@@ -1,0 +1,15 @@
+# Keep secrets, local data and environments out of container images.
+.env
+.env.*
+!.env.example
+.venv
+.pytest_cache
+**/__pycache__
+benchmarks
+examples
+tests
+docs
+extensions
+skills
+scripts
+*.db

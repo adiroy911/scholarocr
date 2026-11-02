@@ -1,0 +1,33 @@
+{
+  "mcpServers": {
+    "scholarocr": {
+      "command": "scholarocr-mcp",
+      "args": [],
+      "timeoutSeconds": 600,
+      "env": {
+        "GEMINI_API_KEY": "${GEMINI_API_KEY}",
+        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
+        "SCHOLAROCR_PROVIDER": "${SCHOLAROCR_PROVIDER}"
+      },
+      "variables": [
+        {
+          "name": "GEMINI_API_KEY",
+          "title": "Gemini API key",
+          "description": "Used for page OCR when the provider is gemini (the default). Leave empty if you use OpenRouter.",
+          "link": "https://aistudio.google.com/apikey"
+        },
+        {
+          "name": "OPENROUTER_API_KEY",
+          "title": "OpenRouter API key",
+          "description": "Only needed when the provider is openrouter. Leave empty otherwise.",
+          "link": "https://openrouter.ai/settings/keys"
+        },
+        {
+          "name": "SCHOLAROCR_PROVIDER",
+          "title": "OCR provider",
+          "description": "gemini or openrouter. Leave empty for gemini."
+        }
+      ]
+    }
+  }
+}

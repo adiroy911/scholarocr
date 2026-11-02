@@ -1,0 +1,38 @@
+# Verification, uncertainty, traceability, errors
+
+## Uncertainty labels (ordinal, not probabilities)
+- Start: extractor's own label (deterministic text layer = low unless characters are garbled).
+- Escalated by evidence: invalid LaTeX → high; table structure problems → medium; poor page quality
+  for math/tables/handwriting → medium; model-reported poor legibility → medium; `uncertain`
+  elements → unresolved.
+- Targeted review (second model on the crop): confirmed → one step lower; corrected → content replaced
+  (old value in `revisions`), at least medium; unreadable → unresolved.
+
+## Verification findings (`verify_document`)
+Severity `error` = must not be ignored (failed pages, empty extraction, broken traceability);
+`warning` = check before relying on it (missing/duplicate pages, page-number gaps, invalid LaTeX,
+ragged tables, question numbering gaps, unresolved/high-uncertainty elements, stale exports);
+`info` = context (blank pages, uncertainty distribution).
+
+## Source traceability
+Every element carries `source.page_number`, `source_file`, `source_page_index`, `page_image` and,
+for figures/tables/equations/uncertain regions, `region_image`. `get_source_region(element_id)` returns
+the original crop; boxes from Gemini are approximate (`bbox_source="model_estimate"`), so the crop
+has padding.
+
+## Error codes
+| code | meaning | what to do |
+|---|---|---|
+| `access_denied` | path outside authorized dirs | ask the user to add the folder to `SCHOLAROCR_ALLOWED_DIRS` and restart the server |
+| `invalid_input` / `unsupported_format` | bad arguments or file type | fix arguments; supported: PDF, PNG, JPEG, TIFF, WebP, BMP, GIF, DOCX |
+| `encrypted_document` | password-protected PDF | ask the user for a decrypted copy |
+| `corrupt_document` | damaged file | ask for another copy |
+| `limit_exceeded` | file size / page limit | process a page range or raise the limit |
+| `not_found` | unknown document/job/element id | `list_documents` |
+| `gemini_unavailable` | no API key on the server | scanned pages fail; text-layer pages still work; tell the user to set `GEMINI_API_KEY` |
+| `gemini_error` | API failure after retries (rate limit, auth, model not found) | wait and `manage_job(resume)`; auth/model errors need configuration fixes |
+| `response_validation_failed` | model output invalid twice | the page is marked failed (never silently accepted); resume later or try `force_visual`/`detail` changes |
+| `job_error` | job conflict (document already processing) | poll the existing job |
+
+A page that fails shows up in `get_document_status(document_id).failed_pages` and in verification;
+the rest of the document remains usable.

@@ -1,0 +1,21 @@
+description = "Extract a document with ScholarOCR. Usage: /ocr <path> [pages or hints]"
+prompt = """
+Extract this document with the ScholarOCR MCP server: {{args}}
+
+The first argument is the file, folder, or list of page images. Anything after it is optional:
+a page range such as "1-5,8", a document type such as exam_paper or handwritten_notes, or a
+free-text context hint. Treat hints as hints, not facts.
+
+Steps:
+1. Call list_documents with the file name. If the document is already processed and the pages
+   are present, reuse it instead of re-extracting.
+2. Otherwise call ocr_document with the path and any hints given. If it returns a job_id, poll
+   get_document_status at a sensible interval until the job finishes.
+3. Report the document_id, the status, the page count, and the uncertainty counts.
+4. Show a short preview with get_document_content (first page or the requested pages).
+5. List any elements labelled high or unresolved, with page numbers and element ids. Do not
+   guess unresolved text. Offer to check them against the source with get_source_region.
+
+If the path is rejected with access_denied, tell me which folder to add to
+SCHOLAROCR_ALLOWED_DIRS. Do not copy the file elsewhere.
+"""

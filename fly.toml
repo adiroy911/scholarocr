@@ -1,0 +1,91 @@
+# Fly.io configuration for the ScholarOCR hosted MCP server (ChatGPT app).
+# Deploy steps: docs/CHATGPT_APP.md, section 4.1 "Deploy to Fly.io". Checked against the
+# docs.fly.io configuration, volumes and autostop references on 2026-11-03.
+#
+# NO SECRETS IN THIS FILE. SCHOLAROCR_REMOTE_SECRET is set with `fly secrets set`.
+# If the name "scholarocr" is already taken on Fly, choose e.g. "scholarocr-<suffix>" and change
+# `app` AND every "scholarocr.fly.dev" below; the public URL must match the host ChatGPT calls.
+
+app = "scholarocr"
+primary_region = "bom" # Mumbai
+
+# SIGINT lets uvicorn finish in-flight requests and stop the retention janitor cleanly.
+kill_signal = "SIGINT"
+kill_timeout = 30
+
+# Swap is a safety net against an OOM kill during a burst of large page renders (it is slower than
+# RAM, and it rules out auto_stop "suspend", which is not used here anyway).
+swap_size_mb = 512
+
+[build]
+  dockerfile = "Dockerfile.remote"
+
+[deploy]
+  # A volume can attach to only one Machine, so canary/bluegreen are not allowed. Rolling replaces
+  # the single Machine in place: expect a few seconds of downtime per deploy.
+  strategy = "rolling"
+
+[env]
+  # Origin ChatGPT reaches. It becomes the OAuth issuer, the protected-resource "resource"
+  # (<url>/mcp), the download-link base and the allowed Host for DNS-rebinding protection.
+  SCHOLAROCR_REMOTE_PUBLIC_URL = "https://scholarocr.fly.dev"
+  SCHOLAROCR_REMOTE_HOST = "0.0.0.0"
+  SCHOLAROCR_REMOTE_PORT = "8000"
+  SCHOLAROCR_REMOTE_AUTH = "oauth"
+  SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE = "0" # bring-your-own-key only; never bill the operator
+  SCHOLAROCR_REMOTE_DATA_DIR = "/data/remote" # on the volume mounted below (auth.db + users/)
+  SCHOLAROCR_REMOTE_WIDGET_DOMAIN = "https://scholarocr.fly.dev" # _meta.ui.domain; unique per plugin
+  # Fly's proxy is the only public path to the Machine; trusting its X-Forwarded-For makes uvicorn
+  # log real client addresses. URLs are built from PUBLIC_URL, never from forwarded headers.
+  FORWARDED_ALLOW_IPS = "*"
+  # Set these once known (not secret, but not known yet). Either uncomment here and redeploy, or use
+  # `fly secrets set NAME=value`, which also restarts the Machine:
+  # SCHOLAROCR_REMOTE_DOMAIN_CHALLENGE = "<token from the OpenAI Platform plugin portal>"
+  # SCHOLAROCR_REMOTE_DOWNLOAD_HOSTS = "<host ChatGPT uses for download_url>"  # empty = any public https host
+
+[[mounts]]
+  source = "scholarocr_data"
+  destination = "/data" # Dockerfile.remote declares VOLUME /data; the server writes /data/remote
+  initial_size = "1GB"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  # Auto-stop is OFF on purpose, so exactly one Machine runs all the time:
+  # * MCP streamable-HTTP sessions and the per-user rate-limit windows (calls/minute, OCR calls/hour,
+  #   pages/day) live in process memory. A stop wipes them, so ChatGPT's session IDs go stale and
+  #   the daily page budgets reset.
+  # * Documents above SCHOLAROCR_SYNC_PAGE_LIMIT pages run as background jobs that ChatGPT polls.
+  #   The proxy decides "idle" from HTTP traffic only, so it could stop the Machine in the middle of
+  #   an OCR job.
+  # * OAuth clients, codes and tokens and the encrypted keys are in auth.db on the volume, so they
+  #   would survive a stop. Only the in-memory state above is at risk.
+  # "suspend" keeps memory, but its snapshot is dropped on every deploy and on host migration, open
+  # SSE streams may not survive, and it is incompatible with swap. Cheaper but riskier option:
+  # auto_stop_machines = "suspend", auto_start_machines = true, swap_size_mb removed.
+  # Fly recommends setting both auto settings together, so both are off.
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50 # a single Machine, so this only affects load-shedding, not scaling
+
+  [[http_service.checks]]
+    grace_period = "20s" # imports of PyMuPDF/OpenCV/MCP plus the initial retention sweep
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+# Memory: measured with the real render/assess/preprocess path (scholarocr 0.1.0, 2026-11-03):
+# about 165 MB after imports, a peak of about 225 MB for one A4 page at the default 200 dpi, and
+# about 350 MB for a 12 MP skewed phone photo. Each OCR job keeps SCHOLAROCR_CONCURRENCY (default 2)
+# page images in flight, so two users OCR-ing photos at once peak around 600-700 MB. 1 GB covers
+# that. 512 MB does not. For heavier use: fly scale vm shared-cpu-2x --memory 2048
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1

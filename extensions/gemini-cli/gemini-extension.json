@@ -1,0 +1,34 @@
+{
+  "name": "scholarocr",
+  "version": "0.1.0",
+  "description": "Source-traceable OCR for academic documents: scanned PDFs, page photos, handwriting, exam papers, equations and tables, with uncertainty labels and verification.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "scholarocr": {
+      "command": "scholarocr-mcp",
+      "args": [],
+      "cwd": "${workspacePath}",
+      "timeout": 600000
+    }
+  },
+  "settings": [
+    {
+      "name": "Gemini API key",
+      "description": "Key ScholarOCR uses for page OCR when SCHOLAROCR_PROVIDER is gemini (the default). Leave empty if you use OpenRouter or a .env file in your workspace.",
+      "envVar": "GEMINI_API_KEY",
+      "sensitive": true
+    },
+    {
+      "name": "OpenRouter API key",
+      "description": "Only needed when SCHOLAROCR_PROVIDER is openrouter. Leave empty otherwise.",
+      "envVar": "OPENROUTER_API_KEY",
+      "sensitive": true
+    },
+    {
+      "name": "OCR provider",
+      "description": "gemini or openrouter. Leave empty for gemini, or to take it from your shell environment or workspace .env.",
+      "envVar": "SCHOLAROCR_PROVIDER",
+      "sensitive": false
+    }
+  ]
+}

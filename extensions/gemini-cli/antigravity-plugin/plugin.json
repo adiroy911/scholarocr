@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "scholarocr",
+  "displayName": "ScholarOCR",
+  "version": "0.1.0",
+  "description": "Source-traceable OCR for academic documents: scanned PDFs, page photos, handwriting, exam papers, equations and tables, with uncertainty labels and verification.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Extract the scanned exam paper in this folder and list anything that was unreadable",
+    "Convert my handwritten chemistry notes to Markdown and check the equations against the source",
+    "Export the processed research paper as a searchable PDF"
+  ],
+  "author": {
+    "name": "adiroy911",
+    "url": "https://github.com/adiroy911"
+  },
+  "homepage": "https://github.com/adiroy911/scholarocr",
+  "repository": "https://github.com/adiroy911/scholarocr",
+  "license": "MIT",
+  "keywords": [
+    "ocr",
+    "academic",
+    "pdf",
+    "handwriting",
+    "latex",
+    "mcp"
+  ]
+}

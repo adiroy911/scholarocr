@@ -1,0 +1,10 @@
+description = "List documents ScholarOCR has already processed. Usage: /ocr:list [file name or title fragment]"
+prompt = """
+List the documents ScholarOCR has already processed.
+
+Filter: {{args}}
+
+Call list_documents. If a filter was given, pass it as query; otherwise list the 20 most
+recent. Show a compact table: document_id, file name, document type, status, page count.
+Do not start any extraction.
+"""

@@ -1,0 +1,27 @@
+# ScholarOCR hosted MCP server (ChatGPT app). Build from the project folder:
+#   docker build -f Dockerfile.remote -t scholarocr-remote .
+# Run (TLS is terminated by your load balancer / reverse proxy in front of port 8000):
+#   docker run -p 8000:8000 -v scholarocr-data:/data \
+#     -e SCHOLAROCR_REMOTE_PUBLIC_URL=https://ocr.example.com \
+#     -e SCHOLAROCR_REMOTE_SECRET=<48+ random characters> scholarocr-remote
+# No model API key is baked in or needed: users bring their own (see docs/CHATGPT_APP.md).
+# Fly.io: fly.toml builds this file, mounts the volume at /data (Fly chowns the mount to the image's
+# USER) and ignores HEALTHCHECK in favour of its own /healthz check.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
+    SCHOLAROCR_REMOTE_HOST=0.0.0.0 SCHOLAROCR_REMOTE_PORT=8000 SCHOLAROCR_REMOTE_DATA_DIR=/data/remote \
+    SCHOLAROCR_DATA_DIR=/data/unused
+
+RUN useradd --create-home --uid 10001 app && mkdir -p /data && chown app /data
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install ".[remote]"
+
+USER app
+VOLUME ["/data"]
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"
+# FORWARDED_ALLOW_IPS: set to your proxy's address so uvicorn trusts its X-Forwarded-* headers.
+CMD ["scholarocr-remote"]

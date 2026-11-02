@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScholarOCR pages</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1c1c1a; --muted: #6a6a64; --line: #e3e2da; --chip: #f2f1ec;
+  --med-bg: #fff4cc; --med-line: #c99a00;
+  --high-bg: #ffe2cc; --high-line: #d0610b;
+  --unres-bg: #ffd9d6; --unres-line: #b42318;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+:root[data-theme="dark"] {
+  --bg: #1b1b1a; --fg: #ecebe5; --muted: #a09f97; --line: #393935; --chip: #262624;
+  --med-bg: #3d3412; --med-line: #e0b52e;
+  --high-bg: #45291a; --high-line: #f08a3c;
+  --unres-bg: #4a1f1c; --unres-line: #ff7b6e;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1b1b1a; --fg: #ecebe5; --muted: #a09f97; --line: #393935; --chip: #262624;
+    --med-bg: #3d3412; --med-line: #e0b52e;
+    --high-bg: #45291a; --high-line: #f08a3c;
+    --unres-bg: #4a1f1c; --unres-line: #ff7b6e;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.wrap { padding: 12px 16px 16px; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
+h1 { font-size: 15px; margin: 0; font-weight: 650; overflow-wrap: anywhere; }
+.meta { color: var(--muted); font-size: 12px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; align-items: center; }
+.chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--chip); }
+.chip.medium { background: var(--med-bg); box-shadow: inset 0 0 0 1px var(--med-line); }
+.chip.high { background: var(--high-bg); box-shadow: inset 0 0 0 1px var(--high-line); }
+.chip.unresolved { background: var(--unres-bg); box-shadow: inset 0 0 0 1px var(--unres-line); }
+label.toggle { font-size: 12px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; margin-left: auto; }
+section.page { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 8px; }
+section.page h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 6px; }
+.el { padding: 4px 8px; margin: 2px 0; border-left: 3px solid transparent; border-radius: 3px; white-space: pre-wrap;
+  overflow-wrap: anywhere; }
+.el .type { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-right: 6px; }
+.el.heading { font-weight: 650; }
+.el .latex { font-family: var(--mono); font-size: 12.5px; }
+.el.u-medium { background: var(--med-bg); border-left-color: var(--med-line); }
+.el.u-high { background: var(--high-bg); border-left-color: var(--high-line); }
+.el.u-unresolved { background: var(--unres-bg); border-left: 3px dashed var(--unres-line); }
+.el .why { display: block; font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.empty, .status { color: var(--muted); font-style: italic; }
+nav { display: flex; gap: 8px; margin-top: 12px; }
+button { font: inherit; font-size: 13px; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--chip); color: var(--fg); cursor: pointer; }
+button[disabled] { opacity: .45; cursor: default; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><h1 id="title">ScholarOCR</h1><span class="meta" id="meta"></span></header>
+  <div class="legend" id="legend"></div>
+  <div id="pages"><p class="status">Waiting for results…</p></div>
+  <nav><button id="prev" disabled>Previous pages</button><button id="next" disabled>Next pages</button></nav>
+</div>
+<script>
+(function () {
+  "use strict";
+  var TOOL = "show_document_pages";
+  var state = { data: null, flaggedOnly: false };
+  var pending = {};
+  var nextId = 1;
+  var bridgeReady = false;
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  }
+
+  function isObj(v) { return v && typeof v === "object" && !Array.isArray(v); }
+
+  function render(data) {
+    if (!isObj(data) || !Array.isArray(data.pages)) return;
+    state.data = data;
+    document.getElementById("title").textContent = data.title || data.document_id || "Document";
+    var m = [];
+    if (data.page_count) m.push(data.page_count + " page" + (data.page_count === 1 ? "" : "s"));
+    if (data.range) m.push("showing " + data.range.first + "–" + data.range.last);
+    document.getElementById("meta").textContent = m.join(" · ");
+
+    var legend = document.getElementById("legend");
+    legend.textContent = "";
+    var c = isObj(data.counts) ? data.counts : {};
+    [["medium", "medium"], ["high", "high"], ["unresolved", "unresolved"]].forEach(function (p) {
+      legend.appendChild(el("span", "chip " + p[0], p[1] + ": " + (c[p[0]] || 0)));
+    });
+    var lab = el("label", "toggle");
+    var cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = state.flaggedOnly;
+    cb.addEventListener("change", function () { state.flaggedOnly = cb.checked; render(state.data); });
+    lab.appendChild(cb); lab.appendChild(document.createTextNode("flagged only"));
+    legend.appendChild(lab);
+
+    var root = document.getElementById("pages");
+    root.textContent = "";
+    data.pages.forEach(function (pg) {
+      var s = el("section", "page");
+      s.appendChild(el("h2", null, "Page " + pg.page_number + (pg.status && pg.status !== "done" ? " · " + pg.status : "")));
+      if (pg.error) s.appendChild(el("p", "status", pg.error));
+      var shown = 0;
+      (pg.elements || []).forEach(function (e) {
+        var u = e.uncertainty || "low";
+        if (state.flaggedOnly && u === "low") return;
+        var d = el("div", "el u-" + u + (e.type === "heading" || e.type === "title" ? " heading" : ""));
+        d.appendChild(el("span", "type", e.type));
+        if (e.latex) d.appendChild(el("span", "latex", e.latex)); else d.appendChild(document.createTextNode(e.text || ""));
+        if (u !== "low") {
+          var why = (e.reasons && e.reasons.length) ? e.reasons.join("; ") : "";
+          d.appendChild(el("span", "why", u + (why ? " — " + why : "")));
+          d.title = "id " + e.id;
+        }
+        s.appendChild(d); shown++;
+      });
+      if (!shown) s.appendChild(el("p", "empty", state.flaggedOnly ? "No flagged elements." : "No elements."));
+      root.appendChild(s);
+    });
+    if (data.truncated) root.appendChild(el("p", "status", "Some elements were shortened for display."));
+    document.getElementById("prev").disabled = !data.prev_pages;
+    document.getElementById("next").disabled = !data.next_pages;
+    notifySize();
+  }
+
+  // ---- host bridges: MCP Apps (postMessage JSON-RPC) and ChatGPT window.openai, feature-detected.
+  function post(msg) { try { window.parent.postMessage(msg, "*"); } catch (e) { /* no host */ } }
+  function request(method, params) {
+    var id = nextId++;
+    post({ jsonrpc: "2.0", id: id, method: method, params: params || {} });
+    return new Promise(function (resolve, reject) {
+      pending[id] = { resolve: resolve, reject: reject };
+      setTimeout(function () { if (pending[id]) { delete pending[id]; reject(new Error("timeout")); } }, 30000);
+    });
+  }
+  function notify(method, params) { post({ jsonrpc: "2.0", method: method, params: params || {} }); }
+
+  function applyTheme(ctx) {
+    if (isObj(ctx) && (ctx.theme === "dark" || ctx.theme === "light")) {
+      document.documentElement.setAttribute("data-theme", ctx.theme);
+    }
+  }
+
+  function resultData(res) {
+    if (!isObj(res)) return null;
+    return res.structuredContent || res.structured_content || null;
+  }
+
+  window.addEventListener("message", function (ev) {
+    if (ev.source !== window.parent) return;
+    var msg = ev.data;
+    if (!isObj(msg) || msg.jsonrpc !== "2.0") return;
+    if (msg.id != null && pending[msg.id]) {
+      var p = pending[msg.id]; delete pending[msg.id];
+      if (msg.error) p.reject(msg.error); else p.resolve(msg.result);
+      return;
+    }
+    if (msg.method === "ui/notifications/tool-result") render(resultData(msg.params));
+    else if (msg.method === "ui/notifications/host-context-changed") applyTheme(msg.params);
+  });
+
+  function callTool(args) {
+    if (window.openai && typeof window.openai.callTool === "function") {
+      return window.openai.callTool(TOOL, args).then(function (r) { return resultData(r) || r; });
+    }
+    if (!bridgeReady) return Promise.reject(new Error("host does not support tool calls"));
+    return request("tools/call", { name: TOOL, arguments: args }).then(resultData);
+  }
+
+  function go(pages) {
+    if (!state.data || !pages) return;
+    document.getElementById("pages").insertBefore(el("p", "status", "Loading…"), document.getElementById("pages").firstChild);
+    callTool({ document_id: state.data.document_id, pages: pages }).then(render, function () {
+      render(state.data);
+      document.getElementById("pages").insertBefore(el("p", "status", "Could not load more pages here; ask in the chat instead."),
+        document.getElementById("pages").firstChild);
+    });
+  }
+  document.getElementById("prev").addEventListener("click", function () { go(state.data && state.data.prev_pages); });
+  document.getElementById("next").addEventListener("click", function () { go(state.data && state.data.next_pages); });
+
+  var lastH = 0;
+  function notifySize() {
+    var h = Math.ceil(document.documentElement.scrollHeight);
+    if (Math.abs(h - lastH) < 2) return;
+    lastH = h;
+    if (bridgeReady) notify("ui/notifications/size-changed", { width: document.documentElement.scrollWidth, height: h });
+  }
+  if (typeof ResizeObserver === "function") new ResizeObserver(notifySize).observe(document.body);
+
+  // ChatGPT: data may already be present, and updates arrive via the openai:set_globals event.
+  function fromOpenAI() {
+    if (window.openai) {
+      if (window.openai.theme) applyTheme({ theme: window.openai.theme });
+      if (window.openai.toolOutput) render(window.openai.toolOutput);
+    }
+  }
+  window.addEventListener("openai:set_globals", fromOpenAI);
+  fromOpenAI();
+
+  // MCP Apps handshake.
+  request("ui/initialize", {
+    protocolVersion: "2026-01-26",
+    appCapabilities: {},
+    clientInfo: { name: "scholarocr-page-viewer", version: "1" }
+  }).then(function (res) {
+    bridgeReady = true;
+    if (isObj(res)) applyTheme(res.hostContext);
+    notify("ui/notifications/initialized", {});
+    notifySize();
+  }, function () { /* not an MCP Apps host */ });
+})();
+</script>
+</body>
+</html>

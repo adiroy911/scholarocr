@@ -1,0 +1,16 @@
+description = "Export a ScholarOCR document to a file. Usage: /ocr:export <document_id or file name> <json|markdown|searchable-pdf|docx|latex|csv|xlsx>"
+prompt = """
+Export a ScholarOCR document: {{args}}
+
+The arguments are a document_id (or a file name to look up with list_documents) and a format:
+json, markdown, searchable-pdf, docx, latex, csv or xlsx. If the format is missing, ask me;
+suggest markdown for reading, docx for editing, searchable-pdf for a scan I want to search,
+latex for math-heavy material, csv or xlsx for tables.
+
+1. Resolve the document_id. If several documents match, ask me which one.
+2. Call export_document with that format. No OCR is re-run.
+3. Report the output file path(s), any warnings, and the post-generation checks it returns
+   (for example searchable-PDF text recall or LaTeX compile status).
+4. If the document has unresolved or high-uncertainty elements, mention that they are carried
+   into the export as-is, and suggest /ocr:verify first if I have not run it.
+"""

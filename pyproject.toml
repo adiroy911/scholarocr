@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scholarocr"
+version = "0.1.0"
+description = "Reusable academic-document OCR and intelligence engine (Gemini + MCP)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "google-genai>=2.30",
+  "pydantic>=2.8",
+  "pymupdf>=1.26",
+  "pillow>=10.0",
+  "numpy>=1.26",
+  "opencv-python-headless>=4.9",
+  "python-docx>=1.1",
+  "openpyxl>=3.1",
+  "mcp>=2.3,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/adiroy911/scholarocr"
+Issues = "https://github.com/adiroy911/scholarocr/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+# Hosted ChatGPT-app server (scholarocr-remote). starlette/uvicorn/httpx already come with mcp.
+remote = ["cryptography>=42", "uvicorn>=0.30", "starlette>=0.40", "httpx>=0.27"]
+
+[project.scripts]
+scholarocr = "scholarocr.cli.main:main"
+scholarocr-mcp = "scholarocr.mcp.server:main"
+scholarocr-remote = "scholarocr.remote.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scholarocr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "live: calls the real Gemini API (requires GEMINI_API_KEY and SCHOLAROCR_RUN_LIVE_TESTS=1)",
+  "latex: requires a LaTeX engine on PATH",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "B008", "B905"]
