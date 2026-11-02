@@ -105,3 +105,79 @@ def classify_prompt(context_hint: str | None, text_sample: str | None, page_coun
         parts.append("Extracted text sample:\n<<<\n" + text_sample + "\n>>>")
     parts.append("Classify the document. Return JSON only.")
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------------------------- host mode
+# Instructions handed to the MCP client's own model (host mode). Versioned separately: part of the cache
+# key of host-transcribed pages.
+HOST_PROMPT_VERSION = "host-2026-11-03.1"
+
+HOST_RULES = """Transcribe this page image for ScholarOCR. You transcribe; you never author.
+1. Exactly what is visible. Never complete, correct, summarise or improve content.
+2. Illegible: do NOT guess. Use an element of type "uncertain" (text like "[illegible: 2 words]",
+   uncertainty "unresolved"), or keep the element and set uncertainty "medium"/"high" when you read it but
+   are unsure. Labels are ordinal judgements, not probabilities.
+3. Elements in natural reading order (respect columns; header first, footer/page number last).
+4. box_2d = [ymin, xmin, ymax, xmax] as integers 0-1000, normalised to THIS image (origin top-left).
+   Give one for every element; the server maps it back to the original page.
+5. Math: LaTeX (amsmath) in "latex", a readable linear form in "text". Display equations are separate
+   "equation" elements; inline math stays in the paragraph text as $...$. Keep equation numbers.
+6. Chemistry: type "chemical_equation" with mhchem LaTeX (\\ce{...}); keep charges, states, arrows and
+   coefficients exactly. Distinguish O/0, l/1, x/×, -/−.
+7. Tables only for genuinely tabular content: rows of cells, header_rows, row_span/col_span for merged cells.
+8. Figures/diagrams/graphs: one element with box_2d tight around it and "figure": {description, labels,
+   relationships, kind}. Captions are separate "caption" elements with caption_of = the figure's index.
+9. Structure: role (question, subquestion, definition, theorem, example, proof, solution, ...) and
+   "question": {number, marks} exactly as printed; subquestions set parent_index (0-based index).
+10. Headers, footers and page numbers get their own types."""
+
+HOST_SHAPE = """Call submit_page_content(document_id, page_number, elements=[...], page_language="en",
+page_label=<printed page number or null>, legibility="low|medium|high|unresolved" (overall doubt),
+rotation_detected=0|90|180|270 (clockwise, only if the image itself is rotated), notes=[...]).
+Element fields: type (required), text, latex, role, level, items, table, figure, question, box_2d,
+uncertainty, uncertainty_reasons, handwritten, language, caption_of, parent_index. Examples:
+{"type":"heading","level":1,"text":"Chapter 2","box_2d":[40,90,80,600]}
+{"type":"paragraph","role":"question","text":"Q3. Solve $x^2=4$. [2]","question":{"number":"3","marks":"2"},"box_2d":[100,80,140,920]}
+{"type":"equation","text":"E = mc^2","latex":"E = mc^2","box_2d":[150,300,190,700]}
+{"type":"table","table":{"header_rows":1,"rows":[[{"text":"x","is_header":true},{"text":"y","is_header":true}],[{"text":"1"},{"text":"2"}]]},"box_2d":[200,80,330,900]}
+{"type":"figure","figure":{"description":"Circuit with a battery and two resistors in series","labels":["R1","R2"],"kind":"circuit"},"box_2d":[340,150,600,850]}
+{"type":"caption","text":"Fig. 2: Series circuit","caption_of":4,"box_2d":[605,300,630,700]}
+{"type":"uncertain","text":"[illegible: 3 words]","uncertainty":"unresolved","box_2d":[650,80,680,500]}
+Types: title heading subheading paragraph text handwriting equation chemical_equation table figure diagram
+image caption footnote header footer page_number list code bibliography_entry reference uncertain."""
+
+HOST_SHORT = """Same rules as before: transcribe exactly, never guess (use "uncertain"/unresolved), reading
+order, box_2d [ymin,xmin,ymax,xmax] 0-1000 of THIS image, LaTeX for math, \\ce{} for chemistry. Submit with
+submit_page_content. Ask for instructions="full" to see the full rules and element examples again."""
+
+
+def host_page_brief(route: Route, *, full: bool, document_type: str | None, language_hint: str | None,
+                    context_hint: str | None, text_layer: str | None) -> str:
+    """Instructions returned with a page image in host mode."""
+    parts = [HOST_RULES + "\n\n" + HOST_SHAPE if full else HOST_SHORT]
+    addendum = PROFILE_ADDENDA.get(route, "")
+    if addendum:
+        parts.append("Page profile: " + addendum)
+    hints = []
+    if document_type:
+        hints.append(f"document type: {document_type}")
+    if language_hint:
+        hints.append(f"language(s): {language_hint}")
+    if context_hint:
+        hints.append(f"context: {context_hint}")
+    if hints:
+        parts.append("Caller-provided hints (may be wrong; trust the image): " + "; ".join(hints))
+    if text_layer:
+        parts.append("The PDF has an embedded text layer for this page (may be incomplete or wrong for math). "
+                     "Use it only to disambiguate characters; the image is authoritative:\n<<<\n" + text_layer
+                     + "\n>>>")
+    return "\n\n".join(parts)
+
+
+HOST_REVIEW_BRIEF = """Re-check this element against the crop. Compare character by character.
+Then call submit_review(document_id, element_id, verdict, ...):
+- verdict "confirmed": the stored transcription is exactly right;
+- verdict "corrected": you can read it and it is wrong; pass the corrected text / latex / table;
+- verdict "unreadable": the source cannot be read reliably; do not guess.
+For a figure/diagram/image you can instead pass figure={description, labels, relationships, kind}.
+uncertainty = your ordinal judgement after the check (low/medium/high/unresolved)."""

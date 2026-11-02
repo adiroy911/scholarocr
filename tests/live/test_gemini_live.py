@@ -23,6 +23,8 @@ pytestmark = [
 @pytest.fixture
 def live(tmp_path, corpus):
     s = Settings.from_env()
+    if s.provider == "host" and not os.environ.get("SCHOLAROCR_PROVIDER"):
+        s = s.model_copy(update={"provider": "gemini"})  # the environment default is host; these tests are Gemini's
     s.data_dir = tmp_path / "data"
     s.allowed_dirs = [next(iter(corpus.values())).parent]
     return ScholarOCR(s)

@@ -49,6 +49,10 @@ VISUAL_TYPES = {ElementType.FIGURE, ElementType.DIAGRAM, ElementType.IMAGE}
 MATH_TYPES = {ElementType.EQUATION, ElementType.CHEMICAL_EQUATION}
 HEADING_TYPES = {ElementType.TITLE, ElementType.HEADING, ElementType.SUBHEADING}
 FURNITURE_TYPES = {ElementType.HEADER, ElementType.FOOTER, ElementType.PAGE_NUMBER}
+# Element.extraction_method values written by a vision model: "gemini" (any server-side key provider,
+# Gemini or OpenRouter; historical name), "host_model" (submitted by the MCP client's model in host
+# mode) and "sampling" (the client's model reached through MCP sampling).
+MODEL_METHODS = frozenset({"gemini", "host_model", "sampling"})
 
 
 class Role(str, Enum):
@@ -227,7 +231,7 @@ class Element(BaseModel):
     uncertainty: Uncertainty = Uncertainty.LOW
     uncertainty_reasons: list[str] = Field(default_factory=list)
     formatting: dict[str, Any] = Field(default_factory=dict)  # bold, italic, font, size, display
-    extraction_method: str = "unknown"  # "embedded_text" | "gemini" | "docx"
+    extraction_method: str = "unknown"  # "embedded_text" | "docx" | "gemini" | "host_model" | "sampling"
     model: str | None = None
     source: SourceRef
     revisions: list[Revision] = Field(default_factory=list)

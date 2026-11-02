@@ -1,6 +1,6 @@
 # Claude Code skill: `scholarocr`
 
-Location in the repo: `skills/scholarocr/` (`SKILL.md` + `references/`). The skill contains only
+Location in the repo: `claude-skill/scholarocr/` (`SKILL.md` + `references/`). The skill contains only
 instructions; all OCR happens in the shared engine via MCP (or the CLI as fallback).
 
 ## What it teaches Claude

@@ -1,6 +1,6 @@
 """ScholarOCR service facade: the one API used by the CLI, the MCP server and Python callers.
 
-Agent-agnostic by design: nothing here knows about Claude, Gemini CLI or MCP.
+Agent-agnostic by design: nothing here knows about Claude, Antigravity or MCP.
 """
 
 from __future__ import annotations
@@ -14,18 +14,22 @@ from PIL import Image
 
 from . import EXTRACTION_VERSION, SCHEMA_VERSION, __version__
 from .config import Settings
-from .exceptions import ExportError, InputError, NotFoundError
+from .exceptions import ExportError, InputError, ModelUnavailableError, NotFoundError
 from .ingestion.loader import PageRenderer, build_manifest
 from .intelligence import classifier, reviewer
 from .intelligence.gemini_client import GeminiClient, Transport
 from .logging_config import configure_logging, get_logger
-from .pipeline import structure
+from .pipeline import host, structure
 from .pipeline.checkpoints import load_page, save_page
 from .pipeline.job_manager import JobManager
 from .pipeline.orchestrator import Pipeline, RunSummary
 from .pipeline.verification import verify as run_verification
-from .schemas import (Document, DocumentType, ElementType, Job, Manifest, Page, PageStatus, ProcessingOptions,
-                      VerificationReport)
+from .schemas import (Document, DocumentType, ElementType, FigureData, Job, Manifest, Page, PageStatus,
+                      ProcessingOptions, Revision, VerificationReport)
+from .intelligence import prompts as host_prompts
+from .intelligence.extractor import VisualPageContext, convert_response
+from .schemas.elements import MATH_TYPES as MATH_TYPES_SET
+from .schemas.elements import MODEL_METHODS, VISUAL_TYPES
 from .security import PathPolicy
 from .storage import ArtifactStore, Repository
 from .utils import now_iso, parse_page_range
@@ -43,16 +47,43 @@ class ScholarOCR:
         self.policy = PathPolicy(self.settings.allowed_dirs, self.settings.max_file_mb)
         self.gemini = GeminiClient(self.settings, transport=transport, usage_sink=self.repo.record_call)
         self.pipeline = Pipeline(self.settings, self.repo, self.store, self.gemini)
+        # Per-document model override for one synchronous run (MCP sampling): doc id -> (client, method, label).
+        self._overrides: dict[str, tuple[GeminiClient, str, str]] = {}
         self.jobs = JobManager(self.repo, self._run_job)
         self.jobs.recover_stale()
         if self.settings.retention_days is not None:
             self.apply_retention()
 
+    # ------------------------------------------------------------------ mode
+    @property
+    def mode(self) -> str:
+        """``host`` (the MCP client's model transcribes), or the key provider in use."""
+        if not self.gemini.available:
+            return "host"
+        p = self.settings.effective_provider
+        return p if p != "host" else "gemini"  # an injected transport (tests) behaves like a key provider
+
+    def mode_info(self) -> dict[str, Any]:
+        info: dict[str, Any] = {"mode": self.mode, "provider_requested": self.settings.provider}
+        if self.mode == "host":
+            info["meaning"] = ("No model API key is used. Pages with a reliable text layer are extracted "
+                               "deterministically; pages that need vision are prepared (rendered, cropped, "
+                               "deskewed) and wait for YOUR model: get_page_image -> submit_page_content.")
+        else:
+            info["meaning"] = f"Server-side visual OCR with the {self.mode} provider ({self.settings.gemini_model})."
+        if self.settings.provider_note:
+            info["note"] = self.settings.provider_note
+        return info
+
     # ------------------------------------------------------------------ processing
     def process(self, paths: str | Path | list[str | Path], options: ProcessingOptions | None = None, *,
-                wait: bool | None = None) -> dict[str, Any]:
+                wait: bool | None = None, model_override: tuple[GeminiClient, str, str] | None = None
+                ) -> dict[str, Any]:
         """Ingest file(s) as one document and extract it. Returns immediately with a job id for
-        large selections unless ``wait=True``; small selections run synchronously by default."""
+        large selections unless ``wait=True``; small selections run synchronously by default.
+
+        ``model_override`` = (client, extraction_method, cache label) runs this call's visual pages through
+        another model client (MCP sampling); it forces a synchronous run."""
         options = options or ProcessingOptions()
         path_list = [paths] if isinstance(paths, (str, Path)) else list(paths)
         manifest = build_manifest(path_list, policy=self.policy, store=self.store, max_pages=self.settings.max_pages)
@@ -65,28 +96,54 @@ class ScholarOCR:
             page_count=len(manifest.pages), status=existing["status"] if existing else "ingested",
             data=(existing or {}).get("data") or {},
         )
+        if model_override is not None:
+            wait = True  # the override (an MCP sampling session) only lives for this call
+            self._overrides[doc_id] = model_override
         if wait is None:
             wait = len(selected) <= self.settings.sync_page_limit
-        job = self.jobs.start(doc_id, options, len(selected), background=not wait)
+        try:
+            job = self.jobs.start(doc_id, options, len(selected), background=not wait)
+        finally:
+            self._overrides.pop(doc_id, None)
+        mode = model_override[1] if model_override is not None else self.mode
         result = {
             "document_id": doc_id,
             "job_id": job.job_id,
             "status": job.status.value,
+            "mode": mode,
             "page_count": len(manifest.pages),
             "selected_pages": len(selected),
             "synchronous": bool(wait),
             "warnings": manifest.warnings,
         }
+        if self.settings.provider_note and mode == "host":
+            result["warnings"] = list(result["warnings"]) + [self.settings.provider_note]
         if wait:
             result["summary"] = self.document_summary(doc_id)
+            awaiting = result["summary"].get("awaiting_transcription") or []
+            if awaiting:
+                result["awaiting_transcription"] = awaiting
+                result["next_step"] = (
+                    f"Host mode: {len(awaiting)} page(s) need YOUR vision. For each, call get_page_image("
+                    f"document_id='{doc_id}') (it returns the next waiting page), transcribe the image, and call "
+                    "submit_page_content with the elements. Pages with a text layer are already done.")
+        elif mode == "host":
+            result["next_step"] = ("Poll get_document_status(job_id=...) until it is terminal. Pages that need "
+                                   "vision then wait for you: get_page_image -> submit_page_content.")
         return result
 
     def _run_job(self, document_id: str, options: ProcessingOptions, job_id: str, should_cancel, progress) -> RunSummary:
         manifest = self.load_manifest(document_id)
         self.repo.update_document(document_id, status="processing")
+        override = self._overrides.get(document_id)
         try:
-            summary = self.pipeline.run(manifest, options, owner=job_id, should_cancel=should_cancel,
-                                        on_progress=progress)
+            if override is not None:
+                summary = self.pipeline.run(manifest, options, owner=job_id, should_cancel=should_cancel,
+                                            on_progress=progress, model_client=override[0], model_method=override[1],
+                                            model_label=override[2])
+            else:
+                summary = self.pipeline.run(manifest, options, owner=job_id, should_cancel=should_cancel,
+                                            on_progress=progress)
         except Exception:
             self.repo.update_document(document_id, status="failed")
             raise
@@ -100,6 +157,8 @@ class ScholarOCR:
             status = "processed"
         elif any(s == PageStatus.FAILED for s in statuses):
             status = "partial" if any(s in (PageStatus.DONE, PageStatus.BLANK) for s in statuses) else "failed"
+        elif any(s == PageStatus.AWAITING_TRANSCRIPTION for s in statuses):
+            status = "awaiting_transcription"
         elif any(s in (PageStatus.DONE, PageStatus.BLANK) for s in statuses):
             status = "partially_processed"
         else:
@@ -183,12 +242,18 @@ class ScholarOCR:
         for el in elements:
             unc[el.uncertainty.value] = unc.get(el.uncertainty.value, 0) + 1
         jobs = self.repo.jobs_for_document(document_id)
+        awaiting = [p.page_number for p in doc.pages if p.status == PageStatus.AWAITING_TRANSCRIPTION]
+        out_awaiting = {"awaiting_transcription": awaiting,
+                        "next_step": "get_page_image -> transcribe -> submit_page_content, one page at a time"
+                        } if awaiting else {}
         return {
             "document_id": document_id,
             "title": doc.title,
             "status": doc.status,
+            "mode": self.mode,
             "page_count": doc.page_count,
             "pages_by_status": counts,
+            **out_awaiting,
             "routes": {r: sum(1 for p in doc.pages if p.route and p.route.value == r)
                        for r in sorted({p.route.value for p in doc.pages if p.route})},
             "elements": len(elements),
@@ -213,10 +278,14 @@ class ScholarOCR:
         used = 0
         next_cursor = None
         pending_pages = []
+        awaiting_pages = []
         for n in selected:
             page = load_page(self.store, document_id, n)
             if page is None:
                 pending_pages.append(n)
+                continue
+            if page.status == PageStatus.AWAITING_TRANSCRIPTION:
+                awaiting_pages.append(n)
                 continue
             rendered = self._render_page(document_id, page, fmt, types, include_ids)
             size = len(rendered) if isinstance(rendered, str) else len(json.dumps(rendered))
@@ -227,6 +296,10 @@ class ScholarOCR:
             used += size
         out: dict[str, Any] = {"document_id": document_id, "format": fmt, "next_cursor": next_cursor,
                                "unprocessed_pages": pending_pages}
+        if awaiting_pages:
+            out["awaiting_transcription"] = awaiting_pages
+            out["note_awaiting"] = ("these pages have no content yet: transcribe them with get_page_image -> "
+                                    "submit_page_content (host mode)")
         if fmt == "json":
             out["pages"] = chunks
         else:
@@ -261,7 +334,10 @@ class ScholarOCR:
         if page is None:
             return {"document_id": document_id, "page_number": page_number, "status": "pending",
                     "message": "Page not processed yet. Run ocr_document with this page range."}
-        return page.model_dump(mode="json", exclude_none=True)
+        d = page.model_dump(mode="json", exclude_none=True)
+        if page.status == PageStatus.AWAITING_TRANSCRIPTION:
+            d["message"] = "Awaiting transcription by the client's model: get_page_image -> submit_page_content."
+        return d
 
     def find_element(self, document_id: str, element_id: str) -> tuple[Page, Any]:
         try:
@@ -341,21 +417,26 @@ class ScholarOCR:
     # ------------------------------------------------------------------ verification
     def verify(self, document_id: str, *, scope: list[str] | None = None, review: bool = False) -> VerificationReport:
         reviewed: list[str] = []
-        if review:
+        candidates: list[dict[str, Any]] = []
+        if review and self.gemini.available:
             reviewed = self._review_flagged(document_id)
+        elif review:
+            candidates = self.host_review_candidates(document_id)
         doc = self.get_document(document_id)
         report = run_verification(doc, self.load_manifest(document_id), self.store, scope=scope,
                                   exports=self.repo.list_exports(document_id))
         report.reviewed_elements = reviewed
+        if review and not self.gemini.available:
+            report.review_candidates = candidates
+            report.notes.append(
+                f"Host mode: {len(candidates)} element(s) to re-check. For each: get_source_region(element_id) to "
+                "see the original crop, then submit_review(document_id, element_id, verdict, ...)." if candidates
+                else "Host mode: no element needs a review pass.")
         self.store.write_json(self.store.doc_dir(document_id) / "verification.json", report)
         self.repo.add_verification(document_id, report.passed, {"counts": report.counts(), "scope": report.scope})
         return report
 
     def _review_flagged(self, document_id: str) -> list[str]:
-        if not self.gemini.available:
-            from .exceptions import GeminiUnavailableError
-
-            raise GeminiUnavailableError("review=True requires GEMINI_API_KEY; run without review for deterministic checks")
         reviewed = []
         manifest = self.load_manifest(document_id)
         for e in manifest.pages:
@@ -375,6 +456,185 @@ class ScholarOCR:
         if reviewed:
             self.repo.update_document(document_id)
         return reviewed
+
+    # ------------------------------------------------------------------ host mode
+    def awaiting_pages(self, document_id: str) -> list[int]:
+        manifest = self.load_manifest(document_id)
+        out = []
+        for e in manifest.pages:
+            p = load_page(self.store, document_id, e.page_number)
+            if p is not None and p.status == PageStatus.AWAITING_TRANSCRIPTION:
+                out.append(e.page_number)
+        return out
+
+    def _host_page(self, document_id: str, page_number: int) -> tuple[Page, host.HostTask]:
+        manifest = self.load_manifest(document_id)
+        if not 1 <= page_number <= len(manifest.pages):
+            raise InputError(f"page_number must be between 1 and {len(manifest.pages)}")
+        page = load_page(self.store, document_id, page_number)
+        task = host.load_task(self.store, document_id, page_number)
+        resubmittable = (page is not None and page.status == PageStatus.DONE and (page.model or "").startswith("host"))
+        if page is None or task is None or not (page.status == PageStatus.AWAITING_TRANSCRIPTION or resubmittable):
+            status = page.status.value if page else "not processed"
+            route = page.route.value if page and page.route else None
+            raise InputError(f"page {page_number} does not need transcription (status={status}, route={route}). "
+                             "Only pages listed in awaiting_transcription take host submissions.",
+                             details={"awaiting_transcription": self.awaiting_pages(document_id)[:50]})
+        return page, task
+
+    def host_page_image(self, document_id: str, page_number: int | None = None, *, instructions: str = "auto",
+                        max_side: int | None = None) -> tuple[bytes | None, str | None, dict[str, Any]]:
+        """The processed image of a page awaiting transcription, plus transcription instructions.
+
+        ``page_number=None`` picks the first waiting page. Returns ``(None, None, info)`` when nothing waits.
+        ``instructions``: "full" (rules + element examples), "short", or "auto" (full until the first page of
+        this document has been submitted)."""
+        waiting = self.awaiting_pages(document_id)
+        if page_number is None:
+            if not waiting:
+                return None, None, {"document_id": document_id, "status": "nothing_to_transcribe",
+                                    "message": "No page is waiting for transcription. Read the result with "
+                                               "get_document_content, or verify_document."}
+            page_number = waiting[0]
+        page, task = self._host_page(document_id, page_number)
+        img = Image.open(self.store.resolve(document_id, page.processed_image)).convert("RGB")
+        data, mime, size = host.encode_for_host(img, max_side or self.settings.host_image_max_side)
+        if instructions == "auto":
+            any_done = any((p.model or "").startswith("host") for p in self.get_document(document_id).pages
+                           if p.status == PageStatus.DONE)
+            instructions = "short" if any_done else "full"
+        brief = host_prompts.host_page_brief(task.route, full=instructions == "full", text_layer=task.text_layer,
+                                             **task.hints)
+        rest = [n for n in waiting if n != page_number]
+        info = {
+            "document_id": document_id, "page_number": page_number, "route": task.route.value,
+            "image": {"width_px": size[0], "height_px": size[1], "mime_type": mime,
+                      "coordinates": "box_2d = [ymin, xmin, ymax, xmax], integers 0-1000 of this image"},
+            "status": page.status.value,
+            "pages_waiting_after_this": len(rest), "next_waiting_page": rest[0] if rest else None,
+            "instructions": brief,
+        }
+        if page.status == PageStatus.DONE:
+            info["note"] = "This page was already transcribed; submitting again replaces its content."
+        return data, mime, info
+
+    def submit_page_content(self, document_id: str, page_number: int, payload: dict[str, Any], *,
+                            transcriber: str | None = None) -> dict[str, Any]:
+        """Validate and store a host-model transcription of one page (host mode).
+
+        ``payload`` has the PageExtractionResponse shape (elements, page_language, page_label, legibility,
+        rotation_detected, notes). Raises ``SubmissionRejected`` with every problem; nothing is stored then."""
+        page, task = self._host_page(document_id, page_number)
+        resp, warnings = host.validate_submission(dict(payload))
+        original = Image.open(self.store.resolve(document_id, page.original_image)).convert("RGB")
+        label = f"{host.HOST_LABEL}:{transcriber}" if transcriber else host.HOST_LABEL
+        if resp.rotation_detected in (90, 180, 270) and task.rotations < host.MAX_ROTATIONS:
+            from .preprocessing.enhancement import preprocess
+
+            processed, transforms, matrix = preprocess(original, page.quality, extra_rotation=resp.rotation_detected,
+                                                       crop_box=task.crop_box)
+            self.pipeline._save_processed(page, processed, transforms)
+            task.matrix, task.processed_size, task.rotations = matrix, processed.size, task.rotations + 1
+            host.save_task(self.store, document_id, page_number, task)
+            page.warnings.append(f"client model reported {resp.rotation_detected} deg rotation; image re-oriented")
+            save_page(self.store, page)
+            return {"accepted": False, "rotated": True, "document_id": document_id, "page_number": page_number,
+                    "message": f"The page image was rotated by {resp.rotation_detected} degrees. Nothing was stored. "
+                               "Call get_page_image for this page again and transcribe the corrected image."}
+        if resp.rotation_detected:
+            warnings.append("rotation_detected ignored: the page was already re-oriented twice")
+        manifest = self.load_manifest(document_id)
+        entry = manifest.pages[page_number - 1]
+        ctx = VisualPageContext(
+            document_id=document_id, page_id=page.page_id, page_number=page_number, source_file=entry.source_file,
+            source_page_index=entry.source_page_index, page_width_pt=page.width_pt, page_height_pt=page.height_pt,
+            original_dpi=task.dpi, original_size=tuple(task.original_size), processed_size=tuple(task.processed_size),
+            matrix=task.matrix, page_image_rel=page.original_image, quality=page.quality)
+        page.elements = convert_response(resp, ctx, model=label, method=host.HOST_METHOD)
+        page.language, page.page_label = resp.page_language, resp.page_label
+        page.model, page.prompt_version = label, host_prompts.HOST_PROMPT_VERSION
+        page.orientation = int(sum(t.params.get("degrees_ccw", 0) for t in page.transforms if t.step == "rotate")) % 360
+        page.warnings = [w for w in page.warnings if not w.startswith("model note:")]
+        page.warnings += [f"model note: {n}" for n in resp.notes]
+        structure.annotate(page.elements)
+        self.pipeline._save_crops(page, original, task.dpi)
+        page.status = PageStatus.DONE
+        page.error = None
+        page.processed_at = now_iso()
+        if not page.elements:
+            page.warnings.append("no content extracted from a non-blank page")
+        save_page(self.store, page)
+        self.repo.set_page(document_id, page_number, page.status, route=task.route.value, cache_key=page.cache_key)
+        self._refresh_document_record(document_id)
+        self.repo.update_document(document_id)
+        unc: dict[str, int] = {}
+        for el in page.elements:
+            unc[el.uncertainty.value] = unc.get(el.uncertainty.value, 0) + 1
+        review = []
+        if task.review:
+            review = [{"element_id": el.element_id, "type": el.type.value, "uncertainty": el.uncertainty.value,
+                       "reasons": el.uncertainty_reasons[:3]}
+                      for el in reviewer.select_for_review(page.elements, detail=task.detail)]
+        remaining = self.awaiting_pages(document_id)
+        out: dict[str, Any] = {"accepted": True, "document_id": document_id, "page_number": page_number,
+                               "elements": len(page.elements), "uncertainty": unc, "warnings": warnings,
+                               "pages_waiting": len(remaining), "next_waiting_page": remaining[0] if remaining else None}
+        if review:
+            out["review_suggested"] = review
+        if remaining:
+            out["next_step"] = f"get_page_image(document_id='{document_id}') for page {remaining[0]}"
+        else:
+            out["next_step"] = ("All pages are transcribed. " + ("Optionally re-check review_suggested elements: "
+                                "get_source_region(element_id) then submit_review. " if review else "")
+                                + "Then read with get_document_content or run verify_document.")
+        return out
+
+    def host_review_candidates(self, document_id: str, limit: int = 40) -> list[dict[str, Any]]:
+        """Elements a host model should re-check: flagged model-read elements not yet reviewed, and figures
+        on text-layer pages that have no description."""
+        out = []
+        for p in self.get_document(document_id).pages:
+            if p.status != PageStatus.DONE:
+                continue
+            for el in reviewer.select_for_review(p.elements, detail="standard"):
+                if not any(r.by.startswith("review:") for r in el.revisions):
+                    out.append({"element_id": el.element_id, "page": p.page_number, "type": el.type.value,
+                                "uncertainty": el.uncertainty.value, "task": "re-check"})
+            for el in p.elements:
+                if (el.type in VISUAL_TYPES and el.bbox is not None and el.extraction_method not in MODEL_METHODS
+                        and not (el.figure and el.figure.description)):
+                    out.append({"element_id": el.element_id, "page": p.page_number, "type": el.type.value,
+                                "uncertainty": el.uncertainty.value, "task": "describe figure"})
+        return out[:limit]
+
+    def submit_review(self, document_id: str, element_id: str, payload: dict[str, Any], *,
+                      transcriber: str | None = None) -> dict[str, Any]:
+        """Host mode second pass: apply the client model's verdict on one element (after it looked at the crop
+        from get_source_region). Previous values are kept in ``revisions``."""
+        page, el = self.find_element(document_id, element_id)
+        resp, figure = host.validate_review(dict(payload))
+        by = f"review:{host.HOST_LABEL}" + (f":{transcriber}" if transcriber else "")
+        if figure is not None and el.type in VISUAL_TYPES and resp.verdict != "unreadable":
+            previous = el.figure.model_dump() if el.figure else None
+            labels = list(dict.fromkeys((el.figure.labels if el.figure else []) + figure.labels))
+            el.figure = FigureData(description=figure.description, labels=labels, relationships=figure.relationships,
+                                   figure_label=(el.figure.figure_label if el.figure else None) or figure.figure_label,
+                                   kind=figure.kind)
+            el.revisions.append(Revision(at=now_iso(), by=by.replace("review:", "describe:"), field="figure",
+                                         previous=previous))
+            el.uncertainty_reasons = [r for r in el.uncertainty_reasons if "not described" not in r]
+            el.uncertainty_reasons.append("figure description written by the client model from the crop")
+        else:
+            reviewer.apply_review(el, resp, by=by)
+            if el.type in MATH_TYPES_SET or el.type == ElementType.TABLE:
+                from .intelligence.uncertainty import apply_rules
+
+                apply_rules(el, quality=page.quality)  # re-check corrected LaTeX / table structure
+        save_page(self.store, page)
+        self.repo.update_document(document_id)
+        return {"document_id": document_id, "element_id": element_id, "verdict": resp.verdict,
+                "uncertainty": el.uncertainty.value, "content": el.content[:500], "latex": el.latex,
+                "revisions": len(el.revisions)}
 
     # ------------------------------------------------------------------ export
     def export(self, document_id: str, fmt: str, *, options: dict | None = None,
@@ -405,7 +665,14 @@ class ScholarOCR:
         return result.model_dump(mode="json")
 
     # ------------------------------------------------------------------ classification
-    def classify(self, document_id: str, *, context_hint: str | None = None, pages: str | None = None) -> dict[str, Any]:
+    def classify(self, document_id: str, *, context_hint: str | None = None, pages: str | None = None,
+                 client: GeminiClient | None = None) -> dict[str, Any]:
+        """``client`` overrides the configured provider (MCP sampling)."""
+        client = client or self.gemini
+        if not client.available:
+            raise ModelUnavailableError(
+                "classify_document needs a server-side model (a Gemini/OpenRouter key, or a client with MCP "
+                "sampling). In host mode, read get_document_content and classify the document yourself.")
         manifest = self.load_manifest(document_id)
         selected = parse_page_range(pages, len(manifest.pages))[:10]
         doc = self.get_document(document_id, page_numbers=selected)
@@ -420,7 +687,7 @@ class ScholarOCR:
                         images.append(renderer.render(entry, 100)[0])
             finally:
                 renderer.close()
-        resp = classifier.classify(self.gemini, self.settings, document_id=document_id, page_count=len(manifest.pages),
+        resp = classifier.classify(client, self.settings, document_id=document_id, page_count=len(manifest.pages),
                                    text_sample=text or None, page_images=images, context_hint=context_hint)
         result = {"document_id": document_id, **resp.model_dump(), "pages_considered": selected,
                   "evidence": "text" if len(text.strip()) >= 200 else "page_images", "context_hint": context_hint,
@@ -524,4 +791,4 @@ class ScholarOCR:
 
     def info(self) -> dict[str, Any]:
         return {"version": __version__, "extraction_version": EXTRACTION_VERSION, "schema_version": SCHEMA_VERSION,
-                "gemini_available": self.gemini.available, "settings": self.settings.redacted()}
+                "gemini_available": self.gemini.available, **self.mode_info(), "settings": self.settings.redacted()}

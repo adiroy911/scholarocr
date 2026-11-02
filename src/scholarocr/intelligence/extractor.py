@@ -86,7 +86,10 @@ def _table(x: XTable | None) -> TableData | None:
     )
 
 
-def convert_response(resp: PageExtractionResponse, ctx: VisualPageContext, *, model: str) -> list[Element]:
+def convert_response(resp: PageExtractionResponse, ctx: VisualPageContext, *, model: str,
+                     method: str = "gemini") -> list[Element]:
+    """Turn a page response (from a key provider, MCP sampling or a host-model submission; all use the
+    same schema and box convention) into IR elements with boxes in page points."""
     elements: list[Element] = []
     ids: list[str] = []
     for i, _ in enumerate(resp.elements):
@@ -103,7 +106,7 @@ def convert_response(resp: PageExtractionResponse, ctx: VisualPageContext, *, mo
             handwritten=x.handwritten or etype == ElementType.HANDWRITING,
             bbox=bbox, bbox_source="model_estimate" if bbox else None,
             uncertainty=Uncertainty(x.uncertainty), uncertainty_reasons=list(x.uncertainty_reasons),
-            extraction_method="gemini", model=model,
+            extraction_method=method, model=model,
             source=SourceRef(document_id=ctx.document_id, page_number=ctx.page_number, source_file=ctx.source_file,
                              source_page_index=ctx.source_page_index, page_image=ctx.page_image_rel),
         )

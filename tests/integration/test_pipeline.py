@@ -40,13 +40,16 @@ def test_digital_pdf_is_deterministic_and_cached(settings, corpus):
     assert s.job_status(r3["job_id"])["cached_pages"] == 0
 
 
-def test_scanned_page_without_key_fails_clearly(settings, corpus):
-    s = svc(settings)  # no transport, no API key
+def test_scanned_page_without_key_awaits_host_transcription(settings, corpus):
+    s = svc(settings)  # no transport, no API key: host mode
     r = s.process(corpus["scanned_poor.pdf"])
-    assert r["status"] == "failed"
+    assert r["mode"] == "host" and r["status"] == "awaiting_transcription"
+    assert r["awaiting_transcription"] == [1] and "get_page_image" in r["next_step"]
     page = s.get_page(r["document_id"], 1)
-    assert page["status"] == "failed" and "GEMINI_API_KEY" in page["error"]
-    assert s.document_summary(r["document_id"])["failed_pages"][0]["page"] == 1
+    assert page["status"] == "awaiting_transcription" and "submit_page_content" in page["message"]
+    summary = s.document_summary(r["document_id"])
+    assert summary["failed_pages"] == [] and summary["awaiting_transcription"] == [1]
+    assert summary["status"] == "awaiting_transcription"
 
 
 def test_scanned_math_visual_pipeline(settings, corpus):
@@ -292,9 +295,9 @@ def test_screenshot_is_cropped_and_boxes_land_inside_note(settings, tmp_path):
 def test_failed_page_keeps_diagnostics(settings, tmp_path):
     from tests.fixtures.corpus import screenshot_note_png
 
-    s = svc(settings)  # no Gemini key
+    s = svc(settings)  # no Gemini key: host mode keeps every deterministic diagnostic
     r = s.process(screenshot_note_png(tmp_path / "shot.png"))
     page = load_page(s.store, r["document_id"], 1)
-    assert page.status == PageStatus.FAILED and "GEMINI_API_KEY" in page.error
+    assert page.status == PageStatus.AWAITING_TRANSCRIPTION and page.error is None
     assert page.route.value == "visual_general" and page.quality.light_on_dark is True  # quality measured on the dark note
     assert page.processed_image and any(tr.step == "crop" for tr in page.transforms)

@@ -10,11 +10,11 @@ in `scholarocr/__init__.py` and are part of every cache key.
 **Document**: `document_id` (`doc_` + 16 hex of the ordered source hashes), `title`,
 `original_filenames`, `document_type`, `languages`, `page_count`, `source_metadata` (per file: PDF
 metadata, sha256, media type, pages), `processing` (last options, classification, models, prompt
-versions), `status` (`ingested`/`processing`/`processed`/`partial`/`partially_processed`/`failed`),
+versions), `status` (`ingested`/`processing`/`processed`/`partial`/`partially_processed`/`awaiting_transcription`/`failed`),
 `created_at`, `updated_at`, `extraction_version`, `schema_version`.
 
 **Page**: `page_id` (`<doc>-pNNNN`), `page_number` (1-based position, never reordered),
-`width_pt`, `height_pt`, `status` (`pending`/`done`/`blank`/`failed`), `route`, `orientation`
+`width_pt`, `height_pt`, `status` (`pending`/`done`/`blank`/`failed`/`awaiting_transcription`: host mode, waiting for the client's model), `route`, `orientation`
 (rotation applied before OCR), `quality` (sharpness, contrast, brightness, ink ratio, noise, skew,
 orientation, effective DPI, grade, issues), `transforms` (each preprocessing step + the affine
 matrix), `original_image`, `processed_image`, `elements`, `language`, `page_label` (printed number),
@@ -41,7 +41,7 @@ perceptual hash, text hash, text-layer profile, `duplicate_of`, notes (`blank_pa
 | `bbox` + `bbox_source` | PDF points on the page as displayed (after /Rotate), top-left origin; `pdf_text_layer` (exact) or `model_estimate` (approximate) |
 | `uncertainty` + `uncertainty_reasons` | `low`/`medium`/`high`/`unresolved` (ordinal; see QUALITY_ASSURANCE.md) |
 | `handwritten`, `language`, `formatting` | flags and font info |
-| `extraction_method`, `model` | `embedded_text` / `gemini` / `docx`; model ID |
+| `extraction_method`, `model` | `embedded_text` / `docx` / `gemini` (any server key provider) / `host_model` (submitted by the MCP client's model; `model` is `host` or `host:<client name>`); model ID |
 | `source` | `document_id`, `page_number`, `source_file`, `source_page_index`, `page_image`, `region_image` (paths relative to the document directory) |
 | `revisions` | every change made by review/description: time, actor, field, previous value, note |
 
@@ -84,7 +84,8 @@ Figures, diagrams, images, tables, equations and uncertain regions also have a s
   manifest.json
   source/00_<original name>           preserved, read-only copy
   pages/0001/original.png             original page render
-  pages/0001/processed.png            image sent to Gemini (visual routes)
+  pages/0001/processed.png            image the vision model saw (visual routes; Gemini/OpenRouter or the host model)
+  pages/0001/host_task.json           host mode: what is needed to convert a submission (matrix, sizes, hints)
   pages/0001/page.json                page IR (checkpoint)
   pages/0001/regions/<element>.png    source crops
   classification.json  verification.json

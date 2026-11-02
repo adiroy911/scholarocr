@@ -40,6 +40,17 @@ API for visual OCR, review, description and classification.
   timeout. pandoc runs on a temporary Markdown file of equations only.
 - SQL uses parameter binding throughout.
 
+## Antigravity plugin
+- The plugin holds no code: it starts the separately installed `scholarocr-mcp` over stdio and declares
+  no variables. Keys, if any, live in the user-level `scholarocr.env`, not in the plugin.
+- `agy plugin install <folder>` copies the whole folder into `~/.gemini/config/plugins/scholarocr/`.
+  Do not point it at a working checkout: its `.env` (which may hold keys) and `.venv/` would be copied,
+  and the server, which runs in the plugin folder, would read that `.env`. Use
+  `scripts/stage_antigravity_plugin.py`, which copies only the plugin files. A GitHub install copies
+  the committed repo, which has no `.env`.
+- Headless allow rules (ANTIGRAVITY_PLUGIN.md) cover only the ScholarOCR tools, reads of the tool
+  descriptor and plugin folders, and listing/reading commands under `antigravity-cli/mcp`.
+
 ## Known gaps
 - Documents sent to Gemini are subject to Google's API data terms. Do not process material you are
   not permitted to send to a cloud API.

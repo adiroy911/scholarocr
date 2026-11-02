@@ -5,14 +5,16 @@ import json
 from mcp import Client
 
 from scholarocr.mcp.server import build_server
-from scholarocr.remote.server import FORBIDDEN_PARAMS, WIDGET_MIME, WIDGET_URI
+from scholarocr.remote.server import FORBIDDEN_PARAMS, PAGE_IMAGE_URI, WIDGET_MIME, WIDGET_URI
 from scholarocr.service import ScholarOCR
 from tests.fixtures.fake_gemini import FakeTransport
 
 EXPECTED_REMOTE = {"ocr_upload", "ocr_upload_base64", "get_document_status", "get_document_content",
                    "get_page_content", "get_source_region", "show_document_pages", "verify_document",
                    "export_document", "list_documents", "classify_document", "delete_document", "manage_job",
-                   "account_status", "delete_my_data"}
+                   "account_status", "delete_my_data",
+                   # host mode and the optional key
+                   "get_page_image", "submit_page_content", "submit_review", "manage_model_key"}
 
 
 def _property_names(schema) -> set[str]:
@@ -97,8 +99,11 @@ async def test_widget_resource_and_template_metadata(remote):
     show = tools["show_document_pages"]
     assert show.meta["ui"]["resourceUri"] == WIDGET_URI
     assert show.meta["openai/outputTemplate"] == WIDGET_URI
-    # only the render tool points at the template
-    assert all("ui" not in (t.meta or {}) for n, t in tools.items() if n != "show_document_pages")
+    # only the two render tools point at templates
+    assert tools["get_page_image"].meta["openai/outputTemplate"] == PAGE_IMAGE_URI
+    assert all("ui" not in (t.meta or {}) for n, t in tools.items() if n not in ("show_document_pages",
+                                                                                   "get_page_image"))
+    assert PAGE_IMAGE_URI in res and res[PAGE_IMAGE_URI].mime_type == WIDGET_MIME
     assert res[WIDGET_URI].mime_type == WIDGET_MIME == "text/html;profile=mcp-app"
     content = read.contents[0]
     assert content.mime_type == WIDGET_MIME
@@ -108,6 +113,18 @@ async def test_widget_resource_and_template_metadata(remote):
     assert "ui/initialize" in html and "ui/notifications/tool-result" in html
     assert "<script src" not in html and "http://" not in html.replace("http://www.w3.org", "")
     assert "innerHTML" not in html  # all data is rendered with textContent
+
+
+async def test_page_image_widget_makes_the_image_model_visible(remote):
+    ns = remote()
+    async with Client(ns.mcp) as c:
+        read = await c.read_resource(PAGE_IMAGE_URI)
+    html = read.contents[0].text
+    # ChatGPT: upload the image and list it in widget-state imageIds; MCP Apps: ui/update-model-context.
+    for needle in ("uploadFile", "setWidgetState", "imageIds", "ui/update-model-context", "scholarocr/pageImage",
+                   "toolResponseMetadata", "sendFollowUpMessage"):
+        assert needle in html, needle
+    assert "<script src" not in html and "innerHTML" not in html
 
 
 async def test_noauth_mode_declares_noauth(remote):

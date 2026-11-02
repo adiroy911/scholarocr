@@ -1,6 +1,6 @@
 """ScholarOCR MCP server (official MCP Python SDK 2.x, ``MCPServer``).
 
-Agent-neutral: any MCP client (Claude Code, Gemini CLI, others) can use it. Transport is stdio by
+Agent-neutral: any MCP client (Antigravity CLI, Claude Code, others) can use it. Transport is stdio by
 default (works everywhere, including Windows); ``--transport streamable-http`` serves one shared
 instance on localhost for several agents.
 
@@ -15,9 +15,9 @@ import json
 import sys
 from typing import Annotated, Any, Literal
 
-from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp_types import ToolAnnotations
+from mcp_types import TextContent, ToolAnnotations
 from pydantic import Field
 
 from .. import __version__
@@ -31,8 +31,19 @@ INSTRUCTIONS = f"""{APP_NAME} extracts structured, source-traceable content from
 Typical flow: list_documents (reuse existing extractions) -> ocr_document -> get_document_status
 (if a job id was returned) -> get_document_content / get_page_content -> get_source_region to look at
 the original image of any uncertain element -> verify_document before relying on uncertain content ->
-export_document only when the user wants a file. Element uncertainty labels (low/medium/high/
-unresolved) are ordinal judgements, not probabilities; "unresolved" content was NOT guessed."""
+export_document only when the user wants a file.
+
+HOST MODE (the default when the server has no model API key; ocr_document reports "mode"): the server does
+all deterministic work and YOU are the vision model. Pages with a reliable PDF text layer are done at once.
+Every other page is listed in "awaiting_transcription". Loop, one page per call:
+  get_page_image(document_id)  -> one page image + rules + the exact element JSON shape
+  submit_page_content(document_id, page_number, elements=[...]) -> validated and stored
+If submit_page_content is rejected, fix every listed problem and resubmit the whole page. Never re-request
+an image you already transcribed. Afterwards all other tools work as usual. Optional second pass: for
+elements in review_suggested, get_source_region(element_id) then submit_review(...).
+
+Element uncertainty labels (low/medium/high/unresolved) are ordinal judgements, not probabilities;
+"unresolved" content was NOT guessed. Transcribe exactly what is visible; never fill in unreadable text."""
 
 DocTypeLit = Literal[tuple(t.value for t in DocumentType)]  # type: ignore[valid-type]
 ElementTypeLit = Literal[tuple(t.value for t in ElementType)]  # type: ignore[valid-type]
@@ -50,6 +61,18 @@ def _call(fn, *args, **kwargs):
         raise ToolError(json.dumps(e.to_dict(), ensure_ascii=False)) from None
     except ValueError as e:  # validation of enum-like inputs inside the service
         raise ToolError(json.dumps({"error": "invalid_input", "message": str(e)})) from None
+
+
+def client_name(ctx: Context | None) -> str | None:
+    """The MCP client's self-reported name (e.g. "antigravity"), recorded as the transcriber in host mode."""
+    try:
+        info = ctx.session.client_params.client_info if ctx is not None and ctx.session.client_params else None
+        name = (info.name if info else None) or None
+    except (AttributeError, ValueError):
+        return None
+    if not name:
+        return None
+    return "".join(c for c in str(name) if c.isalnum() or c in "-_.")[:40] or None
 
 
 def build_server(service: ScholarOCR | None = None) -> MCPServer:
@@ -80,15 +103,18 @@ def build_server(service: ScholarOCR | None = None) -> MCPServer:
         force_visual: Annotated[bool, Field(description="Ignore embedded PDF text; always run visual OCR.")] = False,
         auto_crop: Annotated[bool, Field(description="Crop screenshots/photos to the detected document region "
                                          "(drops app/screen chrome). Default true.")] = True,
-        review: Annotated[bool, Field(description="Targeted second-pass review of flagged regions.")] = True,
+        review: Annotated[bool, Field(description="Targeted second-pass review of flagged regions (host mode: "
+                                      "suggested to you after each submission).")] = True,
         reprocess: Annotated[bool, Field(description="Ignore cached results for these pages.")] = False,
         wait: Annotated[bool | None, Field(description="True: block until done. False: return a job id at once. "
                                            "Default: wait only for small page selections.")] = None,
     ) -> dict[str, Any]:
         """Extract a document (or selected pages) into structured, source-traceable content.
 
-        Re-running on an already processed document reuses cached pages (no new model calls).
-        Returns document_id plus either a completed summary or a job_id to poll with get_document_status."""
+        Returns document_id, "mode" and either a summary or a job_id to poll with get_document_status.
+        mode "host" (no server key): text-layer pages are done; pages listed in awaiting_transcription need
+        YOUR vision via get_page_image -> submit_page_content. mode "gemini"/"openrouter": the server's
+        model reads them. Re-running reuses cached pages."""
         opts = ProcessingOptions(document_type=document_type, language_hint=language_hint, context_hint=context_hint,
                                  pages=pages, detail=detail, force_visual=force_visual, auto_crop=auto_crop, review=review,
                                  reprocess=reprocess)
@@ -142,13 +168,86 @@ def build_server(service: ScholarOCR | None = None) -> MCPServer:
                           bbox=bbox)
         return [Image(data=png, format="png"), meta]
 
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    def get_page_image(
+        document_id: str,
+        page_number: Annotated[int | None, Field(ge=1, description="Page to transcribe. Default: the next page "
+                                                 "awaiting transcription.")] = None,
+        instructions: Annotated[Literal["auto", "full", "short"], Field(
+            description="'full': rules + element JSON examples; 'short': a reminder; 'auto': full until the "
+                        "first page of this document is submitted.")] = "auto",
+    ) -> list:
+        """HOST MODE: return ONE page image that needs your vision, with transcription rules and the exact
+        element shape. Transcribe it, then call submit_page_content. Boxes are box_2d = [ymin, xmin, ymax,
+        xmax] in 0-1000 of THIS image. Call it once per page; do not re-request pages you already did."""
+        data, mime, info = _call(svc().host_page_image, document_id, page_number, instructions=instructions)
+        text = info.pop("instructions", None)
+        meta = json.dumps(info, ensure_ascii=False)
+        if data is None:
+            return [TextContent(type="text", text=meta)]
+        return [Image(data=data, format=mime.split("/", 1)[1]),
+                TextContent(type="text", text=f"{text}\n\nPage info: {meta}")]
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                                          open_world_hint=False))
+    def submit_page_content(
+        document_id: str,
+        page_number: Annotated[int, Field(ge=1)],
+        elements: Annotated[list[dict[str, Any]], Field(description=(
+            "Elements in reading order. Each: {type, text, latex?, role?, level?, items?, table?, figure?, "
+            "question?, box_2d:[ymin,xmin,ymax,xmax] 0-1000, uncertainty: low|medium|high|unresolved, "
+            "uncertainty_reasons?, handwritten?, language?, caption_of?, parent_index?}. "
+            "See get_page_image(instructions='full') for examples."))],
+        page_language: Annotated[str | None, Field(description="BCP-47 code, e.g. 'en'.")] = None,
+        page_label: Annotated[str | None, Field(description="Printed page number, if visible.")] = None,
+        legibility: Annotated[str, Field(description="Overall doubt: low|medium|high|unresolved.")] = "low",
+        rotation_detected: Annotated[int, Field(description="0, or 90/180/270 if the IMAGE is rotated clockwise "
+                                                "(the server re-orients it and asks you again).")] = 0,
+        notes: Annotated[list[str] | None, Field(description="Problems such as cut-off text.")] = None,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        """HOST MODE: store your transcription of one page (from get_page_image). Validated strictly against
+        the document schema; on rejection you get every problem with its path and a fix, nothing is stored,
+        and you resubmit the complete page. On success: element/uncertainty counts, review_suggested and the
+        next page waiting."""
+        payload = {"elements": elements, "page_language": page_language, "page_label": page_label,
+                   "legibility": legibility, "rotation_detected": rotation_detected, "notes": notes or []}
+        return _call(svc().submit_page_content, document_id, page_number, payload, transcriber=client_name(ctx))
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,
+                                          open_world_hint=False))
+    def submit_review(
+        document_id: str,
+        element_id: str,
+        verdict: Annotated[Literal["confirmed", "corrected", "unreadable"], Field(
+            description="After comparing the element with its crop from get_source_region.")],
+        text: Annotated[str, Field(description="Corrected text (verdict 'corrected').")] = "",
+        latex: Annotated[str | None, Field(description="Corrected LaTeX.")] = None,
+        table: Annotated[dict[str, Any] | None, Field(description="Corrected table {rows, header_rows}.")] = None,
+        figure: Annotated[dict[str, Any] | None, Field(description="For figures/diagrams: {description, labels, "
+                                                       "relationships, kind}.")] = None,
+        uncertainty: Annotated[str, Field(description="Your judgement after the check: low|medium|high|"
+                                          "unresolved.")] = "low",
+        notes: list[str] | None = None,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        """Second pass on one element: look at get_source_region(element_id) first, then record your verdict.
+        Replaced values are kept in the element's revisions. Use it for review_suggested / review_candidates
+        elements, and to describe figures on text-layer pages."""
+        payload: dict[str, Any] = {"verdict": verdict, "text": text, "uncertainty": uncertainty, "notes": notes or []}
+        for k, v in (("latex", latex), ("table", table), ("figure", figure)):
+            if v is not None:
+                payload[k] = v
+        return _call(svc().submit_review, document_id, element_id, payload, transcriber=client_name(ctx))
+
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
                                           open_world_hint=True))
     def verify_document(
         document_id: str,
         scope: Annotated[list[ScopeLit] | None, Field(description="Checks to run. Default: all.")] = None,
-        review: Annotated[bool, Field(description="Also send not-yet-reviewed flagged elements to the review "
-                                      "model (costs model calls; updates the extraction).")] = False,
+        review: Annotated[bool, Field(description="Key mode: send not-yet-reviewed flagged elements to the review "
+                                      "model (costs model calls). Host mode: return review_candidates for you to "
+                                      "re-check with get_source_region + submit_review.")] = False,
     ) -> dict[str, Any]:
         """Quality checks on an existing extraction: missing/duplicate/failed pages, page-number gaps, empty or
         short extractions, reading order, invalid LaTeX, table structure, question numbering, unresolved regions,
@@ -193,7 +292,8 @@ def build_server(service: ScholarOCR | None = None) -> MCPServer:
         pages: Annotated[str | None, Field(description="Pages to consider (max 10). Default: first pages.")] = None,
     ) -> dict[str, Any]:
         """Classify the document (exam paper, textbook, handwritten notes, research paper, ...) with subjects,
-        level, topics, an ordinal certainty and whether the hint is consistent with the evidence."""
+        level, topics, an ordinal certainty and whether the hint is consistent with the evidence. Needs a
+        server-side model key; in host mode it returns model_unavailable (classify from the content yourself)."""
         return _call(svc().classify, document_id, context_hint=context_hint, pages=pages)
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True,

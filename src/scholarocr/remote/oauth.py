@@ -1,18 +1,21 @@
-"""OAuth 2.1 authorization server whose "login" step is linking the user's own model API key.
+"""OAuth 2.1 authorization server for the hosted app. Signing in creates a ScholarOCR account; a model
+API key is OPTIONAL.
 
-ChatGPT apps authenticate users only through OAuth 2.1 (authorization code + PKCE S256, with
+ChatGPT apps get per-user identity only through OAuth 2.1 (authorization code + PKCE S256, with
 dynamic client registration or CIMD); they cannot send custom API keys or headers, and secrets must
-not be collected through tool inputs or conversation. So the BYO key is collected on this server's
-own consent page during the OAuth authorization step:
+not be collected through tool inputs or conversation. The consent step is this server's own page:
 
     ChatGPT -> /authorize (SDK handler, validates client/redirect/PKCE) -> provider.authorize()
-            -> 302 /byok/connect?req=...   (this module: HTML form, user pastes Gemini/OpenRouter key)
-            -> key encrypted into AuthStore, authorization code issued
+            -> 302 /byok/connect?req=...   (this module: consent page)
+               * default: continue WITHOUT a key -> host mode (ChatGPT's own model reads the pages)
+               * optional: paste a Gemini/OpenRouter key -> server-side pipeline, billed to that key
+            -> account created (random id), key encrypted into AuthStore if given, code issued
             -> 302 back to ChatGPT's redirect_uri?code=...&state=...
     ChatGPT -> /token (SDK handler verifies PKCE) -> exchange_authorization_code() -> opaque tokens
 
-The access token's ``subject`` is the ScholarOCR user id (derived from the key), which selects the
-sandbox and the key for every tool call.
+The access token's ``subject`` is the account id, which selects the sandbox (and the key, if any) for
+every tool call. A key can be linked later through a one-time link (``/byok/key?t=...``, issued by the
+``manage_model_key`` tool) and unlinked by that tool; the account id never changes.
 """
 
 from __future__ import annotations
@@ -121,7 +124,7 @@ class ByokOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
     # -------------------------------------------------------------- refresh
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
         row = self.store.get_token(refresh_token, "refresh")
-        if not row or row["client_id"] != client.client_id or self.store.get_key(row["user_id"]) is None:
+        if not row or row["client_id"] != client.client_id or not self.store.account_exists(row["user_id"]):
             return None
         return RefreshToken(token=refresh_token, client_id=row["client_id"], scopes=row["scopes"],
                             expires_at=int(row["expires_at"]), resource=row["resource"], subject=row["user_id"])
@@ -142,8 +145,8 @@ class ByokOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
             return None
         if row["resource"] and row["resource"].rstrip("/") != self.cfg.mcp_url.rstrip("/"):
             return None  # token minted for another resource (RFC 8707)
-        if self.store.get_key(row["user_id"]) is None:
-            return None  # key removed (delete_my_data / retention): force re-linking
+        if not self.store.account_exists(row["user_id"]):
+            return None  # account removed (delete_my_data / retention): sign in again
         return AccessToken(token=token, client_id=row["client_id"], scopes=row["scopes"],
                            expires_at=int(row["expires_at"]), resource=self.cfg.mcp_url, subject=row["user_id"],
                            claims={"iss": self.cfg.public_url})
@@ -173,7 +176,9 @@ input[type=password],select{{width:100%;box-sizing:border-box;padding:.6rem;bord
 background:transparent;color:var(--fg);font:inherit}}
 .row{{display:flex;gap:.5rem;align-items:flex-start;margin-top:1rem}} .row label{{margin:0;font-weight:400;color:var(--fg)}}
 button{{margin-top:1.25rem;padding:.65rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:#fff;font:inherit;
-font-weight:600;cursor:pointer}} .err{{color:var(--err);font-weight:600}}
+font-weight:600;cursor:pointer}} .err{{color:var(--err);font-weight:600}} .hint{{color:var(--muted);font-size:.92em}}
+fieldset{{border:1px solid var(--line);border-radius:6px;margin-top:1rem;padding:.25rem .9rem .9rem}}
+legend{{color:var(--muted);padding:0 .3rem}}
 </style></head><body><main>{body}</main></body></html>"""
     return HTMLResponse(doc, status_code=status, headers={"Content-Security-Policy": PAGE_CSP,
                                                          "X-Frame-Options": "DENY", "Cache-Control": "no-store",
@@ -181,31 +186,67 @@ font-weight:600;cursor:pointer}} .err{{color:var(--err);font-weight:600}}
 
 
 def connect_form(cfg: RemoteConfig, req_id: str, client_name: str | None, error: str | None = None,
-                 provider: str = "gemini") -> HTMLResponse:
+                 provider: str = "gemini", mode: str = "host") -> HTMLResponse:
     who = html.escape(client_name or "ChatGPT")
     err = f'<p class="err">{html.escape(error)}</p>' if error else ""
-    opts = "".join(f'<option value="{p}"{" selected" if p == provider else ""}>{label}</option>'
-                   for p, label in (("gemini", "Google Gemini API key"), ("openrouter", "OpenRouter API key")))
-    operator = ""
+
+    def radio(value: str, label: str, hint: str) -> str:
+        checked = " checked" if mode == value else ""
+        return (f'<div class="row"><input type="radio" id="mode_{value}" name="mode" value="{value}"{checked}>'
+                f'<label for="mode_{value}"><strong>{label}</strong><br><span class="hint">{hint}</span></label></div>')
+
+    choices = radio("host", "Continue without a key (recommended)",
+                    f"{who}'s own model reads the page images. ScholarOCR does the rest (page rendering, cleanup, "
+                    "checks, storage, exports) and never calls a model API for you.")
     if cfg.operator_key_mode:
-        operator = ('<div class="row"><input type="checkbox" id="use_operator" name="use_operator" value="1">'
-                    '<label for="use_operator">I do not have a key; use the operator-provided quota.</label></div>')
+        choices += radio("operator", "Use this server's quota", "The operator of this server pays for model calls.")
+    choices += radio("key", "Use my own Gemini or OpenRouter key",
+                     "ScholarOCR's dedicated OCR pipeline reads the pages with your key, billed to your account.")
     body = f"""<h1>Connect ScholarOCR</h1>
-<p>{who} is asking to use ScholarOCR on your behalf. ScholarOCR runs OCR with <strong>your own</strong> model API key,
-so model usage is billed to your Gemini or OpenRouter account.</p>
-<ul><li>The key is stored encrypted on this server and is used only for your OCR requests.</li>
-<li>Uploaded documents and results are deleted after {cfg.retention_hours:g} hours.</li>
-<li>Run the <em>delete_my_data</em> tool, or disconnect the app, to remove the key earlier.</li></ul>
+<p>{who} is asking to use ScholarOCR on your behalf. Signing in creates a private ScholarOCR space for your
+documents. You do not need an API key.</p>
+<ul><li>Uploaded documents and results are deleted after {cfg.retention_hours:g} hours.</li>
+<li>A key, if you add one, is stored encrypted and used only for your OCR requests. You can add, replace or
+remove it later (ask ChatGPT to <em>manage my ScholarOCR key</em>).</li>
+<li>Run the <em>delete_my_data</em> tool, or disconnect the app, to remove everything earlier.</li></ul>
 {err}
 <form method="post" action="{html.escape(cfg.public_url)}/byok/connect" autocomplete="off">
 <input type="hidden" name="req" value="{html.escape(req_id)}">
-<label for="provider">Provider</label><select id="provider" name="provider">{opts}</select>
-<label for="api_key">API key</label><input type="password" id="api_key" name="api_key" spellcheck="false">
-{operator}
+{choices}
+{key_fields(provider)}
 <div class="row"><input type="checkbox" id="consent" name="consent" value="1">
-<label for="consent">I allow ScholarOCR to store this key and use it to process documents I send.</label></div>
+<label for="consent">I allow ScholarOCR to store the documents I send (and my key, if I gave one) to process
+them.</label></div>
 <button type="submit">Connect</button></form>"""
     return _page(body, 400 if error else 200)
+
+
+def key_fields(provider: str) -> str:
+    opts = "".join(f'<option value="{p}"{" selected" if p == provider else ""}>{label}</option>'
+                   for p, label in (("gemini", "Google Gemini API key"), ("openrouter", "OpenRouter API key")))
+    return (f'<fieldset><legend>Optional: your own key</legend>'
+            f'<label for="provider">Provider</label><select id="provider" name="provider">{opts}</select>'
+            f'<label for="api_key">API key</label><input type="password" id="api_key" name="api_key" '
+            f'spellcheck="false"></fieldset>')
+
+
+def key_link_form(cfg: RemoteConfig, token: str, error: str | None = None, provider: str = "gemini") -> HTMLResponse:
+    err = f'<p class="err">{html.escape(error)}</p>' if error else ""
+    body = f"""<h1>Add a model key to ScholarOCR</h1>
+<p>With your own Gemini or OpenRouter key, ScholarOCR's dedicated OCR pipeline reads your pages server-side,
+billed to your key. Without one, ChatGPT's own model reads them (host mode). This link works once and
+expires in a few minutes.</p>
+{err}
+<form method="post" action="{html.escape(cfg.public_url)}/byok/key" autocomplete="off">
+<input type="hidden" name="t" value="{html.escape(token)}">
+{key_fields(provider)}
+<div class="row"><input type="checkbox" id="consent" name="consent" value="1">
+<label for="consent">I allow ScholarOCR to store this key encrypted and use it for my OCR requests.</label></div>
+<button type="submit">Save key</button></form>"""
+    return _page(body, 400 if error else 200)
+
+
+EXPIRED = "<h1>Link expired</h1><p>Start the connection again from ChatGPT.</p>"
 
 
 def make_connect_routes(cfg: RemoteConfig, store: AuthStore, provider: ByokOAuthProvider):
@@ -214,31 +255,71 @@ def make_connect_routes(cfg: RemoteConfig, store: AuthStore, provider: ByokOAuth
             req_id = request.query_params.get("req", "")
             pending = store.get_pending(req_id)
             if pending is None:
-                return _page("<h1>Link expired</h1><p>Start the connection again from ChatGPT.</p>", 400)
+                return _page(EXPIRED, 400)
             return connect_form(cfg, req_id, pending.get("client_name"))
         form = await request.form()
         req_id = str(form.get("req", ""))
         pending = store.get_pending(req_id)
         if pending is None:
-            return _page("<h1>Link expired</h1><p>Start the connection again from ChatGPT.</p>", 400)
+            return _page(EXPIRED, 400)
         prov = str(form.get("provider", "gemini")).strip().lower()
         api_key = str(form.get("api_key", "")).strip()
+        mode = str(form.get("mode", "")).strip().lower()
+        if form.get("use_operator") == "1":  # form of version 0.1
+            mode = "operator"
+        if mode not in ("host", "key", "operator"):
+            mode = "key" if api_key else "host"
+        if mode == "host" and api_key:
+            mode = "key"  # a pasted key means the user wants to use it
         if form.get("consent") != "1":
-            return connect_form(cfg, req_id, pending.get("client_name"), "Please confirm the consent box.", prov)
-        if cfg.operator_key_mode and form.get("use_operator") == "1" and not api_key:
-            user_id = "op_" + secrets.token_hex(12)
-            store.put_key(user_id, prov if prov in REMOTE_PROVIDERS else "gemini", None, operator=True)
-        else:
+            return connect_form(cfg, req_id, pending.get("client_name"), "Please confirm the consent box.", prov, mode)
+        if mode == "key":
             problem = validate_api_key(prov, api_key)
             if problem:
-                return connect_form(cfg, req_id, pending.get("client_name"), problem, prov)
-            user_id = store.user_id_for_key(prov, api_key)
-            store.put_key(user_id, prov, api_key)
+                return connect_form(cfg, req_id, pending.get("client_name"), problem, prov, mode)
+            user_id = store.create_account()
+            store.link_key(user_id, prov, api_key)
+        elif mode == "operator" and cfg.operator_key_mode:
+            user_id = store.create_account(operator=True)
+        else:
+            user_id = store.create_account()  # host mode: no key at all
         try:
             target = provider.complete_authorization(req_id, user_id)
         except AuthorizeError as e:
+            store.delete_user(user_id)
             return _page(f"<h1>Could not connect</h1><p>{html.escape(e.error_description or e.error)}</p>", 400)
         return RedirectResponse(target, status_code=302, headers={"Cache-Control": "no-store"})
 
     return connect
 
+
+def make_key_link_route(cfg: RemoteConfig, store: AuthStore, on_change=None):
+    """``/byok/key``: link a key to an existing account through a one-time token (from manage_model_key)."""
+
+    async def key_link(request: Request) -> Response:
+        if request.method == "GET":
+            token = request.query_params.get("t", "")
+            if store.peek_link_token(token) is None:
+                return _page("<h1>Link expired</h1><p>Ask ChatGPT for a new key link (manage_model_key).</p>", 400)
+            return key_link_form(cfg, token)
+        form = await request.form()
+        token = str(form.get("t", ""))
+        if store.peek_link_token(token) is None:
+            return _page("<h1>Link expired</h1><p>Ask ChatGPT for a new key link (manage_model_key).</p>", 400)
+        prov = str(form.get("provider", "gemini")).strip().lower()
+        api_key = str(form.get("api_key", "")).strip()
+        if form.get("consent") != "1":
+            return key_link_form(cfg, token, "Please confirm the consent box.", prov)
+        problem = validate_api_key(prov, api_key)
+        if problem:
+            return key_link_form(cfg, token, problem, prov)
+        user_id = store.consume_link_token(token)
+        if user_id is None or not store.account_exists(user_id):
+            return _page("<h1>Link expired</h1><p>Ask ChatGPT for a new key link (manage_model_key).</p>", 400)
+        store.link_key(user_id, prov, api_key)
+        if on_change:
+            on_change(user_id)
+        return _page("<h1>Key saved</h1><p>Return to ChatGPT. New OCR requests use your key; documents already "
+                     "processed are kept.</p>")
+
+    return key_link

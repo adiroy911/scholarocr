@@ -18,7 +18,7 @@ from typing import Callable
 from PIL import Image
 
 from ..config import Settings
-from ..exceptions import GeminiError, GeminiUnavailableError, JobError, ScholarOCRError
+from ..exceptions import GeminiError, JobError, ScholarOCRError
 from ..ingestion.docx_input import read_docx_blocks
 from ..ingestion.loader import PageRenderer
 from ..intelligence import diagrams, reviewer
@@ -35,7 +35,7 @@ from ..schemas.elements import MATH_TYPES, VISUAL_TYPES
 from ..storage import ArtifactStore, Repository
 from ..storage.artifacts import atomic_write_bytes
 from ..utils import element_id, now_iso, parse_page_range
-from . import structure
+from . import host, structure
 from .checkpoints import cache_key, load_page, save_page
 from .routing import decide_route
 from .text_layer import extract_elements
@@ -58,6 +58,8 @@ class RunSummary:
     routes: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     reviewed: int = 0
+    awaiting: int = 0  # host mode: pages prepared and waiting for the client's model
+    awaiting_pages: list[int] = field(default_factory=list)
 
     @property
     def finished(self) -> int:
@@ -76,16 +78,41 @@ def _png(img: Image.Image) -> bytes:
 
 
 class Pipeline:
-    def __init__(self, settings: Settings, repo: Repository, store: ArtifactStore, gemini: GeminiClient):
+    def __init__(self, settings: Settings, repo: Repository, store: ArtifactStore, gemini: GeminiClient, *,
+                 method: str = "gemini", label: str | None = None):
         self.settings = settings
         self.repo = repo
         self.store = store
         self.gemini = gemini
+        # How elements from this pipeline's vision model are labelled (extraction_method) and keyed in the
+        # cache ("sampling" for MCP sampling; None = the configured key provider's model ids).
+        self.method = method
+        self.label = label
         self._lock = threading.Lock()
+
+    @property
+    def model(self) -> GeminiClient:
+        return self.gemini
+
+    @property
+    def host_mode(self) -> bool:
+        """No server-side vision model: visual pages wait for the client's model (host mode)."""
+        return not self.gemini.available
 
     # ------------------------------------------------------------------ public
     def run(self, manifest: Manifest, options: ProcessingOptions, *, owner: str,
-            should_cancel: Callable[[], bool] = lambda: False, on_progress: ProgressFn | None = None) -> RunSummary:
+            should_cancel: Callable[[], bool] = lambda: False, on_progress: ProgressFn | None = None,
+            model_client: GeminiClient | None = None, model_method: str = "gemini",
+            model_label: str | None = None) -> RunSummary:
+        """``model_client`` replaces the configured provider for this run only (MCP sampling); a separate
+        pipeline instance is used so concurrent jobs never see it."""
+        if model_client is not None:
+            clone = Pipeline(self.settings, self.repo, self.store, model_client, method=model_method, label=model_label)
+            return clone._run(manifest, options, owner=owner, should_cancel=should_cancel, on_progress=on_progress)
+        return self._run(manifest, options, owner=owner, should_cancel=should_cancel, on_progress=on_progress)
+
+    def _run(self, manifest: Manifest, options: ProcessingOptions, *, owner: str,
+             should_cancel: Callable[[], bool], on_progress: ProgressFn | None) -> RunSummary:
         doc_id = manifest.document_id
         selected = parse_page_range(options.pages, len(manifest.pages))
         summary = RunSummary(document_id=doc_id, selected_pages=selected)
@@ -142,7 +169,8 @@ class Pipeline:
         doc_id = manifest.document_id
         media_type = manifest.sources[entry.source_file_index].media_type
         route, reason = decide_route(entry, options, media_type)
-        key = cache_key(entry, route, options, self.settings, self.gemini.available)
+        label = host.HOST_LABEL if self.host_mode else self.label
+        key = cache_key(entry, route, options, self.settings, self.model.available, model_label=label)
         with self._lock:
             summary.routes[route.value] = summary.routes.get(route.value, 0) + 1
         if not options.reprocess:
@@ -151,6 +179,13 @@ class Pipeline:
                 self.repo.set_page(doc_id, entry.page_number, existing.status, route=route.value, cache_key=key)
                 with self._lock:
                     summary.cached += 1
+                return None
+            if (existing and existing.cache_key == key and existing.status == PageStatus.AWAITING_TRANSCRIPTION
+                    and host.load_task(self.store, doc_id, entry.page_number) is not None):
+                self.repo.set_page(doc_id, entry.page_number, existing.status, route=route.value, cache_key=key)
+                with self._lock:
+                    summary.awaiting += 1
+                    summary.awaiting_pages.append(entry.page_number)
                 return None
 
         page = Page(page_id=entry.page_id, document_id=doc_id, page_number=entry.page_number, width_pt=entry.width_pt,
@@ -189,12 +224,12 @@ class Pipeline:
             structure.annotate(page.elements)
             self._save_crops(page, original, dpi)
             figures = [e for e in page.elements if e.type in VISUAL_TYPES and e.bbox]
-            if figures and self.gemini.available:
+            if figures and self.model.available:
                 return pool.submit(self._guard, page, summary, self._describe_figures, page, figures, original, dpi)
             return self._finish(page, summary)
 
-        # Visual routes. Deterministic analysis runs (and is recorded) even when Gemini is
-        # unavailable, so a failed page still carries its diagnostics.
+        # Visual routes. Deterministic analysis always runs (and is recorded): in host mode it is all the
+        # server does before handing the processed image to the client's model.
         crop_box = detect_content_region(original) if options.auto_crop else None
         if crop_box is not None:
             page.warnings.append(f"cropped to the detected document region {list(crop_box)} px; content outside it "
@@ -204,13 +239,20 @@ class Pipeline:
         page.quality = quality
         processed, transforms, matrix = preprocess(original, quality, crop_box=crop_box)
         self._save_processed(page, processed, transforms)
-        if not self.gemini.available:
-            raise GeminiUnavailableError(
-                "Page needs visual OCR but GEMINI_API_KEY is not configured (route: " + reason + ")")
         text_layer = None
         pdf_page = renderer.pdf_page(entry)
         if pdf_page is not None and entry.profile.text_chars:
             text_layer = (pdf_page.get_text("text") or "")[:6000] or None
+        if self.host_mode:
+            task = host.HostTask(
+                route=route, reason=reason, dpi=dpi, original_size=original.size, processed_size=processed.size,
+                matrix=matrix, crop_box=crop_box, text_layer=(text_layer or "")[:host.MAX_TEXT_LAYER_CHARS] or None,
+                hints={"document_type": options.document_type.value if options.document_type else None,
+                       "language_hint": options.language_hint, "context_hint": options.context_hint},
+                review=options.review, detail=options.detail)
+            host.save_task(self.store, doc_id, entry.page_number, task)
+            page.status = PageStatus.AWAITING_TRANSCRIPTION
+            return self._finish(page, summary)
         return pool.submit(self._guard, page, summary, self._visual_worker, page, entry, route, options, original, dpi,
                            processed, transforms, matrix, text_layer, crop_box)
 
@@ -229,7 +271,7 @@ class Pipeline:
         doc_id = page.document_id
         hints = dict(document_type=options.document_type.value if options.document_type else None,
                      language_hint=options.language_hint, context_hint=options.context_hint, text_layer=text_layer)
-        resp, info = extract_page(self.gemini, self.settings, route, processed, document_id=doc_id,
+        resp, info = extract_page(self.model, self.settings, route, processed, document_id=doc_id,
                                   page_number=page.page_number, **hints)
         if resp.rotation_detected in (90, 180, 270):
             # Residual rotation the deterministic check could not resolve: correct once and re-extract.
@@ -237,7 +279,7 @@ class Pipeline:
                                                        crop_box=crop_box)
             self._save_processed(page, processed, transforms)
             page.warnings.append(f"model reported {resp.rotation_detected} deg rotation; re-extracted after correction")
-            resp, info = extract_page(self.gemini, self.settings, route, processed, document_id=doc_id,
+            resp, info = extract_page(self.model, self.settings, route, processed, document_id=doc_id,
                                       page_number=page.page_number, **hints)
         page.orientation = int(sum(t.params.get("degrees_ccw", 0) for t in transforms if t.step == "rotate")) % 360
         ctx = VisualPageContext(
@@ -246,7 +288,7 @@ class Pipeline:
             original_dpi=dpi, original_size=original.size, processed_size=processed.size, matrix=matrix,
             page_image_rel=page.original_image, quality=page.quality,
         )
-        page.elements = convert_response(resp, ctx, model=info.model)
+        page.elements = convert_response(resp, ctx, model=info.model, method=self.method)
         page.language = resp.page_language
         page.page_label = resp.page_label
         page.model = info.model
@@ -259,7 +301,7 @@ class Pipeline:
         if options.review:
             for el in reviewer.select_for_review(page.elements, detail=options.detail):
                 try:
-                    reviewer.review_element(self.gemini, self.settings, el, reviewer.crop_region(original, el, dpi),
+                    reviewer.review_element(self.model, self.settings, el, reviewer.crop_region(original, el, dpi),
                                             document_id=doc_id)
                 except GeminiError as exc:
                     el.uncertainty_reasons.append(f"review failed: {exc.category}")
@@ -276,7 +318,7 @@ class Pipeline:
     def _describe_figures(self, page: Page, figures: list[Element], original: Image.Image, dpi: float) -> None:
         for el in figures[: diagrams.MAX_FIGURES_PER_PAGE]:
             try:
-                diagrams.describe(self.gemini, self.settings, el, reviewer.crop_region(original, el, dpi, pad_pt=4),
+                diagrams.describe(self.model, self.settings, el, reviewer.crop_region(original, el, dpi, pad_pt=4),
                                   document_id=page.document_id)
             except GeminiError as exc:
                 el.uncertainty_reasons.append(f"figure description failed: {exc.category}")
@@ -329,7 +371,10 @@ class Pipeline:
         self.repo.set_page(page.document_id, page.page_number, page.status, route=page.route.value if page.route else None,
                            cache_key=page.cache_key)
         with self._lock:
-            if page.status == PageStatus.BLANK:
+            if page.status == PageStatus.AWAITING_TRANSCRIPTION:
+                summary.awaiting += 1
+                summary.awaiting_pages.append(page.page_number)
+            elif page.status == PageStatus.BLANK:
                 summary.blank += 1
             else:
                 summary.done += 1

@@ -29,10 +29,17 @@ def _default_data_dir() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "scholarocr"
 
 
+def user_env_file(environ: Mapping[str, str]) -> Path:
+    """Optional user-level settings file: ``SCHOLAROCR_ENV_FILE``, else ``<default data dir>/scholarocr.env``
+    (``%LOCALAPPDATA%/ScholarOCR/scholarocr.env`` on Windows, ``~/.local/share/scholarocr/scholarocr.env``)."""
+    explicit = environ.get("SCHOLAROCR_ENV_FILE")
+    return Path(explicit).expanduser() if explicit else _default_data_dir() / "scholarocr.env"
+
+
 def load_dotenv(path: Path, environ: dict[str, str]) -> None:
     """Minimal ``KEY=VALUE`` parser. Existing non-empty environment variables win.
 
-    An empty variable counts as unset: MCP clients (Gemini CLI, Antigravity) may pass a blank
+    An empty variable counts as unset: MCP clients (Antigravity CLI and others) may pass a blank
     ``GEMINI_API_KEY=""`` when a setting is left empty or a ``$VAR`` expands to nothing, and that
     must not hide the key in ``.env``.
     """
@@ -48,14 +55,25 @@ def load_dotenv(path: Path, environ: dict[str, str]) -> None:
             environ[key] = value
 
 
-PROVIDERS = ("gemini", "openrouter")
+# "host" (default from the environment): no model API; pages that need vision are transcribed by the MCP
+#   client's own model. An exported GEMINI_API_KEY / OPENROUTER_API_KEY is ignored unless a key provider
+#   is chosen explicitly with SCHOLAROCR_PROVIDER.
+# "auto" (opt-in): a key provider when its key is configured, otherwise host mode.
+# "gemini" / "openrouter": that provider (host mode if its key is missing). See Settings.effective_provider.
+PROVIDERS = ("auto", "host", "gemini", "openrouter")
+KEY_PROVIDERS = ("gemini", "openrouter")
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 class Settings(BaseModel):
-    # "gemini" (google-genai SDK) or "openrouter" (OpenAI-compatible chat completions with image input).
-    # The gemini_* model / timeout / retry / rpm fields apply to whichever provider is active.
-    provider: str = "gemini"
+    # Requested provider: "host", "auto", "gemini" (google-genai SDK) or "openrouter" (OpenAI-compatible
+    # chat completions with image input). ``effective_provider`` is what is used. ``from_env`` (CLI, MCP
+    # servers, every end user) defaults to "host" when SCHOLAROCR_PROVIDER is unset, so an exported key is
+    # never used by itself. Settings built in code default to "auto": a caller that passes a key or a
+    # transport explicitly has opted in.
+    # The gemini_* model / timeout / retry / rpm fields apply to whichever key provider is active.
+    provider: str = "auto"
+    host_image_max_side: int = 2000  # longest side of page images handed to the host model
     openrouter_api_key: str | None = Field(default=None, repr=False)
     openrouter_base_url: str = DEFAULT_OPENROUTER_BASE_URL
     openrouter_max_tokens: int = 16384  # output cap per call, reasoning included
@@ -84,19 +102,53 @@ class Settings(BaseModel):
     @field_validator("provider")
     @classmethod
     def _known_provider(cls, v: str) -> str:
-        v = v.strip().lower()
+        v = (v or "auto").strip().lower()
         if v not in PROVIDERS:
             raise ValueError(f"unknown provider {v!r}; expected one of {', '.join(PROVIDERS)}")
         return v
 
+    def _key_of(self, provider: str) -> str | None:
+        return self.openrouter_api_key if provider == "openrouter" else self.gemini_api_key
+
+    @property
+    def effective_provider(self) -> str:
+        """Provider actually used. Precedence:
+
+        1. ``provider="host"`` (what ``from_env`` uses when SCHOLAROCR_PROVIDER is unset): host mode,
+           even when keys are configured, so an exported key never switches on a paid provider by itself.
+        2. ``provider="gemini"`` / ``"openrouter"``: that provider when its key is set; without the key
+           there is no way to call it, so host mode is used and ``provider_note`` says why.
+        3. ``provider="auto"`` (opt-in via SCHOLAROCR_PROVIDER; the default for Settings built in code): Gemini if a Gemini key is set, else OpenRouter if an OpenRouter
+           key is set, else host mode.
+        """
+        p = self.provider
+        if p == "auto":
+            if self.gemini_api_key:
+                return "gemini"
+            if self.openrouter_api_key:
+                return "openrouter"
+            return "host"
+        if p in KEY_PROVIDERS and not self._key_of(p):
+            return "host"
+        return p
+
+    @property
+    def provider_note(self) -> str | None:
+        if self.provider in KEY_PROVIDERS and not self._key_of(self.provider):
+            return (f"SCHOLAROCR_PROVIDER={self.provider} but {self.api_key_env_name} is not set; using host mode "
+                    "(the MCP client's own model transcribes pages that need vision).")
+        return None
+
     @property
     def api_key(self) -> str | None:
-        """Key for the active provider."""
-        return self.openrouter_api_key if self.provider == "openrouter" else self.gemini_api_key
+        """Key for the effective provider (None in host mode)."""
+        p = self.effective_provider
+        return self._key_of(p) if p in KEY_PROVIDERS else None
 
     @property
     def api_key_env_name(self) -> str:
-        return "OPENROUTER_API_KEY" if self.provider == "openrouter" else "GEMINI_API_KEY"
+        p = self.provider if self.provider in KEY_PROVIDERS else self.effective_provider
+        return "OPENROUTER_API_KEY" if p == "openrouter" else "GEMINI_API_KEY"
 
     @field_validator("concurrency", "gemini_max_retries", "gemini_rpm_limit", "render_dpi", "max_pages")
     @classmethod
@@ -121,6 +173,9 @@ class Settings(BaseModel):
         d = self.model_dump(mode="json")
         d["gemini_api_key"] = "set" if self.gemini_api_key else "not set"
         d["openrouter_api_key"] = "set" if self.openrouter_api_key else "not set"
+        d["effective_provider"] = self.effective_provider
+        if self.provider_note:
+            d["provider_note"] = self.provider_note
         return d
 
     @classmethod
@@ -128,6 +183,9 @@ class Settings(BaseModel):
         env = dict(os.environ if environ is None else environ)
         if environ is None:
             load_dotenv(dotenv or Path.cwd() / ".env", env)
+            # Then the user-level file (lowest precedence): for clients that start the server outside the
+            # workspace, such as Antigravity plugins (cwd = plugin directory).
+            load_dotenv(user_env_file(env), env)
 
         def get(name: str) -> str | None:
             v = env.get(name)
@@ -152,6 +210,7 @@ class Settings(BaseModel):
             "SCHOLAROCR_PRICING_FILE": "pricing_file",
             "SCHOLAROCR_TEXT_LAYER_FONT": "text_layer_font",
             "SCHOLAROCR_RETENTION_DAYS": "retention_days",
+            "SCHOLAROCR_HOST_IMAGE_MAX_SIDE": "host_image_max_side",
         }
         for env_name, field in mapping.items():
             v = get(env_name)
@@ -159,8 +218,7 @@ class Settings(BaseModel):
                 kw[field] = v
         if kw.get("gemini_api_key") is None and get("GOOGLE_API_KEY"):
             kw["gemini_api_key"] = get("GOOGLE_API_KEY")
-        provider = (get("SCHOLAROCR_PROVIDER") or "gemini").strip().lower()
-        kw["provider"] = provider
+        kw["provider"] = (get("SCHOLAROCR_PROVIDER") or "host").strip().lower()
         if get("OPENROUTER_API_KEY"):
             kw["openrouter_api_key"] = get("OPENROUTER_API_KEY")
         if get("OPENROUTER_BASE_URL"):
@@ -169,6 +227,10 @@ class Settings(BaseModel):
             kw["openrouter_max_tokens"] = get("OPENROUTER_MAX_TOKENS")
         if get("OPENROUTER_REASONING_EFFORT"):
             kw["openrouter_reasoning_effort"] = get("OPENROUTER_REASONING_EFFORT")
+        # Resolve "auto" now so the model defaults below match the provider that will be used.
+        provider = kw["provider"] if kw["provider"] in KEY_PROVIDERS else cls(
+            provider=kw["provider"], gemini_api_key=kw.get("gemini_api_key"),
+            openrouter_api_key=kw.get("openrouter_api_key")).effective_provider
         if provider == "openrouter":
             # OPENROUTER_* model ids replace GEMINI_* ones, so one .env can hold both setups.
             for env_name, field in (("OPENROUTER_MODEL", "gemini_model"),

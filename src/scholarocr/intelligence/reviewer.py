@@ -9,7 +9,7 @@ from PIL import Image
 
 from ..config import Settings
 from ..schemas import Element, ElementType, Revision, Uncertainty
-from ..schemas.elements import MATH_TYPES
+from ..schemas.elements import MATH_TYPES, MODEL_METHODS
 from ..utils import now_iso
 from . import prompts
 from .extractor import _table, encode_image
@@ -28,7 +28,7 @@ def select_for_review(elements: list[Element], *, detail: str) -> list[Element]:
     look). With detail="high", every equation and table is reviewed too. Requires a bbox."""
     chosen = []
     for el in elements:
-        if el.bbox is None or el.type not in REVIEWABLE or el.extraction_method != "gemini":
+        if el.bbox is None or el.type not in REVIEWABLE or el.extraction_method not in MODEL_METHODS:
             continue
         flagged = el.uncertainty in (Uncertainty.MEDIUM, Uncertainty.HIGH) or el.type == ElementType.UNCERTAIN
         if detail == "high" and (el.type in MATH_TYPES or el.type == ElementType.TABLE):
@@ -63,7 +63,13 @@ def review_element(client: GeminiClient, settings: Settings, el: Element, crop: 
         parts=[encode_image(crop), TextPart(prompts.review_prompt(focus, candidate))], schema=ReviewResponse,
         prompt_version=prompts.PROMPT_VERSION, document_id=document_id, page_number=el.page_number,
     )
-    by = f"review:{info.model}"
+    apply_review(el, resp, by=f"review:{info.model}")
+    return resp.verdict
+
+
+def apply_review(el: Element, resp: ReviewResponse, *, by: str) -> None:
+    """Apply a review verdict in place (shared by the key-provider reviewer and host-mode submit_review).
+    Replaced values are kept in ``revisions``; the label follows ``uncertainty.after_review``."""
     ts = now_iso()
     if resp.verdict == "corrected":
         if resp.text and resp.text != el.content:
@@ -83,4 +89,3 @@ def review_element(client: GeminiClient, settings: Settings, el: Element, crop: 
                                  note=f"verdict={resp.verdict}" + (f"; {'; '.join(resp.notes)[:300]}" if resp.notes else "")))
     el.uncertainty = new_label
     el.uncertainty_reasons.append(f"reviewed: {resp.verdict}")
-    return resp.verdict

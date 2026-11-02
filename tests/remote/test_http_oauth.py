@@ -93,7 +93,8 @@ async def test_oauth_byok_flow_and_mcp_over_http(tmp_path, corpus):
 
             client_id, tokens = await _authorize(http, _pkce())
             assert tokens["token_type"].lower() == "bearer" and tokens["refresh_token"]
-            uid = store.user_id_for_key("gemini", USER_KEY)
+            uid = store.get_token(tokens["access_token"], "access")["user_id"]
+            assert uid != store.user_id_for_key("gemini", USER_KEY)  # the account id does not come from the key
             assert store.get_key(uid).api_key == USER_KEY
 
             url = fetcher.add("https://files.example/x", corpus["handwritten.png"].read_bytes())
@@ -163,3 +164,63 @@ async def test_noauth_mode_rejects_unknown_hosts(tmp_path):
             assert r.status_code == 421  # DNS-rebinding protection: Host must be the public host
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="https://ocr.example.com") as h:
             assert (await h.get("/byok/connect")).status_code == 404  # no OAuth pages without OAuth
+
+
+async def test_consent_without_key_then_link_a_key_later(tmp_path, corpus):
+    cfg = RemoteConfig(root_dir=tmp_path / "remote", secret="s" * 48, auth="oauth", public_url=BASE,
+                       calls_per_minute=0, ocr_calls_per_hour=0, pages_per_day=0)
+    fetcher, transports = FakeFetcher(), Transports()
+    app = create_app(cfg, transport_factory=transports, fetcher=fetcher, environ=dict(OPERATOR_ENV))
+    store = app.state.components.store
+    transport = httpx2.ASGITransport(app=app)
+    verifier, challenge = _pkce()
+    async with app.router.lifespan_context(app):
+        async with httpx2.AsyncClient(transport=transport, base_url=BASE) as http:
+            reg = await http.post("/register", json={"redirect_uris": [REDIRECT], "token_endpoint_auth_method": "none",
+                                                     "grant_types": ["authorization_code", "refresh_token"],
+                                                     "response_types": ["code"], "client_name": "ChatGPT"})
+            client_id = reg.json()["client_id"]
+            auth = await http.get("/authorize", params={
+                "response_type": "code", "client_id": client_id, "redirect_uri": REDIRECT, "code_challenge": challenge,
+                "code_challenge_method": "S256", "state": "s", "scope": "scholarocr", "resource": f"{BASE}/mcp"})
+            connect_url = auth.headers["location"]
+            page = await http.get(connect_url)
+            assert "Continue without a key" in page.text and 'value="host" checked' in page.text
+            assert "Use this server" not in page.text  # operator option only in operator-key mode
+            req = parse_qs(urlparse(connect_url).query)["req"][0]
+            ok = await http.post("/byok/connect", data={"req": req, "mode": "host", "consent": "1"})
+            assert ok.status_code == 302, ok.text
+            code = parse_qs(urlparse(ok.headers["location"]).query)["code"][0]
+            tok = (await http.post("/token", data={"grant_type": "authorization_code", "code": code,
+                                                   "redirect_uri": REDIRECT, "client_id": client_id,
+                                                   "code_verifier": verifier, "resource": f"{BASE}/mcp"})).json()
+            uid = store.get_token(tok["access_token"], "access")["user_id"]
+            assert store.get_key(uid).provider == "host" and store.get_key(uid).api_key is None
+
+            url = fetcher.add("https://files.example/h", corpus["handwritten.png"].read_bytes())
+            authed = httpx2.AsyncClient(transport=transport, base_url=BASE,
+                                        headers={"Authorization": f"Bearer {tok['access_token']}"})
+            async with authed, Client(streamable_http_client(f"{BASE}/mcp", http_client=authed)) as c:
+                up = await c.call_tool("ocr_upload", {"files": [url]})
+                assert not up.is_error and up.structured_content["mode"] == "host"
+                img = await c.call_tool("get_page_image", {"document_id": up.structured_content["document_id"]})
+                assert img.content[0].type == "image"
+                link = (await c.call_tool("manage_model_key", {"action": "link"})).structured_content["url"]
+            assert transports.built == []  # host mode: no model client, operator key untouched
+
+            path = link.replace(BASE, "")
+            form = await http.get(path)
+            assert form.status_code == 200 and 'type="password"' in form.text
+            assert form.headers["x-frame-options"] == "DENY"
+            token = parse_qs(urlparse(link).query)["t"][0]
+            bad = await http.post("/byok/key", data={"t": token, "provider": "gemini", "api_key": "short",
+                                                     "consent": "1"})
+            assert bad.status_code == 400 and store.get_key(uid).api_key is None
+            saved = await http.post("/byok/key", data={"t": token, "provider": "gemini", "api_key": USER_KEY,
+                                                       "consent": "1"})
+            assert saved.status_code == 200 and "Key saved" in saved.text
+            assert store.get_key(uid).api_key == USER_KEY  # same account id, key linked
+            reuse = await http.post("/byok/key", data={"t": token, "provider": "gemini", "api_key": USER_KEY,
+                                                       "consent": "1"})
+            assert reuse.status_code == 400  # one-time link
+            assert (await http.get("/byok/key?t=forged")).status_code == 400

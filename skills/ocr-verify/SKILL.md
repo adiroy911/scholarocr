@@ -11,7 +11,8 @@ description: >-
 1. Resolve the document_id. If the user gave a file name, find it with `list_documents`; if several
    documents match, ask which one.
 2. Call `verify_document` with the default scope. Do not set `review=true` unless the user asked for
-   a review pass, because it spends model calls.
+   a review pass: with an API key it spends model calls; in host mode it returns `review_candidates`
+   that you re-check yourself (`get_source_region`, then `submit_review`).
 3. Summarize findings by severity (`error`, `warning`, `info`) with page numbers and element ids.
    Errors must not be glossed over.
 4. For each element with uncertainty `high` or `unresolved` (at most 5; ask before doing more), call

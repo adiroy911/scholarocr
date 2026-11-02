@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScholarOCR page image</title>
+<style>
+:root { --bg: #ffffff; --fg: #1c1c1a; --muted: #6a6a64; --line: #e3e2da; --chip: #f2f1ec; --ok: #1d7a3a; --warn: #a3271c; }
+:root[data-theme="dark"] { --bg: #1b1b1a; --fg: #ecebe5; --muted: #a09f97; --line: #393935; --chip: #262624; --ok: #6fd08f; --warn: #ff8a7a; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #1b1b1a; --fg: #ecebe5; --muted: #a09f97; --line: #393935; --chip: #262624; --ok: #6fd08f; --warn: #ff8a7a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.wrap { padding: 12px 16px 16px; }
+h1 { font-size: 15px; margin: 0 0 4px; font-weight: 650; }
+.meta, .status { color: var(--muted); font-size: 12.5px; }
+.status.ok { color: var(--ok); } .status.warn { color: var(--warn); }
+img { display: block; max-width: 100%; height: auto; margin-top: 10px; border: 1px solid var(--line); border-radius: 4px; }
+button { font: inherit; font-size: 13px; padding: 5px 12px; margin-top: 10px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--chip); color: var(--fg); cursor: pointer; }
+button[disabled] { opacity: .45; cursor: default; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="title">Page waiting for transcription</h1>
+  <div class="meta" id="meta"></div>
+  <div class="status" id="status">Waiting for the page image…</div>
+  <button id="send" disabled>Send this page to the assistant</button>
+  <div id="pagebox"></div>
+</div>
+<script>
+(function () {
+  "use strict";
+  // Host mode in ChatGPT: the tool result carries the page image in _meta (component-only, hidden from the
+  // model). ChatGPT does not reliably show image content of tool results to its model, so this component
+  // makes the image model-visible the documented way: upload it (window.openai.uploadFile) and list the file
+  // id in widget state imageIds, which the model receives on later turns. MCP Apps hosts additionally get
+  // ui/update-model-context with an image block.
+  var META_KEY = "scholarocr/pageImage";
+  var state = { info: null, image: null, fileId: null, sent: false, shown: null };
+  var pending = {}, nextId = 1, bridgeReady = false;
+
+  function isObj(v) { return v !== null && typeof v === "object"; }
+  function setStatus(text, cls) { var s = document.getElementById("status"); s.textContent = text; s.className = "status" + (cls ? " " + cls : ""); }
+  function post(msg) { try { window.parent.postMessage(msg, "*"); } catch (e) { /* not embedded */ } }
+  function request(method, params) {
+    var id = nextId++;
+    return new Promise(function (resolve, reject) {
+      pending[id] = { resolve: resolve, reject: reject };
+      post({ jsonrpc: "2.0", id: id, method: method, params: params || {} });
+      setTimeout(function () { if (pending[id]) { delete pending[id]; reject(new Error("timeout")); } }, 8000);
+    });
+  }
+  function notify(method, params) { post({ jsonrpc: "2.0", method: method, params: params || {} }); }
+  function applyTheme(ctx) {
+    if (isObj(ctx) && (ctx.theme === "dark" || ctx.theme === "light")) document.documentElement.setAttribute("data-theme", ctx.theme);
+  }
+  function b64ToBlob(data, mime) {
+    var bin = atob(data), n = bin.length, bytes = new Uint8Array(n);
+    for (var i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+  function prompt() {
+    var i = state.info || {};
+    return "Here is page " + i.page_number + " of ScholarOCR document " + i.document_id + " (attached image). " +
+      "Transcribe it exactly following the rules from get_page_image, then call submit_page_content.";
+  }
+  function sendToAssistant() {
+    if (state.sent || !window.openai || typeof window.openai.sendFollowUpMessage !== "function") return;
+    state.sent = true;
+    document.getElementById("send").disabled = true;
+    window.openai.sendFollowUpMessage({ prompt: prompt() }).then(function () {
+      setStatus("Page sent to the assistant.", "ok");
+    }, function () { state.sent = false; document.getElementById("send").disabled = false; });
+  }
+  function makeVisible() {
+    var img = state.image, info = state.info || {};
+    if (!img) return;
+    var tried = false;
+    if (window.openai && typeof window.openai.uploadFile === "function") {
+      tried = true;
+      var file = new File([b64ToBlob(img.data, img.mime_type)], "page-" + info.page_number + "." + (img.mime_type.split("/")[1] || "png"),
+        { type: img.mime_type });
+      window.openai.uploadFile(file).then(function (res) {
+        var fileId = isObj(res) ? (res.fileId || res.file_id || res.id) : null;
+        if (!fileId) throw new Error("no file id");
+        state.fileId = fileId;
+        var prev = isObj(window.openai.widgetState) ? window.openai.widgetState : {};
+        var next = {};
+        for (var k in prev) if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
+        next.document_id = info.document_id; next.page_number = info.page_number; next.imageIds = [fileId];
+        return window.openai.setWidgetState(next);
+      }).then(function () {
+        setStatus("Image attached for the assistant (it sees it on the next turn).", "ok");
+        var b = document.getElementById("send");
+        b.disabled = typeof window.openai.sendFollowUpMessage !== "function";
+        sendToAssistant();  // one follow-up turn per page so the model receives the image now
+      }, function () {
+        setStatus("Could not attach the image for the assistant here. Ask it to try again, or use a key.", "warn");
+      });
+    }
+    if (bridgeReady) {
+      tried = true;
+      request("ui/update-model-context", { content: [{ type: "image", data: img.data, mimeType: img.mime_type }] })
+        .then(function () { if (!state.fileId) setStatus("Image shared with the assistant's context.", "ok"); }, function () { });
+    }
+    if (!tried) setStatus("This host cannot pass the image to the assistant from here.", "warn");
+  }
+  function render(info, meta) {
+    if (isObj(info)) state.info = info;
+    var image = isObj(meta) ? meta[META_KEY] : null;
+    if (!isObj(image) || typeof image.data !== "string") return;
+    var key = (state.info ? state.info.document_id + ":" + state.info.page_number : "") + ":" + image.data.length;
+    if (state.shown === key) return;
+    state.shown = key; state.image = image; state.sent = false; state.fileId = null;
+    var i = state.info || {};
+    document.getElementById("title").textContent = "Page " + (i.page_number || "?") + " waiting for transcription";
+    document.getElementById("meta").textContent = (i.document_id || "") +
+      (i.pages_waiting_after_this != null ? " · " + i.pages_waiting_after_this + " more page(s) after this one" : "");
+    var box = document.getElementById("pagebox");
+    while (box.firstChild) box.removeChild(box.firstChild);
+    var el = document.createElement("img");
+    el.alt = "Page " + (i.page_number || "") + " to transcribe";
+    el.src = "data:" + image.mime_type + ";base64," + image.data;
+    box.appendChild(el);
+    setStatus("Attaching the image for the assistant…");
+    makeVisible();
+  }
+  document.getElementById("send").addEventListener("click", function () { state.sent = false; sendToAssistant(); });
+  window.addEventListener("message", function (ev) {
+    if (ev.source !== window.parent) return;
+    var msg = ev.data;
+    if (!isObj(msg) || msg.jsonrpc !== "2.0") return;
+    if (msg.id != null && pending[msg.id]) {
+      var p = pending[msg.id]; delete pending[msg.id];
+      if (msg.error) p.reject(msg.error); else p.resolve(msg.result);
+      return;
+    }
+    if (msg.method === "ui/notifications/tool-result" && isObj(msg.params)) {
+      render(msg.params.structuredContent || msg.params.structured_content, msg.params._meta || msg.params.meta);
+    } else if (msg.method === "ui/notifications/host-context-changed") applyTheme(msg.params);
+  });
+  function fromOpenAI() {
+    if (!window.openai) return;
+    if (window.openai.theme) applyTheme({ theme: window.openai.theme });
+    if (window.openai.toolResponseMetadata) render(window.openai.toolOutput, window.openai.toolResponseMetadata);
+  }
+  window.addEventListener("openai:set_globals", fromOpenAI);
+  fromOpenAI();
+  request("ui/initialize", { protocolVersion: "2026-01-26", appCapabilities: {},
+    clientInfo: { name: "scholarocr-page-image", version: "1" } }).then(function (res) {
+    bridgeReady = true;
+    if (isObj(res)) applyTheme(res.hostContext);
+    notify("ui/notifications/initialized", {});
+    if (state.image && !state.fileId) makeVisible();
+  }, function () { /* not an MCP Apps host */ });
+})();
+</script>
+</body>
+</html>

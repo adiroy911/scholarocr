@@ -282,6 +282,9 @@ class GeminiClient:
 
     @property
     def available(self) -> bool:
+        """True when server-side model calls are possible. Explicit host mode never calls a model."""
+        if self.settings.provider == "host":
+            return False
         return self._transport is not None or bool(self.settings.api_key)
 
     def _get_transport(self) -> Transport:
@@ -289,10 +292,11 @@ class GeminiClient:
             s = self.settings
             if not s.api_key:
                 raise GeminiUnavailableError(
-                    f"{s.api_key_env_name} is not configured (provider={s.provider}). Visual OCR, classification "
-                    "and review need it; pages with a reliable text layer can still be processed deterministically."
+                    f"{s.api_key_env_name} is not configured (provider={s.provider}, running in host mode). "
+                    "Server-side model calls need a key; in host mode the MCP client's own model transcribes "
+                    "pages instead (get_page_image -> submit_page_content)."
                 )
-            if s.provider == "openrouter":
+            if s.effective_provider == "openrouter":
                 self._transport = OpenRouterTransport(s.api_key, s.gemini_timeout_seconds, s.openrouter_base_url,
                                                       s.openrouter_max_tokens, s.openrouter_reasoning_effort)
             else:

@@ -36,7 +36,7 @@ Document types use dashes or underscores: `exam-paper`, `previous-year-paper`, `
 | 3 | not found (document/job/element) |
 | 4 | access denied (path outside authorized directories) |
 | 5 | invalid input (bad range, corrupt/encrypted/unsupported file, limits) |
-| 6 | Gemini unavailable or failed (e.g. scanned pages without `GEMINI_API_KEY`) |
+| 6 | model unavailable or failed: in host mode (no key) pages that need vision are left `awaiting_transcription`, which only an MCP client's model or a key can finish |
 | 7 | finished with problems (partial job, or verification found errors) |
 | 130 | interrupted; job cancelled and resumable |
 

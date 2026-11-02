@@ -16,9 +16,12 @@ class JobStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"  # process died mid-run (resumable)
+    # Host mode: the server's work is done; some pages wait for the host model (submit_page_content).
+    AWAITING_TRANSCRIPTION = "awaiting_transcription"
 
 
-TERMINAL = {JobStatus.COMPLETED, JobStatus.PARTIAL, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.INTERRUPTED}
+TERMINAL = {JobStatus.COMPLETED, JobStatus.PARTIAL, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.INTERRUPTED,
+            JobStatus.AWAITING_TRANSCRIPTION}
 
 
 class Job(BaseModel):
@@ -61,6 +64,9 @@ class VerificationReport(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     stats: dict[str, Any] = Field(default_factory=dict)
     reviewed_elements: list[str] = Field(default_factory=list)
+    # Host mode with review=True: elements the host model should re-check (get_source_region -> submit_review).
+    review_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         out = {s.value: 0 for s in Severity}

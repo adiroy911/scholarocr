@@ -1,10 +1,11 @@
-"""Persistent state for remote mode: encrypted BYO keys, OAuth clients, codes and tokens.
+"""Persistent state for remote mode: accounts with optional encrypted keys, OAuth clients, codes, tokens.
 
+* Every connection gets an account with a random id (``u_`` + 24 hex) at the OAuth consent step. The id
+  does not depend on any key: a model key is optional (without one the account runs in host mode, where
+  ChatGPT's own model does the reading) and can be linked, replaced or unlinked later.
 * Model API keys are encrypted at rest with Fernet (AES-128-CBC + HMAC-SHA256) under a key derived
   from ``SCHOLAROCR_REMOTE_SECRET``. They are never logged and never returned by any tool.
-* OAuth codes and tokens are stored only as SHA-256 hashes.
-* A user id is derived from the API key itself (HMAC), so reconnecting with the same key returns to
-  the same sandbox and no ScholarOCR account is needed.
+* OAuth codes and tokens, and one-time key-link tokens, are stored only as SHA-256 hashes.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import sqlite3
 import threading
 import time
@@ -46,13 +48,22 @@ def derive_key(secret: str, label: str) -> bytes:
     return hmac.new(secret.encode(), label.encode(), hashlib.sha256).digest()
 
 
+HOST_PROVIDER = "host"  # account without a model key
+
+
 @dataclass(frozen=True)
 class UserKey:
+    """An account. ``api_key`` None: host mode, or the operator's key when ``operator`` (operator mode only)."""
+
     user_id: str
     provider: str
-    api_key: str | None  # None = this user runs on the operator's key (operator mode only)
+    api_key: str | None
     operator: bool
     key_hint: str | None
+
+    @property
+    def has_own_key(self) -> bool:
+        return bool(self.api_key) and self.provider != HOST_PROVIDER
 
 
 class AuthStore:
@@ -78,7 +89,28 @@ class AuthStore:
                 conn.close()
 
     # ------------------------------------------------------------------ users / keys
+    def create_account(self, *, operator: bool = False) -> str:
+        """A new account with a random id and no key (host mode, or operator quota when ``operator``)."""
+        user_id = "u_" + secrets.token_hex(12)
+        self.put_key(user_id, HOST_PROVIDER, None, operator=operator)
+        return user_id
+
+    def link_key(self, user_id: str, provider: str, api_key: str) -> None:
+        """Attach (or replace) the account's own model key. The account id never changes."""
+        if self.get_key(user_id) is None:
+            raise KeyError("unknown account")
+        self.put_key(user_id, provider, api_key)
+
+    def unlink_key(self, user_id: str) -> bool:
+        """Remove the account's model key; the account (documents, sessions) stays, now in host mode."""
+        with self._conn() as c:
+            n = c.execute("UPDATE user_keys SET provider=?, ciphertext=NULL, key_hint=NULL, operator=0, last_used=? "
+                          "WHERE user_id=?", (HOST_PROVIDER, time.time(), user_id)).rowcount
+        return bool(n)
+
     def user_id_for_key(self, provider: str, api_key: str) -> str:
+        """Deterministic id from a key. Legacy (accounts created before 0.2 used it); new accounts get random
+        ids from ``create_account``. Kept so existing sandboxes stay reachable and for tests."""
         mac = hmac.new(self._id_key, f"{provider}:{api_key}".encode(), hashlib.sha256).hexdigest()
         return f"u_{mac[:24]}"
 
@@ -103,9 +135,27 @@ class AuthStore:
 
             try:
                 api_key = self._fernet.decrypt(row["ciphertext"]).decode()
-            except InvalidToken:  # secret rotated: the stored key is unusable
-                return None
+            except InvalidToken:  # secret rotated: the stored key is unusable; the account falls back to host
+                return UserKey(user_id, HOST_PROVIDER, None, False, None)
         return UserKey(user_id, row["provider"], api_key, bool(row["operator"]), row["key_hint"])
+
+    def account_exists(self, user_id: str) -> bool:
+        with self._conn() as c:
+            return c.execute("SELECT 1 FROM user_keys WHERE user_id=?", (user_id,)).fetchone() is not None
+
+    # ------------------------------------------------------------------ one-time key-link tokens
+    def new_link_token(self, user_id: str, ttl_s: float) -> str:
+        token = secrets.token_urlsafe(32)
+        self.put_pending("link:" + sha256_hex(token), {"user_id": user_id, "kind": "key_link"}, ttl_s)
+        return token
+
+    def peek_link_token(self, token: str) -> str | None:
+        data = self.get_pending("link:" + sha256_hex(token or ""))
+        return data["user_id"] if data and data.get("kind") == "key_link" else None
+
+    def consume_link_token(self, token: str) -> str | None:
+        data = self.pop_pending("link:" + sha256_hex(token or ""))
+        return data["user_id"] if data and data.get("kind") == "key_link" else None
 
     def touch_user(self, user_id: str) -> None:
         with self._conn() as c:

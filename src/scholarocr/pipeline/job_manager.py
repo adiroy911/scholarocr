@@ -137,9 +137,17 @@ class JobManager:
                 status = JobStatus.PARTIAL
             elif summary.failed:
                 status = JobStatus.FAILED
+            elif summary.awaiting:
+                status = JobStatus.AWAITING_TRANSCRIPTION
             else:
                 status = JobStatus.COMPLETED
-            self.repo.update_job(job_id, status=status, stage="done", completed_pages=summary.finished,
+            stage = "done"
+            if summary.awaiting:
+                pages = sorted(summary.awaiting_pages)
+                shown = ", ".join(map(str, pages[:30])) + (" ..." if len(pages) > 30 else "")
+                stage = (f"{summary.awaiting} page(s) awaiting transcription by the client's model (host mode): "
+                         f"{shown}")
+            self.repo.update_job(job_id, status=status, stage=stage, completed_pages=summary.finished,
                                  failed_pages=summary.failed, cached_pages=summary.cached, errors=summary.errors[-50:])
         except Exception as exc:
             log.exception("job %s crashed", job_id)

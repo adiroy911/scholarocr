@@ -1,9 +1,14 @@
-"""One ``ScholarOCR`` service instance per user, built on that user's sandbox and key.
+"""One ``ScholarOCR`` service instance per user, built on that user's sandbox and (optional) key.
 
-This is where bring-your-own-key is enforced. The per-user ``Settings`` are derived from the
-operator's environment with every model API key REMOVED; the user's own key (from the encrypted
-store) is then inserted. The operator's ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY`` /
-``OPENROUTER_API_KEY`` are only used when ``SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE=1``.
+The per-user ``Settings`` are derived from the operator's environment with every model API key REMOVED.
+Then, in this order:
+
+1. the account has its own linked key -> that provider and key;
+2. ``SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE=1`` -> the operator's key (the operator pays);
+3. otherwise -> host mode (``SCHOLAROCR_PROVIDER=host``): no server-side model at all; pages that need
+   vision wait for ChatGPT's own model (get_page_image -> submit_page_content).
+
+The operator's ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY`` / ``OPENROUTER_API_KEY`` are only ever used in case 2.
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ from typing import Callable, Mapping
 from ..config import Settings, load_dotenv
 from ..intelligence.gemini_client import Transport
 from ..service import ScholarOCR
-from .config import RemoteConfig
+from .config import REMOTE_PROVIDERS, RemoteConfig
 from .sandbox import UserSandbox
 from .store import AuthStore, UserKey
 
@@ -30,7 +35,7 @@ TransportFactory = Callable[[str, str, str | None], Transport | None]  # (user_i
 
 
 class ByoKeyRequired(Exception):
-    """The user has no model key and the operator has not enabled operator-key mode."""
+    """Operator-key mode is on but the operator configured no key for the provider (a server misconfiguration)."""
 
 
 def operator_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -42,21 +47,25 @@ def operator_environment(environ: Mapping[str, str] | None = None) -> dict[str, 
 
 def user_settings(cfg: RemoteConfig, sandbox: UserSandbox, user_key: UserKey | None,
                   environ: Mapping[str, str]) -> Settings:
-    """Settings for one user's service. Raises ByoKeyRequired when no usable key exists."""
+    """Settings for one user's service: own key, else operator key (operator mode only), else host mode."""
     env = {k: v for k, v in environ.items() if k not in DROPPED_ENV_VARS}
-    if user_key is not None and user_key.api_key:
+    if user_key is not None and user_key.has_own_key:
         provider, api_key = user_key.provider, user_key.api_key
     elif cfg.operator_key_mode:
-        provider = (user_key.provider if user_key else None) or (environ.get("SCHOLAROCR_PROVIDER") or "gemini")
+        provider = (user_key.provider if user_key and user_key.provider in REMOTE_PROVIDERS else None) or (
+            environ.get("SCHOLAROCR_PROVIDER") or "gemini")
         provider = provider.strip().lower()
+        if provider not in REMOTE_PROVIDERS:
+            provider = "gemini"
         api_key = environ.get("OPENROUTER_API_KEY") if provider == "openrouter" else (
             environ.get("GEMINI_API_KEY") or environ.get("GOOGLE_API_KEY"))
         if not api_key:
             raise ByoKeyRequired(f"operator-key mode is on but the operator has no {provider} key configured")
     else:
-        raise ByoKeyRequired("no model API key is linked to this account")
+        provider, api_key = "host", None
     env["SCHOLAROCR_PROVIDER"] = provider
-    env["OPENROUTER_API_KEY" if provider == "openrouter" else "GEMINI_API_KEY"] = api_key
+    if api_key:
+        env["OPENROUTER_API_KEY" if provider == "openrouter" else "GEMINI_API_KEY"] = api_key
     s = Settings.from_env(environ=env)
     return s.model_copy(update={
         "data_dir": sandbox.data_dir,
@@ -89,14 +98,15 @@ class ServicePool:
         user_key = self.key_for(user_id)
         sandbox = self.sandbox(user_id)
         settings = user_settings(self.cfg, sandbox, user_key, self.environ)
-        fingerprint = f"{settings.provider}:{hash(settings.api_key)}"
+        fingerprint = f"{settings.effective_provider}:{hash(settings.api_key)}"
         with self._lock:
             hit = self._services.get(user_id)
             if hit and hit[0] == fingerprint:
                 self._services.move_to_end(user_id)
                 return hit[1]
-            transport = (self.transport_factory(user_id, settings.provider, settings.api_key)
-                         if self.transport_factory else None)
+            # Host mode has no key and therefore no transport at all.
+            transport = (self.transport_factory(user_id, settings.effective_provider, settings.api_key)
+                         if self.transport_factory and settings.api_key else None)
             svc = ScholarOCR(settings, transport=transport)
             self._services[user_id] = (fingerprint, svc)
             while len(self._services) > self.cfg.max_services:
@@ -104,7 +114,7 @@ class ServicePool:
             return svc
 
     def get_readonly(self, user_id: str) -> ScholarOCR:
-        """A service for reading/deleting stored results even when no key is linked any more."""
+        """A service for reading/deleting stored results even when the configured provider is unusable."""
         try:
             return self.get(user_id)
         except ByoKeyRequired:

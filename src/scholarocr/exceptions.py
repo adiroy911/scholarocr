@@ -76,3 +76,16 @@ class JobError(ScholarOCRError):
 
 class ExportError(ScholarOCRError):
     code = "export_error"
+
+
+class SubmissionRejected(InputError):
+    """Host mode: content submitted by the client's model failed validation. ``details["errors"]`` lists
+    each problem with its JSON path and a fix; nothing was stored, so the model can correct and resubmit."""
+
+    code = "submission_rejected"
+
+
+class ModelUnavailableError(GeminiUnavailableError):
+    """A server-side model call was requested in host mode (no key, no sampling)."""
+
+    code = "model_unavailable"

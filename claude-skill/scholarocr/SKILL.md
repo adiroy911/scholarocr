@@ -7,8 +7,10 @@ description: Read, extract and verify content from scanned or complex academic d
 
 ScholarOCR is a shared OCR/intelligence backend. It turns academic documents into a structured,
 source-traceable representation (pages → elements with type, text, LaTeX, tables, bounding boxes,
-uncertainty). **Never re-implement OCR yourself and never guess unreadable content**: call the
-engine, then reason over what it returns.
+uncertainty). **Always go through the engine and never guess unreadable content.** It needs no API
+key: in host mode (the default without a key) it does all deterministic work and hands you, one page at
+a time, the page images that need vision; you transcribe them into its schema and it validates, stores
+and verifies the result.
 
 ## When to use it
 
@@ -26,6 +28,14 @@ reliable text layer) and gives you page/element references.
    - Pass hints you actually know ("Class 11 chemistry exam", `document_type="handwritten_notes"`).
    - Large documents return a `job_id`; poll `get_document_status(job_id=...)` every so often
      (don't spin). Process only the pages you need (`pages="40-55"`) when the task is local.
+   - The result says `mode`. With `"host"`, pages in `awaiting_transcription` need YOUR vision:
+     loop `get_page_image(document_id)` (one image + rules + element shape) -> transcribe exactly ->
+     `submit_page_content(document_id, page_number, elements=[...])`. Boxes are
+     `box_2d=[ymin,xmin,ymax,xmax]` in 0-1000 of that image; unreadable parts are type `uncertain`
+     with uncertainty `unresolved`. A rejected submission lists every problem (path, problem, fix):
+     fix all and resubmit the whole page. Follow `next_waiting_page`; never re-request a done page.
+     Optional second pass: `get_source_region(element_id)` then `submit_review(...)` for
+     `review_suggested` elements.
 3. **Retrieve narrowly**: `get_document_content(document_id, pages=..., element_types=[...])`
    (markdown by default, paginated via `next_cursor`). Use `get_page_content` for the full IR of a
    page (bounding boxes, uncertainty reasons, quality, transforms).
@@ -44,8 +54,11 @@ reliable text layer) and gives you page/element references.
 - Never fill in `unresolved` text. Tell the user it was unreadable and where (page, element).
 - Don't delete anything unless the user explicitly asks. `delete_document(mode="all", confirm=true)`
   removes ScholarOCR's preserved copy; the user's original file is never touched.
-- `verify_document(review=true)` and `ocr_document(detail="high")` spend extra model calls — use
-  them for difficult math/handwriting or when the user needs maximum fidelity.
+- With a key, `verify_document(review=true)` and `ocr_document(detail="high")` spend extra model
+  calls. In host mode `verify_document(review=true)` returns `review_candidates` for you to re-check.
+- Host-mode transcription is a single pass by you, a general model; the key-mode pipeline is a
+  dedicated OCR prompt plus a second model. Say so when exactness matters.
+- `classify_document` needs a key; in host mode classify from the content yourself.
 - File access is limited to the server's authorized directories; on `access_denied`, tell the user
   to add the folder to `SCHOLAROCR_ALLOWED_DIRS` rather than copying files around.
 
@@ -54,8 +67,8 @@ reliable text layer) and gives you page/element references.
 `scholarocr --json process FILE [--pages 1-10] [--type exam-paper] [--context "..."]`, then
 `scholarocr content DOC_ID [--pages ..] [--types equation,table]`, `scholarocr region DOC_ID
 --element ID --out crop.png` (then view the PNG), `scholarocr verify DOC_ID`,
-`scholarocr export DOC_ID --format docx`. Exit code 6 = Gemini key missing/failed, 7 = finished
-with problems (partial pages / verification errors).
+`scholarocr export DOC_ID --format docx`. Exit code 6 = no model key (pages await transcription,
+which only an MCP host or a key can do) or model failure, 7 = finished with problems.
 
 ## References (read when needed)
 

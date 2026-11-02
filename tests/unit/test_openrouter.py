@@ -54,8 +54,15 @@ def test_settings_provider_mapping():
     assert s.gemini_model == "z-ai/glm-5.3-flash" and s.gemini_review_model == "z-ai/glm-5.3-flash"
     assert s.math_model == "z-ai/glm-5.3-flash"
     assert Settings.from_env({"SCHOLAROCR_PROVIDER": "openrouter"}).gemini_model == DEFAULT_OPENROUTER_MODEL
-    g = Settings.from_env({"GEMINI_MODEL": "gemini-x", "OPENROUTER_API_KEY": "k"})
-    assert g.provider == "gemini" and g.gemini_model == "gemini-x" and g.api_key is None
+    # default (no SCHOLAROCR_PROVIDER) is host: an exported key alone is ignored
+    d = Settings.from_env({"GEMINI_MODEL": "gemini-x", "OPENROUTER_API_KEY": "k"})
+    assert d.provider == "host" and d.effective_provider == "host" and d.api_key is None
+    # auto (opt-in): an OpenRouter key alone selects OpenRouter
+    g = Settings.from_env({"SCHOLAROCR_PROVIDER": "auto", "GEMINI_MODEL": "gemini-x", "OPENROUTER_API_KEY": "k"})
+    assert g.provider == "auto" and g.effective_provider == "openrouter" and g.api_key == "k"
+    assert g.gemini_model == DEFAULT_OPENROUTER_MODEL
+    explicit = Settings.from_env({"SCHOLAROCR_PROVIDER": "gemini", "GEMINI_MODEL": "gemini-x", "OPENROUTER_API_KEY": "k"})
+    assert explicit.effective_provider == "host" and explicit.api_key is None and explicit.gemini_model == "gemini-x"
     red = s.redacted()
     assert red["openrouter_api_key"] == "set" and "'k'" not in str(red)
     with pytest.raises(ValueError):

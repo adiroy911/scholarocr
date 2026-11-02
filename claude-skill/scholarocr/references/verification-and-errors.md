@@ -17,7 +17,7 @@ ragged tables, question numbering gaps, unresolved/high-uncertainty elements, st
 ## Source traceability
 Every element carries `source.page_number`, `source_file`, `source_page_index`, `page_image` and,
 for figures/tables/equations/uncertain regions, `region_image`. `get_source_region(element_id)` returns
-the original crop; boxes from Gemini are approximate (`bbox_source="model_estimate"`), so the crop
+the original crop; boxes from a model (Gemini, OpenRouter, or you in host mode) are approximate (`bbox_source="model_estimate"`), so the crop
 has padding.
 
 ## Error codes
@@ -29,7 +29,8 @@ has padding.
 | `corrupt_document` | damaged file | ask for another copy |
 | `limit_exceeded` | file size / page limit | process a page range or raise the limit |
 | `not_found` | unknown document/job/element id | `list_documents` |
-| `gemini_unavailable` | no API key on the server | scanned pages fail; text-layer pages still work; tell the user to set `GEMINI_API_KEY` |
+| `submission_rejected` | your `submit_page_content`/`submit_review` failed validation | fix every `details.errors[]` item (path, problem, fix) and resubmit the whole page; nothing was stored |
+| `model_unavailable` / `gemini_unavailable` | a tool needs a server-side model and none is configured (host mode) | do the task yourself from the content (e.g. classification), or the user configures `GEMINI_API_KEY` / `OPENROUTER_API_KEY` |
 | `gemini_error` | API failure after retries (rate limit, auth, model not found) | wait and `manage_job(resume)`; auth/model errors need configuration fixes |
 | `response_validation_failed` | model output invalid twice | the page is marked failed (never silently accepted); resume later or try `force_visual`/`detail` changes |
 | `job_error` | job conflict (document already processing) | poll the existing job |

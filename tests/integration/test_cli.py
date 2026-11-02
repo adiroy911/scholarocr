@@ -8,13 +8,23 @@ import sys
 import pytest
 
 
+MODEL_ENV = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY", "SCHOLAROCR_PROVIDER")
+
+
+def clean_env(**extra) -> dict:
+    """The inherited environment without any model key or provider choice (host mode)."""
+    env = {k: v for k, v in os.environ.items() if k not in MODEL_ENV}
+    env.update(extra)
+    return env
+
+
 @pytest.fixture
 def run(settings, corpus, tmp_path):
-    # Run outside the repo: the CLI reads .env from its working directory and treats an empty
-    # GEMINI_API_KEY as unset, so a developer's real key would otherwise be used (a live API call).
-    env = {**os.environ, "SCHOLAROCR_DATA_DIR": str(settings.data_dir),
-           "SCHOLAROCR_ALLOWED_DIRS": str(corpus["clean_digital.pdf"].parent), "GEMINI_API_KEY": "",
-           "GOOGLE_API_KEY": ""}
+    # Run outside the repo: the CLI reads .env from its working directory and treats an empty variable as
+    # unset, so a developer's real key would otherwise be used (a live API call). Every model key is removed
+    # (OPENROUTER_API_KEY alone would select OpenRouter under SCHOLAROCR_PROVIDER=auto) and host mode pinned.
+    env = clean_env(SCHOLAROCR_DATA_DIR=str(settings.data_dir), SCHOLAROCR_PROVIDER="host",
+                    SCHOLAROCR_ALLOWED_DIRS=str(corpus["clean_digital.pdf"].parent))
 
     def _run(*args):
         p = subprocess.run([sys.executable, "-m", "scholarocr.cli.main", *args], capture_output=True, text=True,
@@ -57,8 +67,8 @@ def test_cli_full_workflow(run, corpus, tmp_path):
 
 
 def test_cli_exit_codes(run, corpus, tmp_path):
-    code, _, err = run("process", str(corpus["scanned_poor.pdf"]))
-    assert code == 6 and "GEMINI_API_KEY" in (err + _)
+    code, out, err = run("process", str(corpus["scanned_poor.pdf"]))
+    assert code == 6 and "GEMINI_API_KEY" in (err + out) and "awaiting" in out  # host mode: needs a model
     code, _, err = run("process", str(corpus["encrypted.pdf"]))
     assert code == 5 and "password" in err
     outside = tmp_path / "x.pdf"
@@ -73,7 +83,19 @@ def test_cli_exit_codes(run, corpus, tmp_path):
     assert code == 2
 
 
-def test_cli_info_redacts_secrets(settings, corpus):
-    env = {**os.environ, "SCHOLAROCR_DATA_DIR": str(settings.data_dir), "GEMINI_API_KEY": "sk-very-secret"}
-    p = subprocess.run([sys.executable, "-m", "scholarocr.cli.main", "info"], capture_output=True, text=True, env=env)
+def test_cli_info_redacts_secrets(settings, corpus, tmp_path):
+    # ``info`` makes no model call; the fake key only checks redaction and provider selection. A key alone
+    # never selects a provider (unset = host), so ask for gemini explicitly.
+    env = clean_env(SCHOLAROCR_DATA_DIR=str(settings.data_dir), GEMINI_API_KEY="sk-very-secret",
+                    SCHOLAROCR_PROVIDER="gemini")
+    p = subprocess.run([sys.executable, "-m", "scholarocr.cli.main", "info"], capture_output=True, text=True, env=env,
+                       cwd=str(tmp_path))
     assert p.returncode == 0 and "sk-very-secret" not in p.stdout and '"gemini_available": true' in p.stdout
+    assert '"mode": "gemini"' in p.stdout
+
+
+def test_cli_without_keys_is_host_mode(settings, corpus, tmp_path):
+    env = clean_env(SCHOLAROCR_DATA_DIR=str(settings.data_dir))
+    p = subprocess.run([sys.executable, "-m", "scholarocr.cli.main", "info"], capture_output=True, text=True, env=env,
+                       cwd=str(tmp_path))
+    assert p.returncode == 0 and '"mode": "host"' in p.stdout and '"gemini_available": false' in p.stdout

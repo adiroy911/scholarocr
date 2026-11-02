@@ -1,9 +1,10 @@
 # Roadmap and open items
 
 ## Not yet verified (do first)
-1. **Live Gemini run.** No API key was available during development. Run `SCHOLAROCR_RUN_LIVE_TESTS=1 pytest tests/live -m live` and `python benchmarks/run_benchmark.py --live`. Then check the default model IDs and the extraction quality on real scans.
+0. **Host mode with live clients.** Antigravity CLI ran the `get_page_image` -> `submit_page_content` loop on one scanned page on 2026-11-03. Still to run: Antigravity on multi-page documents, a math page whose LaTeX is rejected and resubmitted, and a long document (context use); Claude Code and ChatGPT (developer mode; the page-image widget path in CHATGPT_APP.md 1.5 is unverified). Measure host-mode accuracy against key mode on the same pages.
+1. **Live Gemini run.** Benchmarks ran live on 2026-11-02 (`benchmarks/results/`); re-run the opt-in live tests after changes. Run `SCHOLAROCR_RUN_LIVE_TESTS=1 pytest tests/live -m live` and `python benchmarks/run_benchmark.py --live`. Then check the default model IDs and the extraction quality on real scans.
 2. **Windows.** All code paths are cross-platform: pathlib, `os.pathsep`, process checks via `OpenProcess`, and Windows font paths. None of it was executed on Windows. Test installation, the MCP server under Claude Code, and the PowerShell examples.
-3. **Gemini CLI.** Its configuration is documented from the official docs but has not been tested.
+3. **Antigravity plugin distribution.** After pushing, run the real `agy plugin install https://github.com/adiroy911/scholarocr` (only local installs of the root layout were tested). Replace the placeholder `assets/logo.svg` and submit through the Marketplace interest form.
 4. **Real-document benchmarks.** Build manually verified ground truth (`scholarocr evaluate`) for real exam papers, handwriting, textbooks and research papers. Until that exists, no accuracy figures should be quoted.
 
 ## Planned improvements
@@ -13,6 +14,8 @@
 - Isolate each LaTeX equation at compile time, so one bad expression can't fail the whole compile.
 - DOCX ingestion with page geometry (via LibreOffice conversion when it is installed).
 - An MCP resource for page images, and progress notifications for long jobs.
+- MCP sampling as an opportunistic host-mode backend, if a target client ever implements it (hook: `ScholarOCR.process(model_override=...)`).
+- Host mode: let the client transcribe a dense page in halves (top/bottom crops) with boxes mapped back.
 - Optional cost caps per job, based on the pricing file.
 - Integration tests for the HTTP transport.
 - Perspective correction for angled phone photos (today: axis-aligned crop of the detected page only).

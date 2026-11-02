@@ -101,13 +101,25 @@ has been measured yet (see ROADMAP.md).
 
 ## Test suite
 
-`python -m pytest` (2026-11-01, Linux, Python 3.13): **129 passed, 3 skipped, 0 failed**.
+`python -m pytest -q --ignore=tests/live` (2026-11-03, Windows 11, Python 3.12, run file by file):
+**215 passed, 5 skipped, 1 failed**. The failure is `test_path_policy_blocks_outside_and_traversal`: creating a symlink needs a
+Windows privilege the test account lacks (WinError 1314). The skips are pandoc/XeLaTeX not installed.
+(2026-11-01, Linux, Python 3.13, before the hosted server and host mode: 129 passed, 3 skipped.)
 
-| Group | Result |
+| Group | Covers |
 |---|---|
-| Unit (foundation, schemas, security, ingestion, Gemini client, prompts/schemas, uncertainty, LaTeX/table checks, reviewer, exports, evaluation) | 98 passed |
-| Integration (pipeline with a scripted fake Gemini, MCP in-process + real stdio subprocess, CLI subprocess, end-to-end) | 31 passed |
-| Live Gemini (`tests/live`, opt-in) | 3 skipped: not run, no API key |
+| Unit | foundation, schemas, security, ingestion, model client, OpenRouter transport, prompts/schemas, uncertainty, LaTeX/table checks, reviewer, exports, evaluation |
+| Integration | pipeline with a scripted fake model, MCP in-process + real stdio subprocess (including a host-mode page), CLI subprocess, end-to-end |
+| Host mode (`tests/integration/test_host_mode.py`) | provider precedence (10 cases) and the user env file; explicit host never touches an injected transport; text-layer PDFs need no submission; mixed PDFs; the full loop (image served, valid submission stored, boxes mapped into the page, crops, content/verify/export, zero model calls); multi-page one-image-per-call with full-then-short instructions and cache reuse; switching to a key re-extracts; every validation error reported in one round, nothing stored; lenient normalisation, resubmission and refused pages; reported rotation; host review and figure description; classify refused; the loop over MCP |
+| Remote (`tests/remote`) | sandbox, tool surface and widgets, optional key / host mode / operator key never used / link-unlink, limits and retention, round trip, OAuth over ASGI including consent without a key and the one-time key page |
+| Antigravity plugin (`tests/unit/test_antigravity_plugin.py`) | manifest and versions agree (pyproject, `__version__`, `plugin.json`); root `skills/` holds only the plugin skills; `mcp_config.json` declares no variables; the staging script copies only plugin files |
+| Live (`tests/live`, opt-in) | not run by default |
+
+No test reaches a real model: `tests/conftest.py` removes `GEMINI_API_KEY`, `GOOGLE_API_KEY` and
+`OPENROUTER_API_KEY` from the test process and pins `SCHOLAROCR_PROVIDER=host` (unless
+`SCHOLAROCR_RUN_LIVE_TESTS=1`), and subprocess tests also strip them and run outside the repo so a
+`.env` there is not read. Re-running the subprocess tests with both real keys exported recorded zero
+model calls.
 
 Gemini behaviour in the default suite comes from `tests/fixtures/fake_gemini.py` (mocked responses).
 The test corpus (`tests/fixtures/corpus.py`) is generated at test time. It covers clean digital,

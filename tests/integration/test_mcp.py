@@ -13,7 +13,9 @@ from tests.fixtures.fake_gemini import FakeTransport
 
 EXPECTED_TOOLS = {"ocr_document", "get_document_status", "get_document_content", "get_page_content",
                   "get_source_region", "verify_document", "export_document", "list_documents", "classify_document",
-                  "delete_document", "manage_job"}
+                  "delete_document", "manage_job",
+                  # host mode (the client's model is the vision model)
+                  "get_page_image", "submit_page_content", "submit_review"}
 
 
 @pytest.fixture
@@ -98,13 +100,14 @@ async def test_background_job_via_mcp(server, settings, corpus):
 
 
 async def test_stdio_subprocess_server(settings, corpus):
-    """Launch the real console entry point over stdio, as Claude Code / Gemini CLI would."""
+    """Launch the real console entry point over stdio, as Antigravity CLI / Claude Code would."""
     corpus_dir = str(corpus["clean_digital.pdf"].parent)
     # No real model keys: drop them from the inherited environment, and start in the corpus dir so a
     # developer's .env in the repo root is not loaded (empty variables count as unset for .env).
     env = {k: v for k, v in os.environ.items()
            if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY", "SCHOLAROCR_PROVIDER")}
-    env.update({"SCHOLAROCR_DATA_DIR": str(settings.data_dir), "SCHOLAROCR_ALLOWED_DIRS": corpus_dir})
+    env.update({"SCHOLAROCR_DATA_DIR": str(settings.data_dir), "SCHOLAROCR_ALLOWED_DIRS": corpus_dir,
+                "SCHOLAROCR_PROVIDER": "host"})
     params = StdioServerParameters(command=sys.executable, args=["-m", "scholarocr.mcp.server"], env=env,
                                    cwd=corpus_dir)
     async with Client(params) as c:
@@ -115,3 +118,13 @@ async def test_stdio_subprocess_server(settings, corpus):
         doc_id = r.structured_content["document_id"]
         content = await c.call_tool("get_document_content", {"document_id": doc_id, "format": "text"})
         assert "Introduction to Algebra" in content.structured_content["content"]
+        # Host mode over the real transport: a scanned page waits for the client's model.
+        scan = await c.call_tool("ocr_document", {"file_path": str(corpus["scanned_poor.pdf"])})
+        assert scan.structured_content["mode"] == "host"
+        assert scan.structured_content["awaiting_transcription"] == [1]
+        img = await c.call_tool("get_page_image", {"document_id": scan.structured_content["document_id"]})
+        assert img.content[0].type == "image" and len(img.content[0].data) > 1000
+        ok = await c.call_tool("submit_page_content", {
+            "document_id": scan.structured_content["document_id"], "page_number": 1,
+            "elements": [{"type": "paragraph", "text": "Scanned line", "box_2d": [100, 100, 140, 900]}]})
+        assert ok.structured_content["accepted"] is True

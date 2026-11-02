@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "scholarocr": {
+      "command": "scholarocr-mcp",
+      "args": [],
+      "timeoutSeconds": 600
+    }
+  }
+}

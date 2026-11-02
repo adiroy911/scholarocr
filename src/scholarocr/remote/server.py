@@ -7,10 +7,15 @@ Differences from the local server (``scholarocr.mcp.server``, unchanged):
   for other MCP clients, base64. They are staged in the caller's sandbox and ingested through the
   normal ``ScholarOCR.process`` pipeline; staging files are deleted right after ingestion.
 * Every user has an isolated sandbox and service instance (own database, documents and exports).
-* Model calls use the user's own key (linked during OAuth). The operator's key is only used with
-  ``SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE=1``.
+* No key is needed. By default an account runs in host mode: the server does every deterministic step and
+  ChatGPT's own model transcribes the pages that need vision (get_page_image -> submit_page_content). A user
+  may link their own Gemini/OpenRouter key (at sign-in or later via manage_model_key) for the server-side
+  pipeline. The operator's key is only used with ``SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE=1``.
 * Exports are delivered as short-lived signed download links instead of server paths.
-* ``show_document_pages`` renders an MCP Apps UI resource (``ui://scholarocr/page-viewer-v1.html``).
+* ``show_document_pages`` renders an MCP Apps UI resource (``ui://scholarocr/page-viewer-v1.html``);
+  ``get_page_image`` renders ``ui://scholarocr/page-image-v1.html``, which makes the page image visible to
+  ChatGPT's model (uploadFile + widget-state imageIds), since ChatGPT does not reliably show tool-result
+  images to the model.
 
 Run:  scholarocr-remote --public-url https://ocr.example.com      (see docs/CHATGPT_APP.md)
 """
@@ -30,7 +35,7 @@ from typing import Annotated, Any, Callable, Literal
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field
@@ -44,7 +49,8 @@ from ..logging_config import get_logger
 from ..schemas import DocumentType, ElementType, ProcessingOptions
 from ..utils import parse_page_range
 from .config import RemoteConfig, print_warnings
-from .oauth import SCOPE, ByokOAuthProvider, make_connect_routes
+from ..mcp.server import client_name
+from .oauth import SCOPE, ByokOAuthProvider, make_connect_routes, make_key_link_route
 from .ratelimit import RateLimited, UserLimits
 from .sandbox import Fetcher, HttpFetcher, UserSandbox, decode_base64
 from .services import ByoKeyRequired, ServicePool, TransportFactory
@@ -53,6 +59,9 @@ from .store import AuthStore, derive_key
 log = get_logger("remote.server")
 WIDGET_URI = "ui://scholarocr/page-viewer-v1.html"
 WIDGET_MIME = "text/html;profile=mcp-app"
+PAGE_IMAGE_URI = "ui://scholarocr/page-image-v1.html"
+PAGE_IMAGE_META = "scholarocr/pageImage"  # _meta key: delivered to the component only, hidden from the model
+KEY_LINK_TTL_S = 900
 DEFAULT_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"]
 # Names a remote tool must never accept (enforced by tests/remote/test_tool_surface.py).
 FORBIDDEN_PARAMS = {"file_path", "path", "paths", "output_dir", "folder", "directory"}
@@ -62,6 +71,15 @@ uploads (scanned PDFs, page photos, handwritten notes, exam papers, papers). Flo
 files -> get_document_status if a job_id came back -> show_document_pages to display pages with uncertainty
 highlights, or get_document_content for text -> get_source_region to check an uncertain element against the
 original image -> verify_document before relying on uncertain content -> export_document for a download link.
+
+HOST MODE (no key linked; ocr_upload reports "mode"): YOU are the vision model. Pages with a reliable PDF text
+layer are done at once; the rest are listed in "awaiting_transcription". One page at a time:
+get_page_image(document_id) -> transcribe that page exactly -> submit_page_content(document_id, page_number,
+elements=[...]). If a submission is rejected, fix every listed problem and resubmit the whole page. In ChatGPT
+the page image reaches you through the viewer as an attached image (possibly on the next turn); if you cannot
+see it, say so instead of guessing. A user who prefers the server-side pipeline can add a key with
+manage_model_key(action="link").
+
 Uncertainty labels are ordinal judgements, not probabilities; "unresolved" content was not guessed."""
 
 DocTypeLit = Literal[tuple(t.value for t in DocumentType)]  # type: ignore[valid-type]
@@ -237,15 +255,16 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
             out.add(str(p).replace("\\", "\\\\"))
         return sorted(out, key=len, reverse=True)
 
-    def run(fn: Callable[[str], Any], *, needs_key: bool = False, ocr: bool = False) -> CallToolResult:
+    def run(fn: Callable[[str], Any], *, ocr: bool = False) -> CallToolResult:
         try:
             uid = current_user()
             limits.calls.hit(uid, "tool calls per minute")
             if ocr:
                 limits.ocr_calls.check(uid, "OCR requests per hour")
                 limits.pages.check(uid, "pages per day")
-            if needs_key:
-                pool.get(uid)  # raises ByoKeyRequired before any work is done
+            if not store.account_exists(uid) and cfg.auth == "oauth":
+                raise RemoteToolError({"error": "unauthenticated", "message": "Account not found; reconnect."},
+                                      auth_challenge=challenge("account removed"))
             store.touch_user(uid)
             result = fn(uid)
             if ocr:
@@ -257,10 +276,9 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
         except RemoteToolError as e:
             return _error(e.payload, e.auth_challenge)
         except ByoKeyRequired as e:
-            return _error({"error": "byo_key_required",
-                           "message": f"{e}. Reconnect the ScholarOCR app and link your Gemini or OpenRouter "
-                                      "API key; this server does not pay for model calls."},
-                          challenge("link a model API key"))
+            return _error({"error": "operator_key_missing",
+                           "message": f"{e}. The server operator must configure the key, or the user can link "
+                                      "their own with manage_model_key(action='link')."})
         except RateLimited as e:
             return _error({"error": "rate_limited", "message": str(e), "retry_after_s": int(e.retry_after_s) + 1})
         except ScholarOCRError as e:
@@ -325,8 +343,9 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
     ) -> CallToolResult:
         """Extract documents the user uploaded (PDF or images) into structured, source-traceable content.
 
-        Uses the user's own model API key. Returns document_id plus either a completed summary or a job_id to
-        poll with get_document_status. Re-sending the same files reuses earlier results."""
+        Returns document_id, "mode" and a summary or a job_id to poll with get_document_status. mode "host"
+        (no key linked): pages in awaiting_transcription need YOUR vision via get_page_image ->
+        submit_page_content. With a linked key the server's pipeline reads them. Re-sending reuses results."""
 
         def go(uid: str):
             check_batch(len(files))
@@ -341,7 +360,7 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
             return ingest(uid, items, options(document_type, language_hint, context_hint, pages, detail,
                                               force_visual, auto_crop, review), wait)
 
-        return run(go, needs_key=True, ocr=True)
+        return run(go, ocr=True)
 
     if cfg.allow_base64:
         @mcp.tool(annotations=_ann(False, open_world=True, idempotent=False),
@@ -368,7 +387,7 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
                 return ingest(uid, items, options(document_type, language_hint, context_hint, pages, detail,
                                                   force_visual, auto_crop, review), wait)
 
-            return run(go, needs_key=True, ocr=True)
+            return run(go, ocr=True)
 
     # ------------------------------------------------------------------ retrieval
     @mcp.tool(annotations=_ann(True), meta=tool_meta())
@@ -431,6 +450,88 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
 
         return run(go)
 
+    # ------------------------------------------------------------------ host mode
+    @mcp.tool(annotations=_ann(True),
+              meta=tool_meta({"ui": {"resourceUri": PAGE_IMAGE_URI}, "openai/outputTemplate": PAGE_IMAGE_URI,
+                              "openai/toolInvocation/invoking": "Preparing the page…",
+                              "openai/toolInvocation/invoked": "Page ready"}))
+    def get_page_image(
+        document_id: str,
+        page_number: Annotated[int | None, Field(ge=1, description="Page to transcribe. Default: the next page "
+                                                 "awaiting transcription.")] = None,
+        instructions: Annotated[Literal["auto", "full", "short"], Field(
+            description="'full': rules + element JSON examples; 'short': a reminder; 'auto': full until the "
+                        "first page of this document is submitted.")] = "auto",
+    ) -> CallToolResult:
+        """HOST MODE: one page that needs your vision, with transcription rules and the exact element shape.
+        Transcribe it, then call submit_page_content. Boxes: box_2d = [ymin, xmin, ymax, xmax] in 0-1000 of the
+        page image. In ChatGPT the image is attached through the viewer. One page per call."""
+
+        def go(uid: str):
+            data, mime, info = pool.get(uid).host_page_image(document_id, page_number, instructions=instructions)
+            info = _scrub(info, roots_for(uid))
+            brief = info.pop("instructions", None)
+            if data is None:
+                return CallToolResult(content=[TextContent(type="text", text=json.dumps(info))], structured_content=info)
+            b64 = base64.b64encode(data).decode()
+            text = (f"{brief}\n\nPage info: {json.dumps(info, ensure_ascii=False)}\n\nThe page image is shown to "
+                    "the user in the viewer and attached for you. If you cannot see an image of this page, say so "
+                    "and do not transcribe from memory or guess.")
+            return CallToolResult(content=[ImageContent(type="image", data=b64, mime_type=mime),
+                                           TextContent(type="text", text=text)],
+                                  structured_content=info, meta={PAGE_IMAGE_META: {"data": b64, "mime_type": mime}})
+
+        return run(go)
+
+    @mcp.tool(annotations=_ann(False), meta=tool_meta({"openai/toolInvocation/invoking": "Saving the page…",
+                                                       "openai/toolInvocation/invoked": "Page saved"}))
+    def submit_page_content(
+        document_id: str,
+        page_number: Annotated[int, Field(ge=1)],
+        elements: Annotated[list[dict[str, Any]], Field(description=(
+            "Elements in reading order. Each: {type, text, latex?, role?, level?, items?, table?, figure?, "
+            "question?, box_2d:[ymin,xmin,ymax,xmax] 0-1000, uncertainty: low|medium|high|unresolved, "
+            "uncertainty_reasons?, handwritten?, language?, caption_of?, parent_index?}. "
+            "See get_page_image(instructions='full') for examples."))],
+        page_language: Annotated[str | None, Field(description="BCP-47 code, e.g. 'en'.")] = None,
+        page_label: Annotated[str | None, Field(description="Printed page number, if visible.")] = None,
+        legibility: Annotated[str, Field(description="Overall doubt: low|medium|high|unresolved.")] = "low",
+        rotation_detected: Annotated[int, Field(description="0, or 90/180/270 if the image is rotated clockwise.")] = 0,
+        notes: Annotated[list[str] | None, Field(description="Problems such as cut-off text.")] = None,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> CallToolResult:
+        """HOST MODE: store your transcription of one page (from get_page_image). Strictly validated; on
+        rejection every problem is listed with its path and a fix, nothing is stored, and you resubmit the
+        complete page. Returns counts, review_suggested and the next waiting page."""
+        payload = {"elements": elements, "page_language": page_language, "page_label": page_label,
+                   "legibility": legibility, "rotation_detected": rotation_detected, "notes": notes or []}
+        who = client_name(ctx)
+        return run(lambda uid: pool.get(uid).submit_page_content(document_id, page_number, payload, transcriber=who))
+
+    @mcp.tool(annotations=_ann(False, idempotent=False), meta=tool_meta())
+    def submit_review(
+        document_id: str,
+        element_id: str,
+        verdict: Annotated[Literal["confirmed", "corrected", "unreadable"], Field(
+            description="After comparing the element with its crop from get_source_region.")],
+        text: Annotated[str, Field(description="Corrected text (verdict 'corrected').")] = "",
+        latex: Annotated[str | None, Field(description="Corrected LaTeX.")] = None,
+        table: Annotated[dict[str, Any] | None, Field(description="Corrected table {rows, header_rows}.")] = None,
+        figure: Annotated[dict[str, Any] | None, Field(description="For figures: {description, labels, "
+                                                       "relationships, kind}.")] = None,
+        uncertainty: Annotated[str, Field(description="low|medium|high|unresolved after your check.")] = "low",
+        notes: list[str] | None = None,
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> CallToolResult:
+        """Second pass on one element after looking at get_source_region(element_id): record your verdict.
+        Replaced values are kept in revisions."""
+        payload: dict[str, Any] = {"verdict": verdict, "text": text, "uncertainty": uncertainty, "notes": notes or []}
+        for k, v in (("latex", latex), ("table", table), ("figure", figure)):
+            if v is not None:
+                payload[k] = v
+        who = client_name(ctx)
+        return run(lambda uid: pool.get(uid).submit_review(document_id, element_id, payload, transcriber=who))
+
     @mcp.tool(annotations=_ann(True),
               meta=tool_meta({"ui": {"resourceUri": WIDGET_URI}, "openai/outputTemplate": WIDGET_URI,
                               "openai/toolInvocation/invoking": "Loading pages…",
@@ -457,15 +558,15 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
     def verify_document(
         document_id: str,
         scope: Annotated[list[ScopeLit] | None, Field(description="Checks to run. Default: all.")] = None,
-        review: Annotated[bool, Field(description="Also send flagged elements to the review model (uses the user's "
-                                      "key; updates the extraction).")] = False,
+        review: Annotated[bool, Field(description="With a linked key: send flagged elements to the review model. "
+                                      "Host mode: list review_candidates for you to re-check (get_source_region "
+                                      "-> submit_review).")] = False,
     ) -> CallToolResult:
         """Quality checks on an extraction: missing/duplicate/failed pages, reading order, invalid LaTeX, table
         structure, question numbering, unresolved regions, traceability."""
 
         def go(uid: str):
-            svc = pool.get(uid) if review else svc_ro(uid)
-            report = svc.verify(document_id, scope=scope, review=review)
+            report = pool.get(uid).verify(document_id, scope=scope, review=review)
             d = report.model_dump(mode="json")
             d["counts"] = report.counts()
             if len(d["findings"]) > 200:
@@ -473,7 +574,7 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
                 d["findings"] = d["findings"][:200]
             return d
 
-        return run(go, needs_key=review)
+        return run(go)
 
     @mcp.tool(annotations=_ann(False), meta=tool_meta())
     def export_document(
@@ -521,9 +622,9 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
         pages: Annotated[str | None, Field(description="Pages to consider (max 10).")] = None,
     ) -> CallToolResult:
         """Classify the document (exam paper, textbook, handwritten notes, research paper, ...) with subjects,
-        level, topics and an ordinal certainty. Uses the user's model key."""
-        return run(lambda uid: pool.get(uid).classify(document_id, context_hint=context_hint, pages=pages),
-                   needs_key=True)
+        level, topics and an ordinal certainty. Needs a linked model key; in host mode it returns
+        model_unavailable (classify from the extracted content yourself)."""
+        return run(lambda uid: pool.get(uid).classify(document_id, context_hint=context_hint, pages=pages))
 
     @mcp.tool(annotations=_ann(False, destructive=True), meta=tool_meta())
     def delete_document(
@@ -540,22 +641,52 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
         """Cancel a running job, or resume a cancelled/failed one (finished pages are reused)."""
         if action == "cancel":
             return run(lambda uid: svc_ro(uid).cancel_job(job_id))
-        return run(lambda uid: pool.get(uid).resume_job(job_id, wait=False), needs_key=True)
+        return run(lambda uid: pool.get(uid).resume_job(job_id, wait=False))
 
     # ------------------------------------------------------------------ account
     @mcp.tool(annotations=_ann(True), meta=tool_meta())
     def account_status() -> CallToolResult:
-        """Which model provider this connection uses (key never shown), usage against limits, and retention."""
+        """How this account reads pages (host mode, own key or operator quota; the key is never shown), usage
+        against limits, and retention."""
 
         def go(uid: str):
             k = pool.key_for(uid)
-            return {"provider": k.provider if k else None,
-                    "key": ("operator-provided" if k and k.operator else (k.key_hint or "linked") if k else "none"),
-                    "billing": "operator" if (k is None or k.operator) and cfg.operator_key_mode else "your own key",
+            own = bool(k and k.has_own_key)
+            mode = (k.provider if own else "operator" if cfg.operator_key_mode else "host")
+            return {"mode": mode,
+                    "provider": k.provider if own else None,
+                    "key": (k.key_hint or "linked") if own else ("operator-provided" if cfg.operator_key_mode
+                                                                  else "none (host mode)"),
+                    "billing": ("your own key" if own else "operator" if cfg.operator_key_mode
+                                else "no model API calls (your chat model reads the pages)"),
+                    "change_key": "manage_model_key(action='link' | 'unlink')",
                     "limits": limits.snapshot(uid),
                     "storage_mb": round(pool.sandbox(uid).usage_bytes() / 1048576, 2),
                     "storage_quota_mb": cfg.user_quota_mb, "retention_hours": cfg.retention_hours,
                     "max_file_mb": cfg.max_file_mb, "max_pages": cfg.max_pages}
+
+        return run(go)
+
+    @mcp.tool(annotations=_ann(False, idempotent=False), meta=tool_meta())
+    def manage_model_key(
+        action: Annotated[Literal["link", "unlink"], Field(description="'link': get a one-time page where the user "
+                                                           "adds or replaces their own Gemini/OpenRouter key. "
+                                                           "'unlink': remove the key (back to host mode).")],
+    ) -> CallToolResult:
+        """Optional own model key for the server-side OCR pipeline. Never ask the user to paste a key into the
+        chat: 'link' returns a short-lived page URL for the user to open. Documents are kept either way."""
+
+        def go(uid: str):
+            if action == "unlink":
+                removed = store.unlink_key(uid)
+                pool.drop(uid)
+                return {"unlinked": removed, "mode": "operator" if cfg.operator_key_mode else "host",
+                        "note": "No key is stored any more. Pages that need vision are now transcribed by you "
+                                "(host mode)." if not cfg.operator_key_mode else "Using the operator quota."}
+            token = store.new_link_token(uid, KEY_LINK_TTL_S)
+            return {"url": f"{cfg.public_url}/byok/key?t={token}", "expires_in_s": KEY_LINK_TTL_S,
+                    "message": "Give the user this link to open in their browser. The key is entered on that page, "
+                               "never in the chat. The link works once."}
 
         return run(go)
 
@@ -585,6 +716,15 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
                                                     "highlighted by uncertainty level."})
     def page_viewer() -> str:
         return widget_html()
+
+    @mcp.resource(PAGE_IMAGE_URI, name="scholarocr-page-image", title="ScholarOCR page image", mime_type=WIDGET_MIME,
+                  description="A page waiting for transcription in host mode.",
+                  meta={"ui": {"prefersBorder": True, "domain": cfg.widget_domain or cfg.public_url,
+                               "csp": {"connectDomains": [], "resourceDomains": []}},
+                        "openai/widgetDescription": "Shows the page image the assistant is transcribing and attaches "
+                                                    "it for the assistant."})
+    def page_image_widget() -> str:
+        return resources.files("scholarocr.remote").joinpath("page_image.html").read_text(encoding="utf-8")
 
     return RemoteComponents(cfg, store, pool, limits, signer, provider, mcp)
 
@@ -677,6 +817,7 @@ def create_app(cfg: RemoteConfig | None = None, *, transport_factory: TransportF
 
     if comps.provider is not None:
         mcp.custom_route("/byok/connect", methods=["GET", "POST"])(make_connect_routes(cfg, store, comps.provider))
+        mcp.custom_route("/byok/key", methods=["GET", "POST"])(make_key_link_route(cfg, store, on_change=pool.drop))
 
         # The SDK serves RFC 9728 metadata at /.well-known/oauth-protected-resource/mcp and advertises it in
         # WWW-Authenticate; OpenAI's auth guide names the root path, so serve the same document there too.

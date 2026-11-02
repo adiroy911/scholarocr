@@ -42,8 +42,6 @@ outputs/
 benchmarks/results/*
 !benchmarks/results/.gitkeep
 
-# Gemini extension release archives (scripts/build_gemini_extension_archive.py)
-dist-extension/
 
 # Editors and OS
 .vscode/

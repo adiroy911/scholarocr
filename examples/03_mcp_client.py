@@ -1,5 +1,5 @@
 """Example 3 — any MCP client: launch the ScholarOCR server over stdio and call its tools,
-exactly as Claude Code or Gemini CLI would.
+exactly as Antigravity CLI or Claude Code would.
 
     python examples/03_mcp_client.py path/to/document.pdf
 """

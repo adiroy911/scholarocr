@@ -17,7 +17,7 @@ import shutil
 import sys
 from pathlib import Path
 
-SRC = Path(__file__).resolve().parent.parent / "skills" / "scholarocr"
+SRC = Path(__file__).resolve().parent.parent / "claude-skill" / "scholarocr"
 
 
 def same_tree(a: Path, b: Path) -> bool:

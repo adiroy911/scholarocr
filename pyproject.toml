@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "scholarocr"
-version = "0.1.0"
-description = "Reusable academic-document OCR and intelligence engine (Gemini + MCP)."
+version = "0.2.0"
+description = "Source-traceable academic-document OCR for AI agents over MCP; no API key needed in host mode."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

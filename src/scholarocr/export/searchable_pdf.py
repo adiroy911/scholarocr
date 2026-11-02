@@ -2,7 +2,7 @@
 
 PDF source pages are copied unchanged; image source pages are rebuilt from the preserved
 image at the manifest size. Invisible text is added only for elements that were read by
-the model (``extraction_method == "gemini"``); text-layer pages are already searchable. When a
+the model (``extraction_method`` in ``MODEL_METHODS``); text-layer pages are already searchable. When a
 PDF page already carries a visible text layer (e.g. it was re-read visually because of figures or
 math fonts), elements whose words are already in that layer are skipped to avoid duplicates.
 """
@@ -23,6 +23,7 @@ from ..exceptions import ExportError
 from ..ingestion.images import load_frame
 from ..ingestion.validation import DOCX_TYPE, IMAGE_TYPES
 from ..schemas import Element, ElementType, ManifestEntry, Page
+from ..schemas.elements import MODEL_METHODS
 from .base import ExportContext, ExportResult, ordered_elements
 
 FONT_CANDIDATES: tuple[str, ...] = (
@@ -279,7 +280,7 @@ def export_searchable_pdf(ctx: ExportContext) -> ExportResult:
             ir_page = ir_pages.get(entry.page_number)
             elements = [
                 e for e in (ordered_elements(ir_page) if ir_page else [])
-                if e.extraction_method == "gemini" and e.type != ElementType.UNCERTAIN
+                if e.extraction_method in MODEL_METHODS and e.type != ElementType.UNCERTAIN
             ]
             if elements and src.media_type == "application/pdf":
                 existing = tokens(sources[src.index][entry.source_page_index].get_text("text"))

@@ -4,7 +4,7 @@ Human-readable output by default; ``--json`` prints machine-readable JSON on std
 Diagnostics and progress go to stderr.
 
 Exit codes: 0 ok · 1 error · 2 usage · 3 not found · 4 access denied · 5 invalid input ·
-6 Gemini unavailable/failed · 7 completed with problems (partial job / verification errors) ·
+6 model unavailable/failed, or pages awaiting transcription (host mode) · 7 completed with problems (partial job / verification errors) ·
 130 interrupted (job cancelled, resumable with `scholarocr job resume`).
 """
 
@@ -177,9 +177,18 @@ def cmd_process(svc, args) -> int:
         lines.append(f"warning:  {w}")
     for f in summary["failed_pages"]:
         lines.append(f"failed:   page {f['page']}: {f['error']}")
+    awaiting = summary.get("awaiting_transcription") or []
+    if awaiting:
+        lines.append(f"awaiting: {len(awaiting)} page(s) need visual OCR: {awaiting[:20]}. No model key is configured "
+                     "(host mode). Set GEMINI_API_KEY or OPENROUTER_API_KEY and run process again, or use "
+                     "ScholarOCR from an MCP client (Antigravity CLI, Claude, ChatGPT) whose model transcribes them.")
     _out(args, data, "\n".join(lines))
     if job["status"] == "completed":
         return EXIT_OK
+    if job["status"] == "awaiting_transcription":
+        print(f"error: {len(awaiting)} page(s) await transcription (host mode, no GEMINI_API_KEY / "
+              "OPENROUTER_API_KEY)", file=sys.stderr)
+        return EXIT_GEMINI
     if job["status"] == "failed" and any("GEMINI_API_KEY" in (f["error"] or "") for f in summary["failed_pages"]):
         return EXIT_GEMINI
     return EXIT_PROBLEMS if job["status"] in ("partial", "failed") else EXIT_ERR

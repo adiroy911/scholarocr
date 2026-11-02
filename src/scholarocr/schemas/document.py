@@ -36,6 +36,9 @@ class PageStatus(str, Enum):
     BLANK = "blank"  # detected blank; no extraction needed
     FAILED = "failed"
     SKIPPED = "skipped"  # outside requested page range
+    # Host mode: deterministic work is done and the page image is waiting for the MCP client's model
+    # (get_page_image -> submit_page_content).
+    AWAITING_TRANSCRIPTION = "awaiting_transcription"
 
 
 class Route(str, Enum):

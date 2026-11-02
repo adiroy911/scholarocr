@@ -2,14 +2,14 @@
 
 `scholarocr-remote` is a second, separate MCP entry point that ChatGPT can reach over the public
 internet. The local server (`scholarocr-mcp`, stdio or localhost HTTP) is unchanged and still the
-right choice for Claude Code, Gemini CLI and other local agents.
+right choice for Antigravity CLI, Claude Code and other local agents.
 
 | | `scholarocr-mcp` (local) | `scholarocr-remote` (hosted) |
 |---|---|---|
 | Transport | stdio, or streamable HTTP on localhost | streamable HTTP at `https://<domain>/mcp` |
 | How documents arrive | local file paths behind `SCHOLAROCR_ALLOWED_DIRS` | ChatGPT file parameters (`download_url`), or base64 fallback |
 | Users | one (you) | many; each gets an isolated sandbox |
-| Model key | operator's `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | each user's own key, linked during OAuth |
+| Who reads the pages | the client's model (host mode, no key) or the configured key provider | ChatGPT's model (host mode, default) or the user's own optional key; the operator's key only in operator-key mode |
 | Exports | files written on disk | short-lived signed download links |
 
 Everything below was written on 2026-11-02 against the OpenAI documentation of that date. OpenAI
@@ -25,7 +25,7 @@ ChatGPT ──HTTPS──▶ reverse proxy (TLS) ──▶ scholarocr-remote (uv
                                             ├─ /mcp                     MCP streamable HTTP (bearer token required)
                                             ├─ /.well-known/oauth-*     OAuth metadata (RFC 8414 / RFC 9728)
                                             ├─ /register /authorize /token /revoke   OAuth 2.1 AS (MCP SDK handlers)
-                                            ├─ /byok/connect            consent page: user pastes their model key
+                                            ├─ /byok/connect            consent page: key optional (host mode)
                                             ├─ /download/{signed}       export downloads (HMAC-signed, 15 min)
                                             ├─ /.well-known/openai-apps-challenge   domain verification (optional)
                                             └─ /healthz
@@ -33,7 +33,7 @@ ChatGPT ──HTTPS──▶ reverse proxy (TLS) ──▶ scholarocr-remote (uv
                                                     ▼
                                 ServicePool ── one ScholarOCR service per user (existing service layer)
                                    │             Settings: data_dir = users/<id>/data, allowed_dirs = [users/<id>/inbox],
-                                   │             model key = that user's key (never the operator's by default)
+                                   │             own key if linked, else host mode (operator key never by default)
                                    ▼
                         users/<id>/inbox/<random>/…   staged uploads, deleted right after ingestion
                         users/<id>/data/              that user's db, documents, crops, exports
@@ -45,7 +45,7 @@ Code lives in `src/scholarocr/remote/`:
 | File | Role |
 |---|---|
 | `server.py` | MCP tools, the UI resource, HTTP routes, `create_app()`, `main()` |
-| `oauth.py` | OAuth authorization-server provider for the MCP SDK, plus the `/byok/connect` key-linking page |
+| `oauth.py` | OAuth authorization-server provider for the MCP SDK, the `/byok/connect` consent page (key optional) and the one-time `/byok/key` link page |
 | `store.py` | SQLite store: Fernet-encrypted keys, OAuth clients, pending requests, hashed codes and tokens |
 | `services.py` | Per-user `ScholarOCR` instances and enforcement of bring-your-own-key |
 | `sandbox.py` | Filename sanitising, magic-byte typing, size and quota limits, SSRF-guarded downloads, base64 |
@@ -98,66 +98,78 @@ On a call the server:
 exist only in the local server. `tests/remote/test_tool_surface.py` fails if any remote tool schema
 contains `file_path`, `path`, `paths`, `output_dir`, `folder` or `directory`.
 
-### 1.2 How the user's model key reaches the server (BYO key)
+### 1.2 Sign-in, host mode and the optional key
 
-The OpenAI auth guide documents **OAuth 2.1 only**: the authorization-code flow with PKCE `S256`,
-with CIMD or DCR client registration. ChatGPT "cannot present custom API keys". The submission
-guide says the portal supports none, OAuth or mixed auth only. It also says "API-key and
-bearer-token flows aren't supported" and "public submissions reject nonempty server headers". The
-submission guidelines list API keys as restricted data that tools must not ask for. So the key can
-travel neither as a header nor as a tool argument.
+The OpenAI auth guide documents **OAuth 2.1 only** for authenticated apps: the authorization-code flow
+with PKCE `S256`, with CIMD or DCR client registration. ChatGPT "cannot present custom API keys", and the
+submission guidelines list API keys as restricted data that tools must not ask for. Tools may also be
+anonymous (`noauth`), and ChatGPT sends `_meta["openai/subject"]`, "an anonymized user id ... for the
+purposes of rate limiting and identification" (developers.openai.com/plugins/reference). The docs do not
+say that id is stable across conversations or devices, and they point to authentication for data that
+must survive sessions ("Authenticate the user so the MCP server can map each request to the correct
+account", developers.openai.com/plugins/build/chatgpt-ui). ScholarOCR stores each user's documents for
+up to 24 h and exports them later, so it keeps OAuth for identity.
 
-ScholarOCR therefore runs its own small OAuth authorization server (the MCP SDK's
-`OAuthAuthorizationServerProvider`). The usual "log in" step is replaced by "link your model key":
+ScholarOCR runs its own small OAuth authorization server (the MCP SDK's
+`OAuthAuthorizationServerProvider`). Signing in creates an account; **a key is optional**:
 
 ```
 ChatGPT → GET /authorize   (SDK validates client, redirect_uri, PKCE)  → 302 /byok/connect?req=…
-User    → /byok/connect    chooses Gemini or OpenRouter, pastes key, ticks consent
-Server  → encrypts key (Fernet, key derived from SCHOLAROCR_REMOTE_SECRET), user id = HMAC(secret, provider:key)
+User    → /byok/connect    default: "Continue without a key" (host mode)
+                           optional: choose Gemini or OpenRouter and paste a key; ticks consent
+Server  → account id = "u_" + 24 random hex (never derived from a key); key encrypted (Fernet, key
+          derived from SCHOLAROCR_REMOTE_SECRET) if one was given
         → 302 back to ChatGPT's redirect_uri with ?code=…&state=…
 ChatGPT → POST /token      (SDK verifies the PKCE verifier) → opaque access token (1 h) + refresh token (30 d, rotated)
-ChatGPT → /mcp with Authorization: Bearer …  → token → user id → that user's sandbox and key
+ChatGPT → /mcp with Authorization: Bearer …  → token → account id → that user's sandbox (and key)
 ```
+
+Per account, `services.user_settings()` decides how pages are read, after removing `GEMINI_API_KEY`,
+`GOOGLE_API_KEY` and `OPENROUTER_API_KEY` from the operator environment:
+
+1. the account has its own key → that provider, billed to that key;
+2. `SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE=1` → the operator's key (the consent page then also offers
+   "Use this server's quota");
+3. otherwise → **host mode**: no model client is built at all; pages that need vision wait for ChatGPT's
+   own model (section 1.5).
 
 * The key never appears in the conversation, in tool inputs, in tool outputs (`account_status`
   shows only the last 4 characters) or in logs.
-* The user id is derived from the key, so reconnecting with the same key returns to the same
-  documents. A different key gets a different, empty sandbox. No ScholarOCR account is needed.
-* The key is checked for format only (OpenRouter keys must start with `sk-or-`). No live call is
-  made at link time. A bad key shows up as an `auth_error` on the first OCR call.
-* `delete_my_data` (or retention for idle users) deletes the key, the user's tokens and the whole
-  sandbox. Existing tokens then fail with 401 and ChatGPT has to re-link.
-* **No operator fallback.** `services.user_settings()` removes `GEMINI_API_KEY`,
-  `GOOGLE_API_KEY` and `OPENROUTER_API_KEY` from the operator environment before building a
-  user's settings. Without a linked key, tools that call a model return
-  `{"error": "byo_key_required"}` with `_meta["mcp/www_authenticate"]` set, which the reference
-  says makes ChatGPT start the OAuth flow. Nothing is downloaded and no model client is created.
-  The operator's key is used only with **`SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE=1`**. In that mode
-  the consent page also offers "I do not have a key; use the operator-provided quota". Users who
-  link a key still pay with it.
+* **Link or unlink later.** `manage_model_key(action="link")` returns a one-time URL
+  (`/byok/key?t=…`, 15 minutes, stored as a SHA-256 hash) where the user pastes a key in the browser;
+  the account id does not change, documents are kept. `manage_model_key(action="unlink")` deletes the key
+  and the account falls back to host mode. Keys are never accepted as tool arguments.
+* Reconnecting the app (a new OAuth grant) creates a new, empty account. Documents expire after 24 h
+  anyway. Accounts created by 0.1, whose ids were derived from the key, keep working.
+* The key is checked for format only (OpenRouter keys must start with `sk-or-`). A bad key shows up as an
+  `auth_error` on the first OCR call.
+* `delete_my_data` (or retention for idle users) deletes the account, key, tokens and the whole sandbox.
+  Existing tokens then fail with 401 and ChatGPT has to sign in again.
+* The operator's key is used only with **`SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE=1`**. If that mode is on
+  and the operator configured no key, tools return `operator_key_missing`.
 
-Risk you must accept or resolve before submitting: the guidelines restrict collecting API keys
-through ChatGPT. Collecting the key on your own OAuth page is the documented place for account
-credentials, but I found no OpenAI statement that a review approves of this pattern for
-third-party model keys. Section 6 shows how to describe it to reviewers. The alternative is a
-conventional account system where you bill users yourself, using operator-key mode plus your own
-usage controls.
+Since the key is now optional, the review risk of collecting third-party model keys on the consent
+page is smaller: a reviewer can use the app without any key. The optional key field is still a
+restricted-data question to describe in the review notes (section 6).
 
 ### 1.3 Tools
 
-| Tool | Annotations (read-only / destructive / open-world) | Needs user key |
+| Tool | Annotations (read-only / destructive / open-world) | Model |
 |---|---|---|
-| `ocr_upload` (file params) | false / false / true | yes |
-| `ocr_upload_base64` | false / false / true | yes |
-| `get_document_status`, `get_document_content`, `get_page_content`, `get_source_region`, `list_documents` | true / false / false | no |
-| `show_document_pages` (renders the widget) | true / false / false | no |
-| `verify_document` | false / false / true | only with `review=true` |
-| `export_document` (signed links) | false / false / false | no |
-| `classify_document` | false / false / true | yes |
-| `manage_job` | false / false / true | for `resume` |
-| `delete_document` | false / **true** / false | no |
-| `account_status` | true / false / false | no |
-| `delete_my_data` | false / **true** / false | no |
+| `ocr_upload` (file params) | false / false / true | host mode or the account's key |
+| `ocr_upload_base64` | false / false / true | same |
+| `get_page_image` (renders the page-image widget) | true / false / false | host mode: hands one page to ChatGPT's model |
+| `submit_page_content`, `submit_review` | false / false / false | host mode: stores ChatGPT's transcription / verdict |
+| `get_document_status`, `get_document_content`, `get_page_content`, `get_source_region`, `list_documents` | true / false / false | none |
+| `show_document_pages` (renders the viewer widget) | true / false / false | none |
+| `verify_document` | false / false / true | key: `review=true` calls the review model; host: returns `review_candidates` |
+| `export_document` (signed links) | false / false / false | none |
+| `classify_document` | false / false / true | needs a key; `model_unavailable` in host mode |
+| `manage_job` | false / false / true | none |
+| `delete_document` | false / **true** / false | none |
+| `account_status` | true / false / false | none |
+| `manage_model_key` | false / false / false | none (returns a link; never takes a key) |
+| `delete_my_data` | false / **true** / false | none |
 
 Every tool sets all three hints explicitly, as the guidelines require. Every tool carries
 `_meta.securitySchemes` (`oauth2`, scope `scholarocr`, or `noauth` with `SCHOLAROCR_REMOTE_AUTH=none`).
@@ -191,6 +203,55 @@ Only `show_document_pages` points at it, through `_meta.ui.resourceUri` plus the
 To change the HTML in a way that could break cached copies, publish a new URI (`…-v2.html`) and
 update the tool, as the UI guide asks.
 
+### 1.5 Host mode in ChatGPT: getting the page image to the model
+
+Host mode needs ChatGPT's model to look at a page image. What the official sources say (2026-11-03):
+
+* The Plugins reference (developers.openai.com/plugins/reference, formerly `/apps-sdk/reference`) lists
+  tool-result `content` and `structuredContent` as "surfaced to the model and the component" and `_meta`
+  as "delivered only to the component". It never says image content blocks reach the model as vision.
+* OpenAI forum reports say they do not, at least not reliably: thread 1375446 (an image-only result shows
+  as `{}`; an "OpenAI_Support" reply says it "should not currently be treated as a guaranteed" path and
+  recommends text or `structuredContent`), thread 1399928 (a ~3 KB PNG displayed, a 3 MiB PNG did not),
+  thread 1360430.
+* The documented way is the component: "Make images visible to the model" in
+  developers.openai.com/plugins/build/chatgpt-ui. Widget state `imageIds` = "File IDs the model should
+  receive on later turns", for files "uploaded with `window.openai.uploadFile`", selected, received as
+  file params, or returned as tool-result file references. Caveat: openai/openai-apps-sdk-examples
+  issue #170 ("Images uploaded return sediment://file_* IDs but model cannot access image content") is
+  still open.
+* The MCP Apps extension spec (github.com/openai/mcp-extensions, docs/spec.md) lets a component send
+  image content with `ui/update-model-context`, "Supported" on Desktop and Android, "not yet supported"
+  on Web.
+
+So `get_page_image` returns:
+
+* `content`: an image block (for other MCP clients, and in case ChatGPT shows it) plus the rules and
+  page info as text;
+* `structuredContent`: the page info only (no base64, so the model's context stays small);
+* `_meta["scholarocr/pageImage"]`: the PNG/JPEG as base64, for the component only;
+* `openai/outputTemplate` = `ui://scholarocr/page-image-v1.html`.
+
+The page-image component (`remote/page_image.html`, inline JS, no network access) shows the page,
+uploads it with `window.openai.uploadFile`, stores the file id in widget state `imageIds`, and sends one
+follow-up message (`window.openai.sendFollowUpMessage`, "Here is page N … call submit_page_content") so
+the model gets the image on that turn. On MCP Apps hosts it also sends `ui/update-model-context` with
+an image block. A "Send this page to the assistant" button repeats the follow-up. The tool text tells the
+model to say so instead of guessing when it cannot see an image.
+
+This path is built from documentation and has **not been tried in ChatGPT**. Check in developer mode:
+the image appears in the widget (CSP may block `data:` images), `uploadFile` succeeds, and the model can
+read the page on the follow-up turn. If any step fails, the fallback is a user key (`manage_model_key`).
+
+For page photos the user attached to the chat, ChatGPT's model usually sees the attachment itself;
+ScholarOCR still prepares, validates and stores the transcription.
+
+The consumer Gemini app's custom connectors (support.google.com/gemini/answer/17209137; US, English,
+personal accounts) support MCP up to 2025-11-25 over streamable HTTP, but Google's guide says
+`structuredContent` is not supported and data should go in `TextContent`
+(developers.google.com/connected-apps/mcp/server-optimization). Nothing says image results reach the
+model, so host mode there is untested and not claimed.
+
 ---
 
 ## 2. Configuration
@@ -205,7 +266,7 @@ only and does not strip inline `# comments`, so put comments on their own lines.
 | `SCHOLAROCR_REMOTE_SECRET` | random per start (warning) | ≥32 characters. Encrypts stored keys and signs download links. **Required in production**: a new value makes stored keys unreadable. |
 | `SCHOLAROCR_REMOTE_HOST` / `_PORT` | `127.0.0.1` / `8000` | Bind address. Use `0.0.0.0` in a container behind a proxy. |
 | `SCHOLAROCR_REMOTE_AUTH` | `oauth` | `none` = one shared sandbox for every caller. **Local testing only.** |
-| `SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE` | `0` | `1` = users without a linked key run on the operator's key. |
+| `SCHOLAROCR_REMOTE_OPERATOR_KEY_MODE` | `0` | `1` = users without their own key run on the operator's key. `0`: they run in host mode. |
 | `SCHOLAROCR_REMOTE_DATA_DIR` | `%LOCALAPPDATA%\ScholarOCR\remote` | Root for `auth.db` and `users/`. |
 | `SCHOLAROCR_REMOTE_MAX_FILE_MB` | `20` | Per file |
 | `SCHOLAROCR_REMOTE_MAX_FILES` | `10` | Files per call |
@@ -464,10 +525,10 @@ read `fly logs`. The check allows 20 s for start-up.
 |---|---|
 | `test_sandbox.py` | filename traversal and odd names, user-id validation, staging confined to the inbox, magic-byte typing (an executable named `.pdf` is rejected), size and quota limits, base64 limits, SSRF blocks (http, file, loopback, RFC 1918, link-local metadata, IPv6 loopback), host allowlist |
 | `test_tool_surface.py` | exact remote tool set, no path-like parameters, local server still has `ocr_document`, `openai/fileParams` schema shape, explicit annotations and `securitySchemes`, base64 tool toggle, widget resource MIME, CSP and domain metadata, render-tool-only template binding, `noauth` mode |
-| `test_byok.py` | operator keys stripped, user key used, operator mode is opt-in, keys encrypted at rest, tools refuse without a key (no download, no model client), model client built with the user's key, operator mode end to end |
+| `test_byok.py` | operator keys stripped, no key = host mode (no model client is ever built, the operator key is never used, even for an operator-flagged account when the mode is off), the host loop over MCP (ocr_upload → get_page_image with `_meta` image → submit_page_content → content), user key used, link/unlink keeps the account and documents, operator mode is opt-in, keys encrypted at rest |
 | `test_limits_retention.py` | sliding windows, size, file-count and base64 limits over MCP, per-user call limit, daily page budget, retention deletes old documents, stale staging and idle users, `delete_my_data` |
 | `test_roundtrip.py` | in-process MCP: `list_tools` → `ocr_upload` → status → content → page → source region → `show_document_pages` → verify → export link → classify → account status; no server paths or keys leak; per-user isolation; base64 fallback; unexpected errors return a generic `internal_error` |
-| `test_http_oauth.py` | over HTTP (ASGI): 401 + `WWW-Authenticate`, both protected-resource metadata paths, AS metadata, DCR, `/authorize` → consent page → code, PKCE failure, token, MCP over streamable HTTP with the bearer token, signed download and tampered links, refresh rotation, revocation through `delete_my_data`, Host-header protection |
+| `test_http_oauth.py` | over HTTP (ASGI): 401 + `WWW-Authenticate`, both protected-resource metadata paths, AS metadata, DCR, `/authorize` → consent page → code (with a key, and without one: host mode), PKCE failure, token, account id independent of the key, MCP over streamable HTTP with the bearer token, the one-time `/byok/key` page (bad key, save, reuse refused), signed download and tampered links, refresh rotation, revocation through `delete_my_data`, Host-header protection |
 
 ---
 
@@ -497,14 +558,14 @@ review".
 - [ ] Domain verification: put the challenge token from the portal in
       `SCHOLAROCR_REMOTE_DOMAIN_CHALLENGE`. The server returns it as plain text at
       `https://<host>/.well-known/openai-apps-challenge`.
-- [ ] In the portal, open **MCPs → Connect**, authorise (complete `/byok/connect` with a test key), wait for
+- [ ] In the portal, open **MCPs → Connect**, authorise (complete `/byok/connect`; "Continue without a key" is enough), wait for
       **Scan Tools**, fix any issues, then use **Rescan**.
 - [ ] Decide whether to keep `ocr_upload_base64` public (`SCHOLAROCR_REMOTE_ALLOW_BASE64=0` hides it).
 
 **Policies and listing**
 
 - [ ] Publish a **privacy policy** covering what is collected (uploaded documents, extracted content,
-      the encrypted model key, an IP address in access logs), why, recipients (Google Gemini or OpenRouter
+      the encrypted model key if the user adds one, an IP address in access logs), why, recipients (Google Gemini or OpenRouter
       plus the model host the user picks; your hosting provider), retention (`RETENTION_HOURS`,
       `KEY_RETENTION_DAYS`), and user controls (`delete_my_data`, disconnecting).
 - [ ] Publish **terms of service**, a **website** and a **support** URL, all HTTPS. Keep support
@@ -515,10 +576,10 @@ review".
       Directory".
 - [ ] Prepare the review materials: `review.demo_recording_url` (a screen recording of the flow),
       **5 positive and 3 negative test cases**, and **reviewer credentials** entered in the dashboard's
-      *Review details* form, not in the ZIP. For this app, "credentials" means a working
-      **Gemini or OpenRouter test key with budget**, provided on the consent page. Explain the
-      BYO-key design in the review notes, because API keys are restricted data under the guidelines
-      (see 1.2). A login that needs sign-up or 2FA is rejected.
+      *Review details* form, not in the ZIP. For this app no credentials are needed: the consent page
+      has no sign-up, and "Continue without a key" runs host mode. Explain in the review notes that the
+      optional key field exists, that tools never ask for it, and why (see 1.2). A login that needs
+      sign-up or 2FA is rejected.
 - [ ] Build the plugin ZIP with the package identity and listing metadata, following the "Submit
       plugins" guide. This repository does not generate it.
 
@@ -578,7 +639,10 @@ Checked on 2026-11-02 by reading these pages:
 * The **host, lifetime and size limits of `download_url`**. The docs say only "temporary".
   `SCHOLAROCR_REMOTE_DOWNLOAD_HOSTS` is therefore empty by default.
 * Which **file types** ChatGPT passes through file params (images only, or PDFs too).
-* Whether reviewers accept **collecting a third-party model API key on the OAuth consent page**.
+* Whether reviewers accept the **optional** third-party model key field on the consent page (the app is
+  fully usable without it).
+* Whether ChatGPT's model can read the page image in host mode through `uploadFile` + `imageIds` and the
+  follow-up message (section 1.5).
 * ChatGPT's **redirect URI**, whether it sends the RFC 8707 `resource` parameter, and which DCR
   `token_endpoint_auth_method` it registers with. The server handles both "resource present" and
   "resource absent", and the tests use a public client (`none`).
@@ -598,7 +662,9 @@ Checked on 2026-11-02 by reading these pages:
 ## 8. Known limitations
 
 * No live ChatGPT test has been run. Expect at least one round of fixes after the first real connection.
-* A bad user key is detected only on the first model call, not at link time.
+* A bad user key (optional) is detected only on the first model call, not at link time.
 * In-memory rate limits and MCP sessions mean a single replica.
 * The DNS-rebinding window in the SSRF guard has to be closed with egress rules.
-* Account identity is "whoever holds this key". Two people who share a key share a sandbox.
+* Host mode quality depends on ChatGPT's model reading one page image per turn; there is no independent
+  second model unless the user links a key.
+* Reconnecting the app creates a new account (ids are random); there is no account recovery.

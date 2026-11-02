@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .. import EXTRACTION_VERSION, SCHEMA_VERSION
 from ..config import Settings
-from ..intelligence.prompts import PROMPT_VERSION
+from ..intelligence.prompts import HOST_PROMPT_VERSION, PROMPT_VERSION
 from ..schemas import ManifestEntry, Page, ProcessingOptions, Route
 from ..storage.artifacts import ArtifactStore
 from ..utils import sha256_bytes
@@ -22,20 +22,29 @@ VISUAL_ROUTES = {Route.VISUAL_GENERAL, Route.VISUAL_MATH, Route.VISUAL_HANDWRITI
 
 
 def cache_key(entry: ManifestEntry, route: Route, options: ProcessingOptions, settings: Settings,
-              gemini_available: bool) -> str:
+              gemini_available: bool, *, model_label: str | None = None) -> str:
+    """``model_label`` replaces the configured model ids when the vision model is not a key provider
+    (``"host"`` in host mode, ``"sampling"`` for MCP sampling), so switching modes never reuses a page
+    extracted by a different kind of model."""
     models: dict[str, str | None] = {}
     if route in VISUAL_ROUTES:
-        models["extract"] = settings.math_model if route == Route.VISUAL_MATH else settings.gemini_model
+        if model_label:
+            models["extract"] = model_label
+        else:
+            models["extract"] = settings.math_model if route == Route.VISUAL_MATH else settings.gemini_model
         if options.review:
-            models["review"] = settings.gemini_review_model
+            models["review"] = model_label or settings.gemini_review_model
     elif route == Route.EMBEDDED_TEXT:
         # Figure descriptions on text-layer pages use the primary model when Gemini is available.
         models["describe"] = settings.gemini_model if gemini_available else None
+    prompt = None
+    if route in VISUAL_ROUTES or models.get("describe"):
+        prompt = f"{PROMPT_VERSION}+{HOST_PROMPT_VERSION}" if model_label == "host" else PROMPT_VERSION
     payload = {
         "content": entry.content_hash,
         "route": route.value,
         "models": models,
-        "prompt": PROMPT_VERSION if route in VISUAL_ROUTES or models.get("describe") else None,
+        "prompt": prompt,
         "schema": SCHEMA_VERSION,
         "extraction": EXTRACTION_VERSION,
         "dpi": settings.render_dpi,
