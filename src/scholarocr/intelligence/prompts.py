@@ -110,16 +110,19 @@ def classify_prompt(context_hint: str | None, text_sample: str | None, page_coun
 # ---------------------------------------------------------------------------------------------- host mode
 # Instructions handed to the MCP client's own model (host mode). Versioned separately: part of the cache
 # key of host-transcribed pages.
-HOST_PROMPT_VERSION = "host-2026-11-03.1"
+HOST_PROMPT_VERSION = "host-2026-11-03.2"
 
 HOST_RULES = """Transcribe this page image for ScholarOCR. You transcribe; you never author.
+Work from what you see in the image. Do not run code, scripts or shell commands to inspect or measure it;
+the only tools you need are ScholarOCR's.
 1. Exactly what is visible. Never complete, correct, summarise or improve content.
 2. Illegible: do NOT guess. Use an element of type "uncertain" (text like "[illegible: 2 words]",
    uncertainty "unresolved"), or keep the element and set uncertainty "medium"/"high" when you read it but
    are unsure. Labels are ordinal judgements, not probabilities.
 3. Elements in natural reading order (respect columns; header first, footer/page number last).
 4. box_2d = [ymin, xmin, ymax, xmax] as integers 0-1000, normalised to THIS image (origin top-left).
-   Give one for every element; the server maps it back to the original page.
+   Estimate it by eye: approximate boxes are fine. Give one per element when you can; if you cannot place
+   an element, omit box_2d rather than measuring. The server maps boxes back to the original page.
 5. Math: LaTeX (amsmath) in "latex", a readable linear form in "text". Display equations are separate
    "equation" elements; inline math stays in the paragraph text as $...$. Keep equation numbers.
 6. Chemistry: type "chemical_equation" with mhchem LaTeX (\\ce{...}); keep charges, states, arrows and
@@ -147,7 +150,8 @@ Types: title heading subheading paragraph text handwriting equation chemical_equ
 image caption footnote header footer page_number list code bibliography_entry reference uncertain."""
 
 HOST_SHORT = """Same rules as before: transcribe exactly, never guess (use "uncertain"/unresolved), reading
-order, box_2d [ymin,xmin,ymax,xmax] 0-1000 of THIS image, LaTeX for math, \\ce{} for chemistry. Submit with
+order, box_2d [ymin,xmin,ymax,xmax] 0-1000 of THIS image estimated by eye (never run code to measure),
+LaTeX for math, \\ce{} for chemistry. Submit with
 submit_page_content. Ask for instructions="full" to see the full rules and element examples again."""
 
 

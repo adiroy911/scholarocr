@@ -24,8 +24,10 @@ Never guess unreadable content.
 
 1. `get_page_image(document_id)` returns ONE page image plus the transcription rules and the exact
    element JSON shape (full rules the first time, a short reminder afterwards).
-2. Transcribe that image exactly. Coordinates: `box_2d = [ymin, xmin, ymax, xmax]`, integers 0-1000 of
-   that image. Math as LaTeX, chemistry as `\ce{...}`, tables as rows of cells, figures with a
+2. Transcribe that image exactly, working only from what you see. Coordinates: `box_2d = [ymin, xmin,
+   ymax, xmax]`, integers 0-1000 of that image, estimated by eye (approximate is fine; omit it if you
+   cannot place an element). Never run code, scripts or shell commands to measure or inspect the image:
+   ScholarOCR's tools are all you need. Math as LaTeX, chemistry as `\ce{...}`, tables as rows of cells, figures with a
    description. Anything you cannot read: type `uncertain` with uncertainty `unresolved`. Do not guess.
 3. `submit_page_content(document_id, page_number, elements=[...], page_language=..., page_label=...)`.
    - Rejected (`submission_rejected`): the error lists every problem with its JSON path and a fix.
