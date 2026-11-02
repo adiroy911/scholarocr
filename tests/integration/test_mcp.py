@@ -100,9 +100,13 @@ async def test_background_job_via_mcp(server, settings, corpus):
 async def test_stdio_subprocess_server(settings, corpus):
     """Launch the real console entry point over stdio, as Claude Code / Gemini CLI would."""
     corpus_dir = str(corpus["clean_digital.pdf"].parent)
-    env = {**os.environ, "SCHOLAROCR_DATA_DIR": str(settings.data_dir), "SCHOLAROCR_ALLOWED_DIRS": corpus_dir,
-           "GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}
-    params = StdioServerParameters(command=sys.executable, args=["-m", "scholarocr.mcp.server"], env=env)
+    # No real model keys: drop them from the inherited environment, and start in the corpus dir so a
+    # developer's .env in the repo root is not loaded (empty variables count as unset for .env).
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY", "SCHOLAROCR_PROVIDER")}
+    env.update({"SCHOLAROCR_DATA_DIR": str(settings.data_dir), "SCHOLAROCR_ALLOWED_DIRS": corpus_dir})
+    params = StdioServerParameters(command=sys.executable, args=["-m", "scholarocr.mcp.server"], env=env,
+                                   cwd=corpus_dir)
     async with Client(params) as c:
         tools = {t.name for t in (await c.list_tools()).tools}
         assert tools == EXPECTED_TOOLS

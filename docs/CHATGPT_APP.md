@@ -241,7 +241,7 @@ store and sticky sessions (or `SCHOLAROCR_REMOTE_STATELESS=1`) before scaling ou
 Run everything from the project folder, because `.env` is read from the current directory.
 
 ```powershell
-cd "D:\PROJECT SCHOLAROCR\scholarocr"
+cd path\to\scholarocr
 uv pip install --python .venv\Scripts\python.exe -e ".[remote]"   # cryptography/uvicorn are already present
 .venv\Scripts\python.exe -m pytest tests\remote -q                  # 49 tests, no network, model mocked
 ```
@@ -336,7 +336,7 @@ exactly match the host ChatGPT calls. Use the new name wherever `scholarocr` app
 Run these in PowerShell from the project folder:
 
 ```powershell
-cd "D:\PROJECT SCHOLAROCR\scholarocr"
+cd path\to\scholarocr
 
 # 1. Install flyctl. Follow the official page (Windows section): https://fly.io/docs/flyctl/install/
 #    Then open a new terminal and check:
