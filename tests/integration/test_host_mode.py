@@ -124,7 +124,9 @@ def test_full_host_loop(svc, corpus):
     assert page.status == PageStatus.DONE and page.model == "host:antigravity"
     assert all(e.extraction_method == "host_model" for e in page.elements)
     eq = next(e for e in page.elements if e.type.value == "equation")
-    assert eq.bbox is not None and eq.bbox_source == "model_estimate"
+    # boxes are snapped to the ink after submission; the model's own estimate is kept
+    assert eq.bbox is not None and eq.bbox_source in ("refined", "model_estimate")
+    assert eq.bbox_source == "model_estimate" or eq.bbox_model is not None
     assert 0 <= eq.bbox.x0 < eq.bbox.x1 <= page.width_pt and 0 <= eq.bbox.y0 < eq.bbox.y1 <= page.height_pt
     assert eq.source.region_image  # crops saved like any extraction
     caption = next(e for e in page.elements if e.type.value == "caption")

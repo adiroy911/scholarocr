@@ -1,8 +1,11 @@
 """Prompts the web app sends through ``agy -p`` (and the chat prompt for key engines).
 
-Page prompts reuse host mode's rules and element shape (``prompts.host_page_brief``) unchanged, so a page read
-through the app is validated and stored exactly like one submitted over MCP. Only the framing differs: there
-is no submit tool, the JSON reply is the submission.
+A page read through the app is validated and stored exactly like one submitted over MCP
+(``ScholarOCR.submit_page_content``), but the brief is the app's own compact version of the host rules: agy
+enforces the page JSON schema (``--json-schema``, whose field descriptions already define every field, the
+element types and the doubt levels), and every model call of a page repeats the prompt, so the MCP-specific
+parts (tool names, the call shape, the type list and most examples) are left out. The page profile, the
+caller's hints and the text layer are the same as in ``intelligence.prompts.host_page_brief``.
 """
 
 from __future__ import annotations
@@ -12,20 +15,62 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ..intelligence.prompts import PROFILE_ADDENDA
+
 APP_CHAT_PROMPT_VERSION = "app-chat-2026-11-03.1"
+APP_PAGE_PROMPT_VERSION = "app-page-2026-11-03.2"
 
 PAGE_PREAMBLE = """You are the vision model for the ScholarOCR desktop app.
-Step 1: read exactly one file with your file-reading tool (read_file / view_file):
-{image_path}
-That is the only tool call you may make. Shell commands, scripts, code execution, file edits, browsing, MCP
-tools and every other tool are denied in this run and will fail, so do not try them. Do not inspect or
-measure the image with code; estimate boxes by eye.
-Step 2: reply with ONLY a JSON object with the fields elements, page_language, page_label, page_doubt,
-rotation_detected and notes. No prose, no code fence. Where the rules below mention submit_page_content or
-get_page_image, your JSON reply takes its place; do not call any tool. If the image looks blank or
-unreadable, say so in notes.
-"page_doubt" and each element's "uncertainty" are levels of DOUBT, not of quality: a clean printed page has
-page_doubt "low" and mostly "low" elements. Label each element on its own."""
+Step 1: read exactly one file with read_file: {image_path}
+It is the only file you may read. Shell commands, code, file edits, browsing, MCP tools and every other tool
+are denied in this run and will fail. Estimate boxes by eye, never with code (rough is fine: the app snaps
+them to the ink).
+Step 2: return ONLY the page JSON object (elements, page_language, page_label, page_doubt, rotation_detected,
+notes) in the given schema, no prose. If the image looks blank or unreadable, say so in notes."""
+
+PAGE_RULES = """Rules (the schema's field descriptions apply as well):
+1. Transcribe exactly what is visible; never complete, correct, summarise or guess. Unreadable: type
+   "uncertain", text like "[illegible: 2 words]", uncertainty "unresolved".
+2. uncertainty is DOUBT about each element, judged on its own (clean print is mostly "low"); give
+   uncertainty_reasons when it is not low. page_doubt is the page's overall DOUBT, not its quality.
+3. Reading order (respect columns; header first, footer and page number last). box_2d = [ymin, xmin, ymax,
+   xmax], integers 0-1000 of THIS image.
+4. Math: LaTeX (amsmath) in latex, a readable form in text. Display equations are separate "equation"
+   elements; inline math stays in the text as $...$ (e.g. $\\gamma_0$, never "γ0"). Keep equation numbers.
+5. Chemistry: "chemical_equation" with \\ce{...}; inline $\\ce{SO4^2-}$. Keep charges, states, arrows and
+   coefficients. Distinguish O/0, l/1, x/×, -/−.
+6. Tables only for real rows and columns. A figure, diagram or graph is one element with a tight box and
+   figure {description, labels, relationships, kind}; a caption is a separate "caption" with caption_of = the
+   figure's index. Headers, footers and page numbers get their own types. Unsure how to encode something:
+   pick the closest type and say why in notes.
+7. Questions: role and question {number, marks} exactly as printed; subquestions, and text continuing a
+   question after an equation or figure, set parent_index (0-based) and carry no number. Never repeat one.
+8. Text elements also get clean_text: casing, punctuation and spacing slips fixed (a mid-sentence capital
+   lowered unless a name, acronym or symbol; a full stop where a new sentence starts); same words, numbers,
+   symbols and $...$ math, no rephrasing; e.g. "a Function of x But" -> "a function of x. But". Omit it when
+   nothing changes.
+Examples: {"type":"paragraph","role":"question","text":"Q3. Solve $x^2=4$. [2]","question":{"number":"3",
+"marks":"2"},"box_2d":[100,80,140,920]}  {"type":"equation","text":"E = mc^2","latex":"E = mc^2",
+"box_2d":[150,300,190,700]}"""
+
+
+def page_brief(task: dict[str, Any]) -> str:
+    """The app's page brief from ``host_page_image(..., instructions="none")``'s ``info["task"]``."""
+    parts = [PAGE_RULES]
+    addendum = PROFILE_ADDENDA.get(task.get("route"), "")
+    if addendum:
+        parts.append("Page profile: " + addendum)
+    hints = task.get("hints") or {}
+    named = [(k, label) for k, label in (("document_type", "document type"), ("language_hint", "language(s)"),
+                                          ("context_hint", "context")) if hints.get(k)]
+    if named:
+        parts.append("Caller-provided hints (may be wrong; trust the image): "
+                     + "; ".join(f"{label}: {hints[k]}" for k, label in named))
+    if task.get("text_layer"):
+        parts.append("The PDF has an embedded text layer for this page (may be incomplete or wrong for math). "
+                     "Use it only to disambiguate characters; the image is authoritative. Do not copy Unicode math "
+                     "from it; write inline math as $...$ LaTeX:\n<<<\n" + task["text_layer"] + "\n>>>")
+    return "\n\n".join(parts)
 
 RETRY_TEMPLATE = """Your previous reply for this page was REJECTED by the validator and nothing was stored.
 Fix every problem listed and reply again with the COMPLETE corrected page JSON only (all elements, not just

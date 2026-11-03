@@ -62,7 +62,7 @@ def test_unknown_format_raises(sample, tmp_path):
 
 
 def test_formats_constant():
-    assert FORMATS == ("json", "markdown", "searchable-pdf", "docx", "latex", "csv", "xlsx")
+    assert FORMATS == ("json", "markdown", "searchable-pdf", "layout-pdf", "docx", "latex", "csv", "xlsx")
 
 
 def test_export_package_never_touches_intelligence():

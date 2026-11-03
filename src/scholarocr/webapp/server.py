@@ -40,6 +40,7 @@ from ..remote.sandbox import safe_filename
 from .agy import AgyRunner
 from .config import MAX_MESSAGE_CHARS, AppConfig, PrefsStore
 from .engines import EngineRegistry, NoEngineError, ServicePool
+from . import redraw as redraw_mod
 from .keys import KeyStore
 from .runs import RunManager
 from .store import AppStore
@@ -48,7 +49,7 @@ from .view import document_view
 
 log = get_logger("webapp.server")
 TOKEN_HEADER = "x-scholarocr-token"
-EXPORT_FORMATS = ("markdown", "docx", "latex", "searchable-pdf", "json", "csv", "xlsx")
+EXPORT_FORMATS = ("markdown", "docx", "latex", "searchable-pdf", "layout-pdf", "json", "csv", "xlsx")
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; "
        "font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; "
        "frame-ancestors 'none'")
@@ -81,7 +82,7 @@ class App:
 
         def default_agy() -> AgyRunner | None:
             path = self.registry.agy_path()
-            return AgyRunner(path, cfg.runs_dir) if path else None
+            return AgyRunner(path, cfg.runs_dir, use_reader_agent=cfg.use_reader_agent) if path else None
 
         self.runs = RunManager(cfg, self.store, self.pool, agy_factory or default_agy, threaded=threaded_runs)
         self.allowed_hosts = {f"127.0.0.1:{cfg.port}", f"localhost:{cfg.port}", f"[::1]:{cfg.port}"}
@@ -324,8 +325,57 @@ def create_app(cfg: AppConfig | None = None, **kwargs: Any) -> Starlette:
     async def get_document(request: Request) -> Response:
         doc_id = request.path_params["did"]
         _owned(app, doc_id)
+        prefs = app.prefs.load()
+        svc = app.pool.reader(prefs)
+        return _json(await run_in_threadpool(document_view, svc, doc_id, prefs.text_variant))
+
+    async def figure_image(request: Request) -> Response:
+        doc_id, eid, variant = request.path_params["did"], request.path_params["eid"], request.path_params["variant"]
+        _owned(app, doc_id)
+        if variant not in ("clean", "original", "svg"):
+            raise InputError("figure image variant must be clean, original or svg")
         svc = app.pool.reader(app.prefs.load())
-        return _json(await run_in_threadpool(document_view, svc, doc_id))
+        data, media = await run_in_threadpool(svc.figure_crop, doc_id, eid, variant)
+        headers = {"Cache-Control": "no-store"}
+        if media == "image/svg+xml":  # sanitised on submission; opened directly it still cannot run anything
+            headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        return Response(data, media_type=media, headers=headers)
+
+    async def redraw_figure(request: Request) -> Response:
+        doc_id, eid = request.path_params["did"], request.path_params["eid"]
+        _owned(app, doc_id)
+        data = await _body_json(request)
+        prefs = app.prefs.load()
+        engine = await run_in_threadpool(app.registry.resolve, data.get("engine"), prefs)
+        model = str(data.get("model") or "") or engine.default_model
+        if model and model not in {m["id"] for m in engine.models}:
+            raise InputError(f"model {model!r} is not offered by {engine.label}")
+        svc = app.pool.reader(prefs)
+        key_service = None if engine.id == "antigravity" else (lambda: app.pool.get(engine.id, prefs, model))
+        out = await run_in_threadpool(lambda: redraw_mod.redraw(
+            svc, doc_id, eid, engine=engine, model=model, key_service=key_service, agy_factory=app.runs.agy_factory,
+            runs_dir=cfg.runs_dir, timeout_s=cfg.redraw_timeout_s, effort=prefs.chat_effort))
+        fid = out.get("fidelity") or {}
+        return _json({"element_id": eid, "svg": bool(out.get("svg")), "faithful": bool(out.get("faithful")),
+                      "fidelity": {k: fid.get(k) for k in ("score", "recall", "precision", "passed", "labels_missing",
+                                                           "missing_regions", "extra_regions")},
+                      "feedback": out.get("feedback", []), "attempts": out.get("attempts", 1),
+                      "labels": out.get("labels", []), "removed": out.get("removed", []),
+                      "usage": out.get("usage", {}), "engine": engine.id, "model": model,
+                      "history": out.get("history", []), "retry_error": out.get("retry_error")})
+
+    async def refine_document(request: Request) -> Response:
+        """Update layout: box refinement, figure crops and rule-cleaned text for a document read before they
+        existed (no model call, nothing is read again)."""
+        doc_id = request.path_params["did"]
+        _owned(app, doc_id)
+        if any(doc_id in app.store.documents(r.conversation_id) for r in app.runs.running()):
+            raise InputError("this document is still being read; update its layout when reading has finished")
+        prefs = app.prefs.load()
+        svc = app.pool.reader(prefs)
+        result = await run_in_threadpool(svc.refine_document, doc_id)
+        view = await run_in_threadpool(document_view, svc, doc_id, prefs.text_variant)
+        return _json({"result": {"totals": result["totals"], "pages": len(result["pages"])}, "view": view})
 
     async def element_source(request: Request) -> Response:
         doc_id, eid = request.path_params["did"], request.path_params["eid"]
@@ -350,8 +400,15 @@ def create_app(cfg: AppConfig | None = None, **kwargs: Any) -> Starlette:
         _owned(app, doc_id)
         if fmt not in EXPORT_FORMATS:
             raise InputError(f"unknown format {fmt!r}")
-        svc = app.pool.reader(app.prefs.load())
-        result = await run_in_threadpool(svc.export, doc_id, fmt)
+        prefs = app.prefs.load()
+        svc = app.pool.reader(prefs)
+        # Cleaned / As written and figure images: from the link (the result view's switch), else from Settings.
+        text = request.query_params.get("text") or prefs.text_variant
+        figures = request.query_params.get("figures") or prefs.figure_variant
+        if text not in ("auto", "clean", "faithful") or figures not in ("clean", "original", "redrawn"):
+            raise InputError("text must be auto, clean or faithful; figures must be clean, original or redrawn")
+        result = await run_in_threadpool(lambda: svc.export(doc_id, fmt, options={"text_variant": text,
+                                                                                 "figure_variant": figures}))
         path = Path(result["primary_file"]).resolve()
         if not path.is_relative_to(cfg.engine_data_dir.resolve()) or not path.is_file():
             raise NotFoundError("export file not found")
@@ -388,7 +445,10 @@ def create_app(cfg: AppConfig | None = None, **kwargs: Any) -> Starlette:
         Route("/api/documents/{did}", guarded(get_document), methods=["GET"]),
         Route("/api/documents/{did}/elements/{eid}/source.png", guarded(element_source), methods=["GET"]),
         Route("/api/documents/{did}/pages/{n}/source.png", guarded(page_source), methods=["GET"]),
+        Route("/api/documents/{did}/elements/{eid}/figure/{variant}", guarded(figure_image), methods=["GET"]),
+        Route("/api/documents/{did}/elements/{eid}/redraw", guarded(redraw_figure), methods=["POST"]),
         Route("/api/documents/{did}/export/{fmt}", guarded(export), methods=["GET"]),
+        Route("/api/documents/{did}/refine", guarded(refine_document), methods=["POST"]),
     ]
     routes = [Route("/", index, methods=["GET"]), *api,
               Mount("/static", app=StaticFiles(directory=str(static_dir())), name="static")]

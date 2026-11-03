@@ -5,8 +5,9 @@ displayed* (i.e. after any PDF /Rotate is applied, matching the rendered page im
 at the top-left, x to the right, y downwards. Preprocessing transforms (deskew, rotation
 correction, upscaling) are inverted before boxes are stored, so boxes never refer to the
 processed image. ``bbox_source`` says where it came
-from: ``pdf_text_layer`` boxes are exact; ``model_estimate`` boxes come from Gemini and
-are approximate.
+from: ``pdf_text_layer`` boxes are exact; ``model_estimate`` boxes come from a vision model and
+are approximate; ``refined`` boxes are model estimates snapped deterministically to the ink on the
+page image (``pipeline/layout_refine.py``), with the model's own box kept in ``bbox_model``.
 
 Uncertainty is an ordinal label, never a probability. See docs/QUALITY_ASSURANCE.md for
 exactly how labels are assigned.
@@ -179,6 +180,14 @@ class FigureData(BaseModel):
     relationships: list[str] = Field(default_factory=list)  # e.g. "arrow from A to B"
     figure_label: str | None = None  # e.g. "Fig. 3"
     kind: str | None = None  # graph, circuit, geometry, chemical_structure, photo, ...
+    # Paths relative to the document dir. The full-resolution crop itself is ``Element.source.region_image``.
+    image_clean: str | None = None  # cleaned crop: paper/shadows whitened, ruled lines removed, trimmed
+    svg: str | None = None  # optional vector redraw (opt-in, model-made, sanitised); never replaces the crop
+    # Deterministic check of ``svg`` against the crop it was drawn from (``pipeline/svg_fidelity.py``): score,
+    # recall (crop ink the redraw covers), precision (redraw ink the crop supports), missing labels, passed.
+    # Exports and the app use the SVG only when ``passed`` is true.
+    svg_fidelity: dict[str, Any] | None = None
+    redraw_attempts: int = 0  # failed checks in the current redraw (one retry is allowed)
 
 
 class QuestionInfo(BaseModel):
@@ -216,7 +225,11 @@ class Element(BaseModel):
     page_id: str
     page_number: int
     reading_order: int
-    content: str = ""  # human-readable text; for math, a readable linearisation
+    content: str = ""  # human-readable text exactly as written; for math, a readable linearisation
+    # ``content`` with casing, punctuation and spacing normalised and obvious slips of the pen fixed (never other
+    # words, numbers, symbols or math). None = not produced (exports then use ``content``).
+    clean_content: str | None = None
+    clean_content_source: str | None = None  # "model" (same call, passed the guard) | "rules" (deterministic)
     latex: str | None = None  # math/chemistry in LaTeX (mhchem \ce{} for chemistry)
     level: int | None = None  # heading level (1 = top)
     items: list[str] | None = None  # list items
@@ -227,7 +240,8 @@ class Element(BaseModel):
     parent_id: str | None = None  # caption->figure, subquestion->question
     handwritten: bool = False
     bbox: BBox | None = None
-    bbox_source: str | None = None  # "pdf_text_layer" | "model_estimate"
+    bbox_source: str | None = None  # "pdf_text_layer" | "model_estimate" | "refined"
+    bbox_model: BBox | None = None  # the model's own estimate, kept when ``bbox`` was refined to the ink
     uncertainty: Uncertainty = Uncertainty.LOW
     uncertainty_reasons: list[str] = Field(default_factory=list)
     formatting: dict[str, Any] = Field(default_factory=dict)  # bold, italic, font, size, display

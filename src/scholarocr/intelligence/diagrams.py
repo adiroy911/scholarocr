@@ -37,7 +37,8 @@ def describe(client: GeminiClient, settings: Settings, el: Element, crop: Image.
     labels = list(dict.fromkeys((known or []) + resp.labels))
     el.figure = FigureData(description=resp.description, labels=labels, relationships=resp.relationships,
                            figure_label=(el.figure.figure_label if el.figure else None) or resp.figure_label,
-                           kind=resp.kind)
+                           kind=resp.kind, image_clean=el.figure.image_clean if el.figure else None,
+                           svg=el.figure.svg if el.figure else None)
     el.revisions.append(Revision(at=now_iso(), by=f"describe:{info.model}", field="figure", previous=previous))
     el.uncertainty_reasons = [r for r in el.uncertainty_reasons if "not described" not in r]
     # The description is auxiliary (the preserved crop is authoritative), so the label is unchanged.

@@ -84,7 +84,7 @@ Uncertainty labels are ordinal judgements, not probabilities; "unresolved" conte
 
 DocTypeLit = Literal[tuple(t.value for t in DocumentType)]  # type: ignore[valid-type]
 ElementTypeLit = Literal[tuple(t.value for t in ElementType)]  # type: ignore[valid-type]
-FormatLit = Literal["json", "markdown", "searchable-pdf", "docx", "latex", "csv", "xlsx"]
+FormatLit = Literal["json", "markdown", "searchable-pdf", "layout-pdf", "docx", "latex", "csv", "xlsx"]
 ScopeLit = Literal["completeness", "duplicates", "page_order", "content", "reading_order", "math", "tables",
                    "structure", "uncertainty", "traceability", "exports"]
 OptDocType = Annotated[DocTypeLit | None, Field(description="Optional hint, e.g. exam_paper, handwritten_notes.")]

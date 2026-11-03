@@ -5,7 +5,7 @@ the MCP server (``scholarocr.mcp.server``) or the CLI (``scholarocr.cli.main``);
 callers use :class:`scholarocr.service.ScholarOCR`.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Bump when extraction semantics change; part of every cache key.
 EXTRACTION_VERSION = "1"

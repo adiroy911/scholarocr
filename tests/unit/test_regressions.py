@@ -132,7 +132,7 @@ def test_shape_examples_are_valid_elements_and_cover_chemistry():
     assert examples[cap["caption_of"]]["type"] == "figure"
     # The validator accepts the examples as one page.
     host.validate_submission({"elements": examples})
-    assert len(prompts.HOST_RULES + prompts.HOST_SHAPE) < 4800  # keep the brief compact
+    assert len(prompts.HOST_RULES + prompts.HOST_SHAPE) < 5000  # keep the brief compact (4800 before clean_text)
 
 
 # ---------------------------------------------------------------------------------------------- 5. malformed elements

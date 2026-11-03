@@ -176,7 +176,8 @@ def test_read_with_antigravity_end_to_end(client, corpus):
     done = evs[-1]
     assert done["state"] == "done"
     call = client.fake_agy.calls[0]
-    assert call["model"] == "gemini-3.8-flash-low"
+    # effort is chosen through the model family (agy refuses "gemini-3.8-flash-low --effort low" as a conflict)
+    assert call["model"] == "gemini-3.8-flash" and call["effort"] == "low"
     assert call["schema"]["properties"]["elements"]["type"] == "array"  # PageExtractionResponse schema
     img_dir = call["read_dirs"][0]
     assert str(img_dir).startswith(str(client.app.cfg.runs_dir))
@@ -320,3 +321,78 @@ def test_conversation_rename_and_delete(client):
     assert client.patch(f"/api/conversations/{cid}", json={"title": "  Chem   unit 3 "}).json()["title"] == "Chem unit 3"
     assert client.delete(f"/api/conversations/{cid}").status_code == 200
     assert client.get(f"/api/conversations/{cid}").status_code == 404
+
+
+def test_cleaned_text_figures_and_redraw(client, corpus):
+    """Cleaned / As written in the view and exports (saved default in Settings), figure images (cleaned crop
+    with a toggle to the original), and the opt-in Redraw through the engine with a sanitised SVG."""
+    payload = page_payload("Q1. Solve the Equation $x^2 + 5x + 6 = 0$ [2]")
+    first_text = next(e for e in payload["elements"] if e["type"] in ("paragraph", "text", "heading"))
+    first_text["clean_text"] = first_text["text"].replace("Equation", "equation") if "Equation" in first_text["text"] \
+        else first_text["text"]
+    client.fake_agy.replies = [payload]
+    _, _, evs = read(client, corpus["math_paper.pdf"])
+    doc_id = evs[-1]["data"]["documents"][0]["document_id"]
+    view = client.get(f"/api/documents/{doc_id}").json()
+    assert view["text_variant"] in ("clean", "faithful") and "handwritten" in view
+    els = view["pages"][0]["elements"]
+    fig = next(e for e in els if e["type"] == "figure")
+    assert fig["figure"]["images"]["original"] and fig["figure"]["images"]["svg"] is False
+    for variant in ("original", "clean") if fig["figure"]["images"]["clean"] else ("original",):
+        r = client.get(f"/api/documents/{doc_id}/elements/{fig['id']}/figure/{variant}")
+        assert r.status_code == 200 and r.content[:8] == b"\x89PNG\r\n\x1a\n"
+    assert client.get(f"/api/documents/{doc_id}/elements/{fig['id']}/figure/svg").status_code == 404
+    assert client.get(f"/api/documents/{doc_id}/elements/{fig['id']}/figure/evil").status_code == 400
+    # the saved setting decides the default; the result view's switch overrides it per link
+    assert client.put("/api/prefs", json={"text_variant": "faithful"}).json()["prefs"]["text_variant"] == "faithful"
+    assert client.get(f"/api/documents/{doc_id}").json()["text_variant"] == "faithful"
+    assert client.put("/api/prefs", json={"text_variant": "fancy"}).status_code == 400
+    for text in ("clean", "faithful"):
+        assert client.get(f"/api/documents/{doc_id}/export/markdown?text={text}").status_code == 200
+    assert client.get(f"/api/documents/{doc_id}/export/markdown?text=fancy").status_code == 400
+    # Redraw: the engine replies with an SVG (with a script that the sanitiser removes)
+    client.fake_agy.chat_text = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 60"><script>x()</script>'
+                                 '<path d="M5 55 Q50 -20 95 55" fill="none" stroke="#111"/></svg>')
+    calls_before = len(client.fake_agy.calls)
+    r = client.post(f"/api/documents/{doc_id}/elements/{fig['id']}/redraw", json={"engine": "antigravity"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "element <script>" in body["removed"]
+    # the curve is not a copy of the drawing: refused, retried once with the feedback, then marked not faithful
+    assert body["faithful"] is False and body["attempts"] == 2 and body["svg"] is True
+    assert body["fidelity"]["passed"] is False and body["feedback"]
+    assert [h["attempt"] for h in body["history"]] == [1, 2] and body["retry_error"] is None
+    first, second = client.fake_agy.calls[calls_before:]
+    assert first["schema"] is None and "read_file" in first["prompt"] and "WITHOUT CHANGING A THING" in first["prompt"]
+    assert "REFUSED by the fidelity check" in second["prompt"]
+    svg = client.get(f"/api/documents/{doc_id}/elements/{fig['id']}/figure/svg")  # inspectable, labelled in the UI
+    assert svg.status_code == 200 and svg.headers["content-type"].startswith("image/svg+xml")
+    assert b"script" not in svg.content and "sandbox" in svg.headers["content-security-policy"]
+    shown = client.get(f"/api/documents/{doc_id}").json()["pages"][0]["elements"][els.index(fig)]["figure"]
+    assert shown["images"]["svg"] and shown["svg_fidelity"]["passed"] is False
+    md = client.get(f"/api/documents/{doc_id}/export/markdown?figures=redrawn")
+    assert md.status_code == 200 and ".svg" not in md.text  # a redraw that failed is never exported
+    not_fig = next(e for e in els if e["type"] != "figure")
+    assert client.post(f"/api/documents/{doc_id}/elements/{not_fig['id']}/redraw", json={}).status_code == 400
+
+
+def test_update_layout_for_an_older_reading(client, corpus):
+    from scholarocr.pipeline.checkpoints import load_page, save_page
+
+    _, _, evs = read(client, corpus["math_paper.pdf"])
+    doc_id = evs[-1]["data"]["documents"][0]["document_id"]
+    view = client.get(f"/api/documents/{doc_id}").json()
+    assert view["layout_update"]["outdated"] is False  # read now: already refined
+    svc = client.app.pool.reader(client.app.prefs.load())
+    page = load_page(svc.store, doc_id, 1)
+    page.layout_refined_at = None
+    for el in page.elements:
+        el.clean_content = None
+    save_page(svc.store, page)
+    view = client.get(f"/api/documents/{doc_id}").json()
+    assert view["layout_update"]["outdated"] and view["layout_update"]["counts"]["clean_text"] > 0
+    r = client.post(f"/api/documents/{doc_id}/refine")
+    assert r.status_code == 200, r.text
+    assert r.json()["result"]["totals"]["clean_text_added"] > 0
+    assert r.json()["view"]["layout_update"]["outdated"] is False
+    assert client.post("/api/documents/doc_0123456789abcdef/refine").status_code == 404

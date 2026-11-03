@@ -96,6 +96,16 @@ skill:
 (`get_page_image` -> transcribe -> `submit_page_content`, optional `submit_review`), the tools, the
 uncertainty rules and the error codes.
 
+Boxes may be rough: the server snaps every box to the ink on the page after `submit_page_content` (and
+grows figure boxes to their strokes and labels), so the model never needs to measure the image or run code.
+Each text element also carries `clean_text` (casing, punctuation and spacing slips fixed, same words, numbers
+and math); the server checks it and stores it as `clean_content`, next to the unchanged transcription.
+`get_document_content` and `export_document` take `text_variant` (`clean` | `faithful`; default cleaned for
+handwritten documents). To get a vector copy of a figure: `redraw_figure(document_id, element_id)` returns the
+cleaned crop and strict instructions (copy it without changing anything, viewBox = the crop's pixels);
+`submit_figure_svg` sanitises it and compares it with the crop, and a copy that fails gets one retry with
+feedback. Only do this when the user asks: it costs output tokens.
+
 In host mode the server makes no model calls; transcription uses Antigravity's model and its context,
 about one page image plus the elements per page. With a key, model calls happen only in `ocr_document`
 (scanned pages, figures), `classify_document` and `verify_document(review=true)`.

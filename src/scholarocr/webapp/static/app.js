@@ -7,6 +7,7 @@
   const VERSION = document.querySelector('meta[name="scholarocr-version"]').content;
   const SPRITE = "/static/icons.svg#";
   const $ = (id) => document.getElementById(id);
+  const LIVE_PAGE = new Set(["reading", "retrying", "rotated", "waiting"]);
   const EVENT_TYPES = ["stage", "job", "document_started", "page", "usage", "verification", "document", "delta", "error", "done"];
   const UNC_LABEL = { low: "Clear", medium: "Some doubt", high: "Doubtful", unresolved: "Unreadable" };
   const TYPE_LABEL = {
@@ -20,7 +21,7 @@
     native: "Word document with native, editable equations",
     fallback: "Word document. pandoc is not installed, so equations are inserted as LaTeX source and inline math as plain text. Install pandoc for native Word equations.",
   };
-  const EXPORT_LABEL = { markdown: "Markdown", docx: "Word", latex: "LaTeX", "searchable-pdf": "Searchable PDF", json: "JSON", csv: "CSV", xlsx: "Excel" };
+  const EXPORT_LABEL = { markdown: "Markdown", docx: "Word", latex: "LaTeX", "searchable-pdf": "Searchable PDF", "layout-pdf": "Layout PDF", json: "JSON", csv: "CSV", xlsx: "Excel" };
 
   const S = {
     prefs: null, engines: [], keys: {}, keyBackend: "file", setupNeeded: false, limits: { max_file_mb: 50, max_files: 30 },
@@ -277,7 +278,83 @@
   }
   function marksLabel(m) { return /^[\[(]/.test(m) ? m : `[${m}]`; }
 
-  function elementBody(el) {
+  // Cleaned (casing/punctuation normalised) or as written; elements without a cleaned version show their text.
+  function shownText(el, variant) { return variant === "clean" && el.clean_text ? el.clean_text : (el.text || ""); }
+
+  const pct = (x) => `${Math.round((x || 0) * 100)}%`;
+
+  function figureUrl(docId, el, mode, bust) {
+    return tokenUrl(`/api/documents/${encodeURIComponent(docId)}/elements/${encodeURIComponent(el.id)}/figure/${mode}${bust ? `?v=${bust}` : ""}`);
+  }
+
+  // A figure: the cleaned crop (toggle to the original or the redrawn SVG), the description as alt text and
+  // caption, and an opt-in Redraw that asks the selected engine for a vector version.
+  function figureNode(docId, el, text) {
+    const t = el.type;
+    const f = el.figure || {};
+    const imgs = { ...(f.images || {}) };
+    let fid = f.svg_fidelity || null;  // the redraw's fidelity check: { score, passed, ... }
+    const kind = [f.figure_label, f.kind ? f.kind.replace(/_/g, " ") : TYPE_LABEL[t]].filter(Boolean).join(", ") || TYPE_LABEL[t];
+    const desc = f.description || text || "No description.";
+    const labels = f.labels && f.labels.length ? h("div", { class: "figure-labels" }, f.labels.slice(0, 24).map((l) => h("span", { text: l }))) : null;
+    if (!docId || (!imgs.clean && !imgs.original)) {
+      return h("div", { class: "figure" }, icon("image"),
+        h("div", null, h("div", { class: "figure-kind", text: kind }), h("p", { class: "figure-desc", text: desc }), labels));
+    }
+    let mode = imgs.clean ? "clean" : "original";
+    let bust = 0;
+    const img = h("img", { class: "fig-img", alt: desc, src: figureUrl(docId, el, mode), loading: "lazy" });
+    img.addEventListener("error", () => { img.hidden = true; });
+    img.addEventListener("load", () => { img.hidden = false; });
+    const bar = h("div", { class: "fig-bar" });
+    bar.addEventListener("click", (e) => e.stopPropagation());
+    bar.addEventListener("keydown", (e) => e.stopPropagation());
+    const redrawBtn = h("button", { type: "button", class: "btn btn-quiet btn-small",
+      title: "Copy this figure as clean vector lines with the selected engine, without changing anything. The copy is checked against the crop; one or two model calls. The crop is kept." },
+      icon("refresh-cw"), h("span", { text: imgs.svg ? "Redraw again" : "Redraw" }));
+    redrawBtn.addEventListener("click", async () => {
+      redrawBtn.disabled = true; redrawBtn.classList.add("busy");
+      redrawBtn.querySelector("span").textContent = "Redrawing";
+      try {
+        const r = await api("POST", `/api/documents/${encodeURIComponent(docId)}/elements/${encodeURIComponent(el.id)}/redraw`,
+          { engine: S.engine || undefined, model: S.model || undefined });
+        imgs.svg = r.svg; bust = Date.now();
+        fid = r.fidelity && r.fidelity.score != null ? { score: r.fidelity.score, passed: r.faithful } : null;
+        if (f.images) f.images.svg = r.svg;
+        f.svg_fidelity = fid;
+        const tokens = r.usage && r.usage.total_tokens ? `, ${fmtTokens(r.usage.total_tokens)}` : "";
+        if (r.faithful) {
+          mode = "svg"; img.src = figureUrl(docId, el, "svg", bust);
+          toast(`Figure redrawn, fidelity ${pct(fid.score)}${tokens}`);
+        } else {
+          // never substituted: the cleaned crop stays; the copy can still be inspected under "Redrawn"
+          toast(`The redraw is not faithful (${fid ? pct(fid.score) : "failed"}) and is not used${tokens}`);
+        }
+      } catch (err) { toast(err.message); }
+      redrawBtn.disabled = false; redrawBtn.classList.remove("busy");
+      renderBar();
+    });
+    function renderBar() {
+      const svgLabel = !fid ? "Redrawn" : fid.passed ? `Redrawn ${pct(fid.score)}` : `Redrawn, not faithful ${pct(fid.score)}`;
+      const modes = [["clean", "Cleaned"], ["original", "Original"], ["svg", svgLabel]].filter(([m]) => imgs[m]);
+      redrawBtn.querySelector("span").textContent = imgs.svg ? "Redraw again" : "Redraw";
+      setKids(bar,
+        modes.length > 1 ? h("div", { class: "seg seg-small", role: "group", "aria-label": "Figure image" }, modes.map(([m, label]) => {
+          const b = h("button", { type: "button", class: `seg-btn${m === "svg" && fid && !fid.passed ? " seg-warn" : ""}`,
+            "aria-pressed": String(m === mode), text: label,
+            title: m === "svg" && fid ? `Fidelity check: ${pct(fid.score)}${fid.passed ? ", passed" : ", failed: exports keep the crop"}` : null });
+          b.addEventListener("click", () => { mode = m; img.src = figureUrl(docId, el, m, bust); renderBar(); });
+          return b;
+        })) : null,
+        redrawBtn);
+    }
+    renderBar();
+    return h("figure", { class: "figure fig-has-img" }, img,
+      h("figcaption", null, h("span", { class: "figure-kind", text: kind }), h("span", { class: "figure-desc", text: desc }), labels),
+      bar);
+  }
+
+  function elementBody(el, docId) {
     const t = el.type;
     const text = el.text || "";
     if (t === "equation" || t === "chemical_equation") {
@@ -286,15 +363,7 @@
     }
     if (t === "table" && el.table) return tableNode(el.table);
     if (t === "list" && el.items && el.items.length) return h("ul", null, el.items.map((it) => h("li", null, inlineMath(it))));
-    if (t === "figure" || t === "diagram" || t === "image") {
-      const f = el.figure || {};
-      const kind = [f.figure_label, f.kind ? f.kind.replace(/_/g, " ") : TYPE_LABEL[t]].filter(Boolean).join(", ");
-      return h("div", { class: "figure" }, icon("image"),
-        h("div", null,
-          h("div", { class: "figure-kind", text: kind || TYPE_LABEL[t] }),
-          h("p", { class: "figure-desc", text: f.description || text || "No description." }),
-          f.labels && f.labels.length ? h("div", { class: "figure-labels" }, f.labels.slice(0, 24).map((l) => h("span", { text: l }))) : null));
-    }
+    if (t === "figure" || t === "diagram" || t === "image") return figureNode(docId, el, text);
     if (t === "code") return h("pre", null, h("code", { text }));
     return h("p", null, h("span", { class: "u-text" }, inlineMath(text)));
   }
@@ -332,15 +401,16 @@
     return "el-text";
   }
 
-  function elementRow(docId, el) {
+  function elementRow(docId, el, variant) {
     const q = el.question;
     const sub = el.role === "subquestion";
-    const shown = q ? { ...el, text: stripQuestion(el.text || "", q) } : el;
+    const base = { ...el, text: shownText(el, variant) };
+    const shown = q ? { ...base, text: stripQuestion(base.text, q) } : base;
     const node = h("div", {
       class: `el ${typeClass(el.type)} u-${el.uncertainty}${sub ? " sub" : ""}`, tabindex: "0", role: "button",
       "aria-label": `${TYPE_LABEL[el.type] || el.type}${el.uncertainty !== "low" ? `, ${UNC_LABEL[el.uncertainty].toLowerCase()}` : ""}. Show source`,
       dataset: { eid: el.id },
-    }, elementBody(shown));
+    }, elementBody(shown, docId));
     if (el.uncertainty === "unresolved" && el.type !== "uncertain") node.append(h("span", { class: "u-flag", text: "unreadable" }));
     const open = () => openSource(docId, el, node);
     node.addEventListener("click", open);
@@ -360,8 +430,9 @@
     return "";
   }
 
-  function renderDoc(view, entry, pageStats) {
+  function renderDoc(view, entry, pageStats, variantOverride) {
     const docId = view.document_id;
+    const variant = variantOverride || view.text_variant || "faithful";
     const card = h("article", { class: "doc", dataset: { doc: docId } });
     const name = view.title || (view.filenames || [])[0] || "Document";
     const facts = h("div", { class: "doc-facts" });
@@ -389,10 +460,38 @@
       h("p", { class: "doc-files", text: `${(view.filenames || []).join(", ")}, ${plural(view.page_count, "page", "pages")}` }),
       facts, findings);
     card.append(head);
+    if (view.pages.some((p) => p.elements.some((e) => e.clean_text))) {
+      const sw = h("div", { class: "seg seg-small", role: "group", "aria-label": "Text shown and exported" },
+        [["clean", "Cleaned"], ["faithful", "As written"]].map(([v, label]) => {
+          const b = h("button", { type: "button", class: "seg-btn", "aria-pressed": String(v === variant), text: label,
+            title: v === "clean" ? "Casing, punctuation and spacing slips fixed; same words, numbers and math" : "Exactly as transcribed" });
+          b.addEventListener("click", () => { if (v !== variant) card.replaceWith(renderDoc(view, entry, pageStats, v)); });
+          return b;
+        }));
+      card.append(h("div", { class: "doc-tools" }, h("span", { class: "doc-tools-label", text: "Text" }), sw));
+    }
+    const lu = view.layout_update;
+    if (lu && lu.outdated) {
+      const what = [lu.counts.boxes ? "snap boxes to the ink" : "", lu.counts.figures ? "crop and clean figures" : "",
+        lu.counts.clean_text ? "add cleaned text" : ""].filter(Boolean).join(", ");
+      const btn = h("button", { type: "button", class: "btn btn-small", title: `Read before these features existed: ${what}. Nothing is read again.` },
+        icon("refresh-cw"), "Update layout");
+      btn.addEventListener("click", async () => {
+        btn.disabled = true; btn.lastChild.textContent = "Updating";
+        try {
+          const r = await api("POST", `/api/documents/${encodeURIComponent(docId)}/refine`);
+          S.docViews[docId] = r.view;
+          card.replaceWith(renderDoc(r.view, entry, pageStats, variantOverride));
+          toast("Layout updated");
+        } catch (e) { toast(e.message); btn.disabled = false; btn.lastChild.textContent = "Update layout"; }
+      });
+      card.append(h("div", { class: "doc-tools" }, h("span", { class: "doc-tools-label", text: "Older reading" }),
+        h("span", { class: "doc-tools-note", text: `Update to ${what}.` }), btn));
+    }
     if (view.export_formats && view.export_formats.length) {
       card.append(h("div", { class: "exports" }, h("span", { class: "exports-label", text: "Export" }),
         view.export_formats.map((f) => {
-          const a = h("a", { class: "export-link", href: tokenUrl(`/api/documents/${encodeURIComponent(docId)}/export/${f}`), download: "",
+          const a = h("a", { class: "export-link", href: tokenUrl(`/api/documents/${encodeURIComponent(docId)}/export/${f}?text=${variant}`), download: "",
             title: f === "docx" ? DOCX_NOTE[view.native_equations ? "native" : "fallback"] : null },
             icon("download"), EXPORT_LABEL[f] || f);
           a.addEventListener("click", () => { a.classList.add("busy"); setTimeout(() => a.classList.remove("busy"), 2500); });
@@ -411,7 +510,7 @@
           h("button", { type: "button", class: "btn btn-quiet btn-small", onclick: (e) => openPage(docId, p.page_number, e.currentTarget) },
             icon("eye"), "Page image")));
       const sheet = h("div", { class: "sheet" });
-      if (p.elements.length) p.elements.forEach((el) => sheet.append(elementRow(docId, el)));
+      if (p.elements.length) p.elements.forEach((el) => sheet.append(elementRow(docId, el, variant)));
       else if (p.status === "failed") sheet.append(h("p", { class: "page-error", text: p.error || "This page could not be read." }));
       else if (p.status === "awaiting_transcription") sheet.append(h("p", { class: "page-empty", text: "This page has not been read yet." }));
       else if (p.status === "blank") sheet.append(h("p", { class: "page-empty", text: "Blank page." }));
@@ -469,7 +568,8 @@
       cropImg(tokenUrl(`/api/documents/${encodeURIComponent(docId)}/elements/${encodeURIComponent(el.id)}/source.png`), "Source region of this element"),
       facts,
       el.reasons && el.reasons.length ? h("ul", { class: "sp-reasons" }, el.reasons.map((r) => h("li", { text: r }))) : null,
-      h("p", { class: "sp-label", text: "Text" }), h("pre", { class: "sp-raw", text: raw || "(empty)" }),
+      h("p", { class: "sp-label", text: el.clean_text ? "As written" : "Text" }), h("pre", { class: "sp-raw", text: raw || "(empty)" }),
+      el.clean_text ? [h("p", { class: "sp-label", text: "Cleaned" }), h("pre", { class: "sp-raw", text: el.clean_text })] : null,
       el.latex ? [h("p", { class: "sp-label", text: "LaTeX" }), h("pre", { class: "sp-raw", text: el.latex })] : null,
       h("div", { class: "sp-actions" }, copy,
         page ? h("button", { type: "button", class: "btn btn-small btn-quiet", onclick: () => openPage(docId, page, node) }, icon("eye"), "Whole page") : null));
@@ -583,6 +683,7 @@
     const doc = (id) => L.docs.find((d) => d.id === id);
     switch (ev.type) {
       case "stage":
+        if (ev.stage === "throttled") { const d = doc(ev.document_id); if (d) d.note = ev.message || ""; break; }
         L.stage = ev.stage; L.message = ev.message || "";
         if (ev.engine) { L.engine = ev.engine; L.model = ev.model; }
         if (ev.stage === "cancelling") L.cancelling = true;
@@ -595,8 +696,11 @@
         const d = doc(ev.document_id);
         if (!d) break;
         const prev = d.pages[ev.page] || { started: Date.now(), usage: {} };
-        d.pages[ev.page] = { ...prev, ...ev, usage: prev.usage, started: prev.started };
-        if (ev.status !== "reading" && ev.status !== "retrying" && ev.status !== "rotated") d.pages[ev.page].finished = Date.now();
+        const restarted = ev.status === "reading" && prev.finished;
+        d.pages[ev.page] = { ...prev, ...ev, usage: prev.usage, started: restarted ? Date.now() : prev.started };
+        if (restarted) delete d.pages[ev.page].finished;
+        if (!LIVE_PAGE.has(ev.status)) d.pages[ev.page].finished = Date.now();
+        if (Array.isArray(ev.reading)) { d.reading = ev.reading; d.read = ev.read; d.total = ev.total; d.concurrency = ev.concurrency; }
         L.stage = "reading";
         break;
       }
@@ -633,10 +737,18 @@
     return h("button", { type: "button", class: "btn btn-small", disabled: L.cancelling, onclick: cancelRun }, icon("stop"), L.cancelling ? "Stopping" : "Stop");
   }
 
+  // "page 4", "pages 4–6", "pages 2, 5 and 9"
+  function pagesText(list) {
+    const ns = [...list].sort((a, b) => a - b);
+    if (ns.length === 1) return `page ${ns[0]}`;
+    if (ns.every((n, i) => !i || n === ns[i - 1] + 1)) return `pages ${ns[0]}–${ns[ns.length - 1]}`;
+    return `pages ${ns.slice(0, -1).join(", ")} and ${ns[ns.length - 1]}`;
+  }
+
   function pageRow(n, p, total) {
-    const live = p.status === "reading" || p.status === "retrying" || p.status === "rotated";
+    const live = LIVE_PAGE.has(p.status);
     const statusText = {
-      reading: "Reading", retrying: p.message || "Asking again", rotated: "Re-oriented, reading again", done: `${plural(p.elements || 0, "element", "elements")}`,
+      reading: "Reading", retrying: p.message || "Asking again", rotated: "Re-oriented, reading again", waiting: "Waiting to try again", done: `${plural(p.elements || 0, "element", "elements")}`,
       rejected: p.message || "Rejected by the validator", timeout: p.message || "Timed out", error: p.message || "Failed",
     }[p.status] || p.status;
     const secs = ((p.finished || Date.now()) - p.started) / 1000;
@@ -645,7 +757,7 @@
     return h("li", { class: `prow${p.status === "done" ? " done" : ""}${bad ? " bad" : ""}` },
       live ? h("span", { class: "spinner", role: "img", "aria-label": "working" }) : icon(p.status === "done" ? "check" : bad ? "triangle-alert" : "info"),
       h("span", null, h("strong", { text: `Page ${n}` }), total ? h("span", { class: "prow-status", text: ` of ${total}` }) : null, h("span", { class: "prow-status", text: `  ${statusText}` })),
-      h("span", { class: "prow-meta", dataset: live ? { live: "1" } : {}, text: meta }),
+      h("span", { class: "prow-meta", dataset: live ? { live: "1", page: String(n) } : {}, text: meta }),
       p.errors && p.errors.length && p.status !== "done" ? h("ul", { class: "prow-errors" }, p.errors.slice(0, 4).map((e) => h("li", { text: `${e.path}: ${e.problem}` }))) : null);
   }
 
@@ -665,16 +777,18 @@
       const pages = Object.keys(d.pages).map(Number).sort((a, b) => a - b);
       const name = d.files.length === 1 ? d.files[0] : `${d.files[0]} and ${d.files.length - 1} more`;
       let title = "Preparing pages", sub = name;
-      if (pages.length) {
-        const cur = d.pages[pages[pages.length - 1]];
-        title = cur.status === "reading" || cur.status === "retrying" ? `Reading page ${cur.index} of ${cur.total}` : `Read ${pages.filter((n) => d.pages[n].status === "done").length} of ${cur.total} pages`;
-      } else if (L.stage === "verifying" || d.verification) title = "Checking the result";
+      const total = d.total || d.pageCount;
+      if (d.reading && d.reading.length) title = `Reading ${pagesText(d.reading)} of ${total}`;
+      else if (pages.length && pages.some((n) => LIVE_PAGE.has(d.pages[n].status))) title = `Reading ${pagesText(pages.filter((n) => LIVE_PAGE.has(d.pages[n].status)))} of ${total}`;
+      else if (L.stage === "verifying" || d.verification) title = "Checking the result";
+      else if (pages.length) title = `Read ${pages.filter((n) => d.pages[n].status === "done").length} of ${plural(total, "page", "pages")}`;
       const job = d.job;
       const prog = h("div", { class: "progress" },
         h("div", { class: "progress-head" }, h("span", { class: "spinner" }), h("span", { class: "progress-title", text: L.cancelling ? "Stopping" : title }), stopButton()),
         h("p", { class: "progress-sub" }, h("span", { text: sub }), et.model ? h("span", { text: `, ${et.model}` }) : null),
+        d.note ? h("p", { class: "progress-note", role: "status", text: d.note }) : null,
         !pages.length && job && job.total ? h("div", { class: "bar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": String(job.total), "aria-valuenow": String(job.completed) },
-          h("i", { style: `width:${Math.round((100 * job.completed) / job.total)}%` })) : null,
+          h("i", { style: `transform:scaleX(${(job.completed / job.total).toFixed(3)})` })) : null,
         pages.length ? h("ul", { class: "pages-list" }, pages.map((n) => pageRow(n, d.pages[n], null))) : null);
       nodes.push(prog);
     }
@@ -690,11 +804,9 @@
   setInterval(() => {
     if (!S.run) return;
     for (const node of document.querySelectorAll('.prow-meta[data-live="1"]')) {
-      const li = node.closest(".prow");
-      if (!li) continue;
-      const d = S.run.live.docs.find((x) => Object.values(x.pages).some((p) => !p.finished));
-      if (!d) continue;
-      const p = Object.values(d.pages).find((x) => !x.finished);
+      const n = node.dataset.page;
+      const d = S.run.live.docs.find((x) => x.pages[n] && !x.pages[n].finished);
+      const p = d && d.pages[n];
       if (p) node.textContent = [p.usage && p.usage.total_tokens ? fmtTokens(p.usage.total_tokens) : "", fmtSecs((Date.now() - p.started) / 1000)].filter(Boolean).join(", ");
     }
   }, 1000);
@@ -990,7 +1102,7 @@
       return h("li", { class: `chip${a.status === "error" ? " error" : ""}` }, thumb,
         h("span", { class: "chip-text" }, h("span", { class: "chip-name", text: a.name, title: a.name }), h("span", { class: "chip-meta", text: meta })),
         h("button", { type: "button", class: "icon-btn chip-remove", "aria-label": `Remove ${a.name}`, onclick: () => removeAttachment(a) }, icon("x")),
-        a.status === "uploading" ? h("span", { class: "chip-bar", style: `width:${Math.round(a.progress * 100)}%` }) : null);
+        a.status === "uploading" ? h("span", { class: "chip-bar", style: `transform:scaleX(${(a.progress || 0).toFixed(3)})` }) : null);
     }));
   }
   $("attach-btn").addEventListener("click", () => $("file-input").click());
@@ -1093,7 +1205,9 @@
     const p = S.prefs;
     $("saved-instructions").value = p.saved_instructions || "";
     $("max-file-mb").value = p.max_file_mb; $("max-files").value = p.max_files; $("max-pages").value = p.max_pages;
+    $("read-concurrency").value = String(p.read_concurrency || 3); $("read-effort").value = p.read_effort || "low"; $("chat-effort").value = p.chat_effort || "medium";
     for (const r of document.querySelectorAll('input[name="theme"]')) r.checked = r.value === (store.get("scholarocr.theme") || p.theme || "system");
+    for (const r of document.querySelectorAll('input[name="text-variant"]')) r.checked = r.value === (p.text_variant || "auto");
     $("settings-error").hidden = true;
     $("dialog-version").textContent = `ScholarOCR ${VERSION}`;
     renderEngineList(); renderKeyStatus();
@@ -1104,13 +1218,17 @@
   async function saveSettings() {
     const theme = (document.querySelector('input[name="theme"]:checked') || {}).value || "system";
     const engine = (document.querySelector('input[name="engine-pref"]:checked') || {}).value || "auto";
-    const changes = { saved_instructions: $("saved-instructions").value, engine, theme,
-      max_file_mb: Number($("max-file-mb").value), max_files: Number($("max-files").value), max_pages: Number($("max-pages").value) };
+    const textVariant = (document.querySelector('input[name="text-variant"]:checked') || {}).value || "auto";
+    const changes = { saved_instructions: $("saved-instructions").value, engine, theme, text_variant: textVariant,
+      max_file_mb: Number($("max-file-mb").value), max_files: Number($("max-files").value), max_pages: Number($("max-pages").value),
+      read_concurrency: Number($("read-concurrency").value), read_effort: $("read-effort").value, chat_effort: $("chat-effort").value };
     try {
       const r = await api("PUT", "/api/prefs", changes);
       S.prefs = r.prefs;
       store.set("scholarocr.theme", theme); applyTheme(theme);
+      const variantChanged = S.prefs && S.prefs.text_variant !== r.prefs.text_variant;
       $("settings-dialog").close();
+      if (variantChanged) { S.docViews = {}; renderMessages(); }
       await loadState(false);
       toast("Settings saved");
     } catch (e) { const err = $("settings-error"); err.textContent = e.message; err.hidden = false; }

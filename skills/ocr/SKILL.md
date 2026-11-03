@@ -24,6 +24,8 @@ Treat hints as hints, not facts.
    Each element's `uncertainty` is your doubt about it: `low` = you would bet it is exact, `medium` =
    a specific character or word could differ, `high` = a guess among alternatives, `unresolved` =
    cannot read. Label every element on its own; a clean print is mostly `low`.
+   Boxes may be rough (the server snaps them to the ink). Give text elements `clean_text` as the rules
+   describe (slips of casing, punctuation and spacing fixed; same words, numbers and math).
    Never run shell commands or read the plugin's or server's files to learn the format: if unsure,
    call `get_page_image(instructions="full")`, pick the closest element type and explain in `notes`.
    If `ocr_document` warns that a page was skipped as blank but it has content, tell the user and

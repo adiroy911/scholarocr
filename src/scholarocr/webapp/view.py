@@ -10,6 +10,7 @@ import shutil
 
 from typing import Any
 
+from ..export.base import document_is_handwritten, resolve_text_variant
 from ..schemas import ElementType, PageStatus
 from ..service import ScholarOCR
 
@@ -40,9 +41,19 @@ def element_view(el) -> dict[str, Any]:
                       "rows": [[{"text": _cut(c.text, 2000) or "", "latex": _cut(c.latex, 1000), "row_span": c.row_span,
                                  "col_span": c.col_span, "is_header": c.is_header, "uncertain": c.uncertain}
                                 for c in row[:60]] for row in el.table.rows[:300]]}
+    if el.clean_content is not None and el.clean_content != el.content:
+        d["clean_text"] = _cut(el.clean_content)
     if el.figure is not None:
         d["figure"] = {"description": _cut(el.figure.description, 4000), "labels": el.figure.labels[:60],
-                       "kind": el.figure.kind, "figure_label": el.figure.figure_label}
+                       "kind": el.figure.kind, "figure_label": el.figure.figure_label,
+                       # which stored images exist: the app shows the cleaned crop, toggles to the original
+                       "images": {"clean": bool(el.figure.image_clean), "original": bool(el.source.region_image),
+                                  "svg": bool(el.figure.svg)}}
+        fid = el.figure.svg_fidelity
+        if el.figure.svg and fid:  # shown next to "Redrawn"; a failed check is labelled "not faithful"
+            d["figure"]["svg_fidelity"] = {"score": fid.get("score"), "passed": bool(fid.get("passed")),
+                                           "recall": fid.get("recall"), "precision": fid.get("precision"),
+                                           "labels_missing": (fid.get("labels_missing") or [])[:10]}
     if el.question is not None and (el.question.number or el.question.marks):
         d["question"] = {"number": el.question.number, "marks": el.question.marks}
     if el.uncertainty_reasons:
@@ -56,7 +67,8 @@ def element_view(el) -> dict[str, Any]:
     return d
 
 
-def document_view(svc: ScholarOCR, document_id: str) -> dict[str, Any]:
+def document_view(svc: ScholarOCR, document_id: str, text_pref: str = "auto") -> dict[str, Any]:
+    """``text_pref`` is the saved setting (auto | clean | faithful); the view says which variant to show."""
     doc = svc.get_document(document_id)
     counts = {"low": 0, "medium": 0, "high": 0, "unresolved": 0}
     pages = []
@@ -81,11 +93,15 @@ def document_view(svc: ScholarOCR, document_id: str) -> dict[str, Any]:
             entry["notes"] = notes
         pages.append(entry)
     done = sum(1 for p in doc.pages if p.status in (PageStatus.DONE, PageStatus.BLANK))
-    formats = ["markdown", "docx", "latex", "searchable-pdf", "json"] + (["csv", "xlsx"] if has_tables else [])
+    formats = ["markdown", "docx", "latex", "searchable-pdf", "layout-pdf", "json"] + (["csv", "xlsx"] if has_tables else [])
     return {"document_id": document_id, "title": doc.title, "filenames": doc.original_filenames,
             "page_count": doc.page_count, "pages_done": done, "status": doc.status, "pages": pages,
             "uncertainty": counts, "export_formats": formats if done else [],
-            "native_equations": shutil.which("pandoc") is not None}  # Word export: OMML needs pandoc
+            "native_equations": shutil.which("pandoc") is not None,  # Word export: OMML needs pandoc
+            "handwritten": document_is_handwritten(doc),
+            "text_variant": resolve_text_variant(doc, text_pref),
+            # read before box refinement, figure crops or cleaned text existed: offer "Update layout"
+            "layout_update": svc.layout_outdated(document_id, doc)}
 
 
 def verification_view(report) -> dict[str, Any]:

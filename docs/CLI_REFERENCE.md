@@ -13,7 +13,8 @@
 | `page DOC N` | Full IR of page N (JSON). |
 | `region DOC (--element ID \| --page N [--bbox x0,y0,x1,y1]) --out FILE.png` | Save the original source image region. |
 | `verify DOC [--scope a,b] [--review]` | Quality checks; exit 7 if errors. |
-| `export DOC --format F [--option k=v ...] [--out-dir DIR]` | `json`, `markdown`, `searchable-pdf`, `docx`, `latex`, `csv`, `xlsx` (aliases: md, pdf, tex). |
+| `export DOC --format F [--option k=v ...] [--out-dir DIR]` | `json`, `markdown`, `searchable-pdf`, `layout-pdf`, `docx`, `latex`, `csv`, `xlsx` (aliases: md, pdf, tex). |
+| `refine DOC [--pages R] [--no-clean-text]` | Update a document read by an older version without reading it again (no model call): snap boxes to the ink, crop and clean figures, add cleaned text with the rule normaliser where an element has none. Exit 7 when no page was read yet. |
 | `list [--query Q] [--status S] [--type T] [--limit N] [--offset N]` | List documents. |
 | `classify DOC [--context TEXT] [--pages R]` | Classify (needs Gemini). |
 | `delete DOC [--all --yes]` | Delete generated artifacts; `--all --yes` also the preserved copy and record. |

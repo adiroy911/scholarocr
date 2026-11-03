@@ -12,7 +12,7 @@ from ..schemas import (BBox, Element, ElementType, FigureData, QualityAssessment
                        TableCell, TableData, Uncertainty)
 from ..preprocessing import geometry
 from ..utils import element_id
-from . import prompts
+from . import clean_text, prompts
 from .gemini_client import CallInfo, GeminiClient, ImagePart, TextPart
 from .responses import PageExtractionResponse, XTable
 from .uncertainty import apply_rules
@@ -92,6 +92,7 @@ def convert_response(resp: PageExtractionResponse, ctx: VisualPageContext, *, mo
     same schema and box convention) into IR elements with boxes in page points."""
     elements: list[Element] = []
     ids: list[str] = []
+    proper = clean_text.page_proper_nouns(x.text for x in resp.elements)
     for i, _ in enumerate(resp.elements):
         ids.append(element_id(ctx.page_id, i + 1))
     for i, x in enumerate(resp.elements):
@@ -112,6 +113,10 @@ def convert_response(resp: PageExtractionResponse, ctx: VisualPageContext, *, mo
         )
         if x.box_2d and bbox is None:
             el.uncertainty_reasons.append("invalid bounding box from model")
+        el.clean_content, el.clean_content_source, rejected = clean_text.resolve_clean(
+            x.text, x.clean_text, x.type, proper=proper)
+        if rejected:
+            el.formatting["clean_text_rejected"] = rejected[:200]  # why the model's version was not used
         ref = x.caption_of if x.caption_of is not None else x.parent_index
         if ref is not None and 0 <= ref < len(ids) and ref != i:
             el.parent_id = ids[ref]

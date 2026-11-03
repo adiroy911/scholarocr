@@ -35,11 +35,16 @@ it).
 2. Transcribe that image exactly, working only from what you see. Use the returned image, not the
    original file: the server may have cropped, rotated or deskewed it, and boxes refer to it. Do not search
    the web or use what you know about the source to fill in or "correct" the page. Coordinates: `box_2d = [ymin, xmin,
-   ymax, xmax]`, integers 0-1000 of that image, estimated by eye (approximate is fine; omit it if you
-   cannot place an element). Never run code, scripts or shell commands to measure or inspect the image.
+   ymax, xmax]`, integers 0-1000 of that image, estimated by eye (rough is fine: the server snaps every box
+   to the ink on the page; omit it if you cannot place an element). Never run code, scripts or shell
+   commands to measure or inspect the image.
    Math as LaTeX (inline math as `$...$`, never Unicode such as "γ0"), chemistry as `\ce{...}`, tables as
    rows of cells, figures with a description. Anything you cannot read: type `uncertain` with uncertainty
    `unresolved`. Do not guess.
+   Text elements also get `clean_text`: the same text with casing, punctuation and spacing slips fixed (a
+   capital in mid-sentence lowered unless it is a name, acronym or symbol; a full stop where a new sentence
+   starts; an obvious slip of the pen). Same words, numbers, symbols and math, no rephrasing; `text` stays
+   exactly as written. The server refuses a `clean_text` that changes more.
    Each element's `uncertainty` is your DOUBT about that element (not page quality): `low` = you would
    bet the transcription is exact; `medium` = a specific character or word could differ; `high` = a guess
    among alternatives; `unresolved` = cannot read. Judge every element on its own and give the reason in
@@ -69,13 +74,16 @@ formulas). The user can switch to the dedicated pipeline by configuring a key
 | `get_page_image` | Host mode: one page image to transcribe, with rules and the element shape. |
 | `submit_page_content` | Host mode: store your transcription of that page (strictly validated). |
 | `submit_review` | Second pass on one element after looking at its crop; also describes figures. |
-| `get_document_content` | Read extracted content, narrowed by `pages` and `element_types`. Markdown by default, paginated with `next_cursor`. |
+| `get_document_content` | Read extracted content, narrowed by `pages` and `element_types`. Markdown by default, paginated with `next_cursor`. `text_variant`: `clean` (casing/punctuation slips fixed) or `faithful` (as written); default cleaned for handwritten documents. |
 | `get_page_content` | Structured record of one page. Pass `compact=true` (or `fields=[...]`) unless you need everything: the full record (quality, transforms, sources, revisions) is large. |
 | `get_source_region` | Get the ORIGINAL image crop of an element (or a page region) to check uncertain content. |
 | `verify_document` | Quality checks: missing/duplicate/failed pages, page gaps, invalid LaTeX, table structure, question numbering, unresolved regions, traceability, stale exports. |
-| `export_document` | Write a file (json, markdown, searchable-pdf, docx, latex, csv, xlsx) from the stored extraction. No OCR is re-run. |
+| `export_document` | Write a file (json, markdown, searchable-pdf, layout-pdf, docx, latex, csv, xlsx) from the stored extraction. No OCR is re-run. |
+| `redraw_figure` | Optional, only when the user asks: the cleaned crop of one figure and strict instructions to copy it as SVG without changing anything (viewBox = the crop's pixels). |
+| `submit_figure_svg` | Store that SVG: sanitised, then checked against the crop (strokes both ways, every label). Refused once with feedback: fix exactly those places and submit again. A copy that fails twice is kept but marked not faithful and never used instead of the crop. |
 | `classify_document` | Document type, subjects, level, topics. Needs a key; in host mode classify from the content yourself. |
 | `manage_job` | Cancel a running job, or resume a cancelled/failed/interrupted one (finished pages are reused). |
+| `update_layout` | A document read by an older ScholarOCR (boxes not snapped to the ink, no figure crops or cleaned text): updates it without reading again. No model call. |
 | `delete_document` | Delete stored artifacts. Only on explicit user instruction. |
 
 ## Typical flow
@@ -92,6 +100,8 @@ formulas). The user can switch to the dedicated pipeline by configuring a key
 6. `verify_document(document_id)` before high-stakes use (solutions, grading, conversions). Report
    `error` and `warning` findings that affect the user's task.
 7. `export_document(document_id, format)` only when the user wants a file. Tell them the output path.
+   Options: `text_variant` (`clean` | `faithful`), `figure_variant` (`clean` cleaned figure images, default |
+   `original` crops | `redrawn` faithful SVG copies).
 8. Cite content as "page N" (and element ids where useful) so the user can check it.
 
 ## Uncertainty semantics

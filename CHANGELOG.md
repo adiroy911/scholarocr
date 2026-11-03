@@ -1,5 +1,116 @@
 # Changelog
 
+## 0.4.0 (2026-11-03)
+
+- **Reading with Antigravity is about 7 times faster** (web app). Measured on pages 1-4 of a real handwritten
+  notebook (`gemini-3.8-flash-medium` selected): 483 s and 223.6k tokens before, 70 s and 130.0k tokens now; every
+  page accepted on the first attempt in both runs.
+  - Several pages at once: Settings "Pages at once" (1-6, default 3), one agy process each, with one limit shared
+    by every document the app reads. Progress says "Reading pages 4-6 of 12"; pages appear as each finishes and
+    are stored by page number. Stop kills every agy process of the run.
+  - Pipelining: reading starts as soon as page 1 is prepared, while the job prepares the rest (first page call
+    after 1.2 s instead of 12 s). Box refinement, figure crops and cleaned text run in the page's worker right
+    after it is accepted.
+  - Throttling: when agy reports a rate limit or an exhausted quota (`429`, `RESOURCE_EXHAUSTED`, quota, rate
+    limit, `503`), or two pages in a row fail, the reader pauses (20 s, doubling), halves its concurrency for the
+    rest of the run and reads those pages again (at most 3 times).
+  - Effort: Settings "Effort for reading pages" (default Low) and "Effort for questions and Redraw" (default
+    Medium). agy refuses `--model gemini-3.8-flash-medium --effort low` as a conflict, so the app passes the
+    model family with `--effort` when `agy models` lists that variant. Low thinks 0 tokens instead of 6-12k per
+    page; compared with the earlier transcription it dropped one phrase on one of four pages (8 of 276 prose words
+    missing, against 6 for the old run and 4 for a medium run), so Medium remains one click away.
+  - Fewer model calls: an image cannot be attached to the first message in headless mode (`--input-format
+    stream-json` takes only `text` blocks; `@path` passes only the path). Instead each page uses a workspace
+    agent (`--agent scholarocr-reader`, written into the run folder) with only `read_file` and `finish`, told to
+    return the JSON through `finish`: two model calls with a short system prompt instead of three with agy's
+    ~12k-token prompt (a probe: 39.1k -> 16.8k input tokens; medium pages: about 43k -> 21k). Unknown to agy:
+    falls back to the default agent.
+  - A compact page brief for the app (2.6k instead of 6.4k characters): the JSON schema already defines the
+    fields, element types and doubt levels. `host_page_image(instructions="none")` returns the route, hints
+    and text layer for a caller that writes its own brief.
+- **Layout PDF: one font size.** Instead of fitting each element to its own box (paragraphs came out at different
+  sizes), one body size is chosen per document from the paragraphs' fitted sizes (the size at which three in four
+  fit; the median over pages, a clearly different page keeps its own) and every paragraph is set at it; headings,
+  captions, page numbers and equations at fixed ratios. A box too small for its text first extends right (one-line
+  boxes, equations) and down into free paper, checking the next element; only then is the text shrunk, down to a
+  floor (equations 0.9x the body), with a warning. Punctuation touching inline math and a leading bullet stay on
+  the math's line. `layout_fidelity` now reports `body_size` per page, `shared_size_share` (also as `fit_share`),
+  `moved` (grown boxes), `shrunk`, `overflowed` and `fitted_to_box`. On the real pages 1-4: one size (13.6 pt) on
+  pages 2-4, 20 pt on the landscape page 1; 34 of 37 text elements at the shared size, 3 shrunk by 3-8 %, none
+  overflowing; before, 68-81 % per page were at the page's common size.
+- **Update layout for documents read before refinement existed**: `ScholarOCR.refine_document()` now also adds
+  cleaned text with the deterministic rule normaliser where an element has none (no model call) and reports
+  totals; `layout_outdated()` says whether a document needs it (pages carry `layout_refined_at`). Web app: an
+  "Older reading" row with **Update layout** on such documents (`POST /api/documents/{id}/refine`); MCP:
+  `update_layout(document_id, pages)`; CLI: `scholarocr refine DOC [--pages R] [--no-clean-text]`.
+- Box refinement: the "Thermal resistance" element on a real page (an arrow whose head sits under the equation
+  above, then the words) did keep its words; the refined boxes overlap and the review overlay drew the label in
+  the shared band. A regression test on a synthetic page checks the words stay in the text's box, out of the
+  equation's, and survive the layout PDF's overlap split.
+- Redraw through Antigravity: 10-minute timeout per call (a real 3D slab took 4-5 minutes per attempt at medium
+  effort), and when the retry fails (timeout, quota) the first attempt's verdict is returned instead of an error.
+  The response lists each attempt's fidelity (`history`). Real test (3D slab, page 3): attempt 1 recall 0.90,
+  precision 0.89, failed on misplaced regions; attempt 2 recall 0.84, stored as not faithful; 105k tokens. The
+  thresholds were left as they are: the rejected copies were visibly displaced.
+- Web app design fixes: AA contrast everywhere (white on the dark-theme red Delete button; the muted ink tokens in
+  both themes, checked in a browser on every visible text), padding in the drop zone and dialogs, no clipping
+  container around positioned layers, no card inside a card (the Settings switches and the figure blocks are
+  flat), doubtful equations marked with a tint or dotted outline instead of a side stripe, a steady "working"
+  dot in history instead of a pulsing one, and progress bars that scale instead of animating width.
+- Windows: replacing a stored file retries briefly when another thread has it open.
+
+- **Layout PDF export (`layout-pdf`).** A typeset remake of the document: each page at the original size and
+  orientation, every element (headings, paragraphs, equations, tables, lists, figures, page numbers, question
+  numbers and marks) placed at its box. Text is set at one body size per document (see above), equations are
+  typeset with the vendored KaTeX and mhchem, Hindi is set in Noto Serif Devanagari, and figures use the cleaned
+  crop (or the original crop, the redrawn SVG, a crop cut from the page image, or a described placeholder).
+  Options `text_variant`, `figures`, `background`, `show_boxes`, `pages`, `renderer`. Overlapping boxes are
+  nudged apart; text that cannot fit overflows downward with a warning. Verification adds `layout_fidelity`
+  (share set at the target size, shrunk and overflowed elements, words found inside their boxes). Printed by a
+  headless Chromium-family browser (Edge, Chrome, Chromium, Brave, Playwright's Chromium or
+  `SCHOLAROCR_BROWSER`), with a basic PyMuPDF fallback. Available in the CLI, MCP `export_document` (local and
+  remote) and the web app's export links. The existing `searchable-pdf` is unchanged.
+- **Boxes snapped to the ink.** After a page's elements are stored (host submissions and key-provider
+  extractions), every `model_estimate` box is refined deterministically (`pipeline/layout_refine.py`, no model):
+  the page is binarised relative to its paper level after dividing out shadows, ruled notebook lines and margin
+  rules are found (straight seeds, a robust curve fit, then tracing to follow slant and page curl; faint dotted
+  rules too) and removed while strokes crossing them are kept, and each box is fitted to the ink components it
+  owns. A component goes to one element only (best pixel share, then depth inside the box, then reading order,
+  with ink covered by overlapping boxes going to the element whose own ink is nearest). Figures grow along
+  their strokes and nearby labels (`T_A`, `dx`, `θ₁`) but not into another element's ink or into a text line, and
+  drawings that touch are split between their figures. The model box is kept when refinement is unreliable (no
+  ink, growth past a cap, ink belonging to a larger structure). Refined boxes have `bbox_source: "refined"` and
+  keep the model's box in `bbox_model`. `ScholarOCR.refine_document()` re-runs it on stored pages.
+- **Figure images.** Every figure, diagram or image gets a full-resolution crop
+  (`pages/NNNN/figures/<id>.png`, `source.region_image`) and, on scanned pages, a cleaned version
+  (`<id>.clean.png`, `figure.image_clean`): paper and shadows whitened, ruled lines removed, only the figure's own
+  strokes kept in their colour, contrast stretched, trimmed. Markdown writes the images next to the `.md` with
+  relative links, Word inserts them inline at the same share of the text width as on the page, LaTeX uses
+  `\includegraphics`, JSON carries the paths; option `figure_variant` = `clean` (default) | `original` |
+  `redrawn`. The web app shows the cleaned image with the description as alt text and caption, and a toggle to
+  the original crop.
+- **Redraw as vector (opt-in).** A faithful SVG copy of a figure, "without changing a thing": the brief asks for
+  the crop's pixel coordinates as the viewBox and forbids added, removed, straightened or corrected content. The
+  SVG is sanitised strictly (allowlisted elements and attributes; no scripts, event handlers, styles, links,
+  images, `foreignObject` or external references) and then checked deterministically against the crop
+  (`pipeline/svg_fidelity.py`): rasterised at the crop size with PyMuPDF and compared both ways with a distance
+  tolerance (recall: original ink the copy covers; precision: copy ink the original supports), any sizeable
+  missing or extra region fails on its own, and every `figure.labels` entry must appear as SVG text. A copy that
+  fails gets one retry with specific feedback (where strokes are missing or extra, which labels are absent); a
+  second failure is stored but marked not faithful and is never shown or exported instead of the crop. Stored as
+  `figure.svg` with `figure.svg_fidelity`. Web app: Redraw button per figure (Antigravity or a key engine), the
+  score next to "Redrawn". MCP: `redraw_figure` (crop + instructions) and `submit_figure_svg` for host mode.
+- **Cleaned text.** Text elements get `clean_content`: casing, punctuation and spacing slips fixed and obvious
+  slips of the pen corrected (`temperture` -> `temperature`), never other words, numbers, symbols or math.
+  `content` stays exactly as written. The model proposes it in the same call (`clean_text`, host prompt
+  `host-2026-11-03.4`, extraction prompt `2026-11-03.1`); a deterministic guard accepts it only if math, LaTeX,
+  numbers, symbols and bracketed markup are identical and the words are the same (spacing, a capitalised word's
+  case, or a one- or two-letter slip in a long word), otherwise a rule normaliser is used
+  (`clean_content_source`: `model` | `rules`). Exports, MCP `get_document_content` / `export_document`
+  (`text_variant`: `clean` | `faithful`) and the web app ("Cleaned / As written" per document, default in
+  Settings) choose the variant: cleaned by default for handwritten documents, as written for printed ones.
+- Host rules: rough boxes are fine (the server snaps them), still estimated by eye and never with code.
+
 ## 0.3.0 (2026-11-03)
 
 - **Web app (`scholarocr-app`).** A local chat-style interface on 127.0.0.1: attach PDFs, page photos or DOCX

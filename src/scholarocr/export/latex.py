@@ -25,7 +25,11 @@ from .base import (
     ExportContext,
     ExportResult,
     ce_to_math,
-    copy_asset,
+    export_variant_context,
+    figure_image_path,
+    figure_preference,
+    redraw_note,
+    svg_to_pdf,
     heading_level,
     is_unclear,
     iter_document,
@@ -35,7 +39,6 @@ from .base import (
     ordered_elements,
     ordered_pages,
     plain_text,
-    region_image,
     unclear_text,
     write_text,
 )
@@ -262,19 +265,35 @@ class _LatexWriter:
         desc = " ".join((fig.description if fig and fig.description else el.content).split())
         label = fig.figure_label if fig and fig.figure_label else ""
         caption = self.caption_for(el) or _inline(" ".join(x for x in (label, desc) if x))
-        rel = region_image(page, el)
+        src = figure_image_path(self.ctx.doc_dir, el, figure_preference(self.ctx))
+        if note := redraw_note(el, figure_preference(self.ctx)):
+            self.warnings.append(note)
         copied = None
-        if rel:
-            name = f"fig{len(self.assets) + 1:03d}{Path(rel).suffix.lower() or '.png'}"
-            copied = copy_asset(self.ctx, rel, self.ctx.out_dir / "assets", self.warnings, name=name)
+        if src is None and (el.source.region_image or (el.figure and (el.figure.image_clean or el.figure.svg))):
+            self.warnings.append(f"Figure image missing on disk for {el.element_id}")
+        if src is not None:
+            stem = self.ctx.out_dir / "assets" / f"fig{len(self.assets) + 1:03d}"
+            if src.suffix.lower() == ".svg":
+                try:  # \includegraphics cannot read SVG: a vector PDF keeps it sharp
+                    copied = svg_to_pdf(src, stem.with_suffix(".pdf"))
+                except Exception as e:  # noqa: BLE001
+                    self.warnings.append(f"redrawn figure {el.element_id} could not be converted "
+                                         f"({e.__class__.__name__}); used the cleaned crop")
+                    src = figure_image_path(self.ctx.doc_dir, el, "clean")
+            if copied is None and src is not None:
+                stem.parent.mkdir(parents=True, exist_ok=True)
+                copied = stem.with_suffix(src.suffix.lower() or ".png")
+                shutil.copyfile(src, copied)
         if copied is None:
             return r"\begin{center}\emph{[" + _inline(el.type.value) + (": " + _inline(desc) if desc else "") \
                 + r"]}\end{center}"
         self.assets.append(copied)
-        width = min(el.bbox.width, MAX_FIGURE_WIDTH_PT) if el.bbox is not None and el.bbox.width > 0 \
-            else MAX_FIGURE_WIDTH_PT
+        # the same share of the line width as the figure had of the source page width
+        share = el.bbox.width / page.width_pt if el.bbox is not None and el.bbox.width > 0 and page.width_pt else 0.8
+        share = max(0.15, min(1.0, share))
         lines = [r"\begin{figure}[htbp]", r"\centering",
-                 rf"\includegraphics[width={width:.1f}pt,height=0.45\textheight,keepaspectratio]{{assets/{copied.name}}}"]
+                 rf"\includegraphics[width={share:.3f}\linewidth,height=0.45\textheight,keepaspectratio]"
+                 rf"{{assets/{copied.name}}}"]
         if caption:
             lines.append(rf"\caption*{{{caption}}}")
         if self.captions.get(el.element_id) and desc:
@@ -360,6 +379,7 @@ def compile_latex(tex_path: Path, warnings: list[str]) -> dict:
 
 def export_latex(ctx: ExportContext) -> ExportResult:
     warnings: list[str] = []
+    ctx, variant = export_variant_context(ctx)
     main_font = ctx.option("main_font")
     if main_font is not None:
         main_font = str(main_font).strip()
@@ -383,7 +403,8 @@ def export_latex(ctx: ExportContext) -> ExportResult:
     write_text(tex_path, tex)
     files = [str(tex_path)] + [str(a) for a in writer.assets]
 
-    verification: dict = {"main_font_requested": main_font, "main_font": main_font or DEFAULT_FONT}
+    verification: dict = {"main_font_requested": main_font, "main_font": main_font or DEFAULT_FONT,
+                          "text_variant": variant, "figure_variant": figure_preference(ctx)}
     if ctx.flag("compile", True):
         verification.update(compile_latex(tex_path, warnings))
         log = tex_path.with_suffix(".log")

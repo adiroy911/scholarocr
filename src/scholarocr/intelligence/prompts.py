@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from ..schemas import Route
 
-PROMPT_VERSION = "2026-11-01.1"
+PROMPT_VERSION = "2026-11-03.1"
 
 EXTRACTION_SYSTEM = """You are a meticulous OCR engine for academic documents. You transcribe; you never author.
 
@@ -32,6 +32,10 @@ Rules:
 9. Academic structure: set `role` (question, subquestion, definition, theorem, example, proof, solution, ...)
    and `question` (number/marks exactly as printed). Subquestions use parent_index.
 10. Headers, footers and page numbers get their own element types.
+11. Text elements also get `clean_text`: the same text with casing, punctuation and spacing normalised and obvious
+   slips of the pen fixed (a capital in mid-sentence lowered unless it is a name, acronym or symbol; a missing
+   full stop added where a new sentence clearly starts). Same words, numbers, units, symbols, math and LaTeX;
+   never rephrase. `text` stays exactly as written. Omit `clean_text` when nothing changes.
 """
 
 PROFILE_ADDENDA: dict[Route, str] = {
@@ -110,7 +114,7 @@ def classify_prompt(context_hint: str | None, text_sample: str | None, page_coun
 # ---------------------------------------------------------------------------------------------- host mode
 # Instructions handed to the MCP client's own model (host mode). Versioned separately: part of the cache
 # key of host-transcribed pages.
-HOST_PROMPT_VERSION = "host-2026-11-03.3"
+HOST_PROMPT_VERSION = "host-2026-11-03.4"
 
 HOST_RULES = """Transcribe this page image for ScholarOCR. You transcribe; you never author.
 Use only the image returned with these rules (not the original file: boxes refer to this processed image)
@@ -119,15 +123,15 @@ server or other documents' files to learn formats or debug (a denied command can
 answer). If unsure how to encode something, use these rules and examples (on later pages
 get_page_image(instructions="full") repeats them), pick the closest element type and explain in notes.
 If a page comes back blank or empty but seems to have content, tell the user.
-1. Exactly what is visible. Never complete, correct, summarise or improve content.
+1. "text" is exactly what is visible. Never complete, correct, summarise or improve it.
 2. "uncertainty" is DOUBT about each element, not quality: low = you would bet the transcription is exact;
    medium = a specific character or word could differ; high = a guess among alternatives; unresolved =
    cannot read (use type "uncertain", text like "[illegible: 2 words]"; never guess). Judge every element
    on its own and say why in uncertainty_reasons; do not blanket-label a page (clean print is mostly low).
 3. Elements in natural reading order (respect columns; header first, footer/page number last).
 4. box_2d = [ymin, xmin, ymax, xmax] as integers 0-1000, normalised to THIS image (origin top-left).
-   Estimate it by eye: approximate boxes are fine. Give one per element when you can; if you cannot place
-   an element, omit box_2d rather than measuring. The server maps boxes back to the original page.
+   Estimate it by eye, never with code: rough boxes are fine, the server snaps them to the ink. Give one per
+   element when you can; if you cannot place one, omit box_2d. The server maps boxes back to the page.
 5. Math: LaTeX (amsmath) in "latex", a readable linear form in "text". Display equations are separate
    "equation" elements; inline math stays in the paragraph text as $...$ LaTeX (e.g. $\\gamma_0$, never
    Unicode like "γ0"). Keep equation numbers.
@@ -140,12 +144,15 @@ If a page comes back blank or empty but seems to have content, tell the user.
    "question": {number, marks} exactly as printed; subquestions set parent_index (0-based index). Text that
    continues a question after an equation or figure sets parent_index to that question and carries no
    question number; never repeat a number.
-10. Headers, footers and page numbers get their own types."""
+10. Headers, footers and page numbers get their own types.
+11. Text elements also get "clean_text": casing, punctuation and spacing slips fixed (a mid-sentence capital
+   lowered unless a name, acronym or symbol; a full stop where a new sentence starts); same words, numbers,
+   symbols, $...$ math; no rephrasing. E.g. "a Function of x But" -> "a function of x. But"."""
 
 HOST_SHAPE = """Call submit_page_content(document_id, page_number, elements=[...], page_language="en",
 page_label=<printed page number or null>, page_doubt="low|medium|high|unresolved" (overall DOUBT: low for a
 clean page), rotation_detected=0|90|180|270 (clockwise, only if the image itself is rotated), notes=[...]).
-Element fields: type (required), text, latex, role, level, items, table, figure, question, box_2d,
+Element fields: type (required), text, clean_text, latex, role, level, items, table, figure, question, box_2d,
 uncertainty, uncertainty_reasons, handwritten, language, caption_of, parent_index. Examples:
 {"type":"heading","level":1,"text":"Chapter 2","box_2d":[40,90,80,600]}
 {"type":"paragraph","role":"question","text":"Q3. Solve $x^2=4$. [2]","question":{"number":"3","marks":"2"},"box_2d":[100,80,140,920]}
@@ -162,8 +169,9 @@ image caption footnote header footer page_number list code bibliography_entry re
 
 HOST_SHORT = """Same rules as before: transcribe exactly, never guess (use "uncertain"/unresolved), per-element
 uncertainty = doubt (low = you would bet it is exact; vary it per element), reading order, box_2d
-[ymin,xmin,ymax,xmax] 0-1000 of THIS image estimated by eye, LaTeX for math ($...$ inline), \\ce{} for
-chemistry. No shell commands or file reads. Submit with submit_page_content. Ask for instructions="full" to
+[ymin,xmin,ymax,xmax] 0-1000 of THIS image estimated by eye (rough is fine: the server snaps boxes to the
+ink), LaTeX for math ($...$ inline), \\ce{} for chemistry, clean_text for text elements (casing, punctuation,
+spacing and slips only; same words, numbers and math). No shell commands or file reads. Submit with submit_page_content. Ask for instructions="full" to
 see the full rules and examples again."""
 
 

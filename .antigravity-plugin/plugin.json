@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "scholarocr",
   "displayName": "ScholarOCR",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Source-traceable OCR for academic documents: scanned PDFs, page photos, handwriting, exam papers, equations and tables, with uncertainty labels and verification.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

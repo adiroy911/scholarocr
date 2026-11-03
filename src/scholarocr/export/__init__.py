@@ -1,4 +1,5 @@
-"""Export engine: renders the stored IR into JSON, Markdown, searchable PDF, DOCX, LaTeX, CSV, XLSX.
+"""Export engine: renders the stored IR into JSON, Markdown, searchable PDF, layout PDF, DOCX, LaTeX, CSV,
+XLSX.
 
 Exports read only the IR, the preserved sources and saved region crops. They never call
 Gemini and never re-run OCR.
@@ -13,6 +14,7 @@ from .base import FORMATS, ExportContext, ExportResult
 from .docx import export_docx
 from .json_export import export_json
 from .latex import export_latex
+from .layout_pdf import export_layout_pdf
 from .markdown import document_to_markdown, export_markdown
 from .searchable_pdf import export_searchable_pdf
 from .spreadsheet import export_csv, export_xlsx
@@ -21,6 +23,7 @@ _EXPORTERS: dict[str, Callable[[ExportContext], ExportResult]] = {
     "json": export_json,
     "markdown": export_markdown,
     "searchable-pdf": export_searchable_pdf,
+    "layout-pdf": export_layout_pdf,
     "docx": export_docx,
     "latex": export_latex,
     "csv": export_csv,

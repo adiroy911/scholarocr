@@ -78,9 +78,15 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("export", help="export a processed document")
     s.add_argument("document_id")
     s.add_argument("--format", required=True,
-                   help="json | markdown | searchable-pdf | docx | latex | csv | xlsx")
+                   help="json | markdown | searchable-pdf | layout-pdf | docx | latex | csv | xlsx")
     s.add_argument("--option", action="append", default=[], help="key=value format option (repeatable)")
     s.add_argument("--out-dir")
+
+    s = sub.add_parser("refine", help="update a document read by an older version: snap boxes to the ink, crop "
+                                      "figures, add cleaned text (no model call)")
+    s.add_argument("document_id")
+    s.add_argument("--pages", help="page range like 1-5,8 (default: all read pages)")
+    s.add_argument("--no-clean-text", action="store_true", help="leave cleaned text as it is")
 
     s = sub.add_parser("list", help="list documents")
     s.add_argument("--query")
@@ -246,6 +252,16 @@ def dispatch(svc, args) -> int:
         lines = [f"wrote {res['primary_file']}"] + [f"warning: {w}" for w in res["warnings"]]
         _out(args, res, "\n".join(lines))
         return EXIT_OK
+    if c == "refine":
+        res = svc.refine_document(args.document_id, pages=args.pages, clean_text=not args.no_clean_text)
+        t = res["totals"]
+        lines = [f"pages updated: {len(res['pages'])}" + (f" (skipped, not read: {res['skipped_pages']})"
+                                                          if res["skipped_pages"] else ""),
+                 f"boxes refined: {t['refined']} (model box kept: {t['kept_model_box']})",
+                 f"figures cropped: {t['figures']} (cleaned: {t['figures_cleaned']})",
+                 f"cleaned text added: {t['clean_text_added']}"]
+        _out(args, res, "\n".join(lines))
+        return EXIT_OK if res["pages"] else EXIT_PROBLEMS
     if c == "list":
         data = svc.list_documents(query=args.query, status=args.status, document_type=_doc_type(args.document_type),
                                   limit=args.limit, offset=args.offset)

@@ -284,10 +284,18 @@ class ScholarOCR:
 
     def get_content(self, document_id: str, *, pages: str | None = None, element_types: list[str] | None = None,
                     fmt: str = "markdown", max_chars: int = 30000, cursor: int | None = None,
-                    include_ids: bool = True) -> dict[str, Any]:
-        """Paginated content. ``cursor`` is the page number to continue from (from ``next_cursor``)."""
+                    include_ids: bool = True, text_variant: str | None = None) -> dict[str, Any]:
+        """Paginated content. ``cursor`` is the page number to continue from (from ``next_cursor``).
+        ``text_variant``: ``clean`` (casing/punctuation normalised), ``faithful`` (exactly as written) or
+        None/``auto`` (clean for handwritten documents, faithful for printed ones). JSON carries both."""
+        from .export.base import resolve_text_variant
+
         if fmt not in ("markdown", "json", "text"):
             raise InputError("format must be markdown, json or text")
+        try:
+            variant = resolve_text_variant(self.get_document(document_id), text_variant)
+        except ExportError as e:
+            raise InputError(e.message) from None
         manifest = self.load_manifest(document_id)
         selected = parse_page_range(pages, len(manifest.pages))
         if cursor is not None:
@@ -306,7 +314,7 @@ class ScholarOCR:
             if page.status == PageStatus.AWAITING_TRANSCRIPTION:
                 awaiting_pages.append(n)
                 continue
-            rendered = self._render_page(document_id, page, fmt, types, include_ids)
+            rendered = self._render_page(document_id, page, fmt, types, include_ids, variant)
             size = len(rendered) if isinstance(rendered, str) else len(json.dumps(rendered))
             if chunks and used + size > max_chars:
                 next_cursor = n
@@ -314,7 +322,8 @@ class ScholarOCR:
             chunks.append(rendered)
             used += size
         out: dict[str, Any] = {"document_id": document_id, "format": fmt, "next_cursor": next_cursor,
-                               "unprocessed_pages": pending_pages}
+                               "unprocessed_pages": pending_pages,
+                               "text_variant": variant if fmt != "json" else "both (content and clean_content)"}
         if awaiting_pages:
             out["awaiting_transcription"] = awaiting_pages
             out["note_awaiting"] = ("these pages have no content yet: transcribe them with get_page_image -> "
@@ -327,7 +336,8 @@ class ScholarOCR:
             out["note"] = "first page alone exceeds max_chars; returned in full"
         return out
 
-    def _render_page(self, document_id: str, page: Page, fmt: str, types, include_ids: bool):
+    def _render_page(self, document_id: str, page: Page, fmt: str, types, include_ids: bool,
+                     variant: str = "faithful"):
         if fmt == "json":
             d = page.model_dump(mode="json", exclude_none=True)
             if types:
@@ -339,9 +349,13 @@ class ScholarOCR:
                             extraction_version=EXTRACTION_VERSION, schema_version=SCHEMA_VERSION, pages=[page])
         from .export import document_to_markdown
 
-        md = document_to_markdown(doc_stub, include_ids=include_ids and fmt == "markdown", element_types=types)
+        md = document_to_markdown(doc_stub, include_ids=include_ids and fmt == "markdown", element_types=types,
+                                  text_variant=variant)
         if fmt == "text":
-            return "\n".join(el.text_for_search() for el in sorted(page.elements, key=lambda e: e.reading_order)
+            from .export.base import with_text_variant
+
+            shown = with_text_variant(doc_stub, variant).pages[0]
+            return "\n".join(el.text_for_search() for el in sorted(shown.elements, key=lambda e: e.reading_order)
                              if not types or el.type in types)
         return md
 
@@ -537,8 +551,9 @@ class ScholarOCR:
         """The processed image of a page awaiting transcription, plus transcription instructions.
 
         ``page_number=None`` picks the first waiting page. Returns ``(None, None, info)`` when nothing waits.
-        ``instructions``: "full" (rules + element examples), "short", or "auto" (full until the first page of
-        this document has been submitted)."""
+        ``instructions``: "full" (rules + element examples), "short", "auto" (full until the first page of
+        this document has been submitted), or "none" (no brief; ``info["task"]`` carries the route, the caller's
+        hints and the text layer, for a caller that writes its own brief, such as the web app)."""
         waiting = self.awaiting_pages(document_id)
         if page_number is None:
             if not waiting:
@@ -553,8 +568,11 @@ class ScholarOCR:
             any_done = any((p.model or "").startswith("host") for p in self.get_document(document_id).pages
                            if p.status == PageStatus.DONE)
             instructions = "short" if any_done else "full"
-        brief = host_prompts.host_page_brief(task.route, full=instructions == "full", text_layer=task.text_layer,
-                                             **task.hints)
+        if instructions == "none":
+            brief = ""
+        else:
+            brief = host_prompts.host_page_brief(task.route, full=instructions == "full", text_layer=task.text_layer,
+                                                 **task.hints)
         rest = [n for n in waiting if n != page_number]
         info = {
             "document_id": document_id, "page_number": page_number, "route": task.route.value,
@@ -564,6 +582,8 @@ class ScholarOCR:
             "pages_waiting_after_this": len(rest), "next_waiting_page": rest[0] if rest else None,
             "instructions": brief,
         }
+        if instructions == "none":
+            info["task"] = {"route": task.route, "hints": dict(task.hints), "text_layer": task.text_layer}
         if page.status == PageStatus.DONE:
             info["note"] = "This page was already transcribed; submitting again replaces its content."
         return data, mime, info
@@ -607,7 +627,7 @@ class ScholarOCR:
         page.warnings = [w for w in page.warnings if not w.startswith("model note:")]
         page.warnings += [f"model note: {n}" for n in resp.notes] + page_doubt_note(resp)
         structure.annotate(page.elements)
-        self.pipeline._save_crops(page, original, task.dpi)
+        self.pipeline._save_crops(page, original, task.dpi)  # refines boxes to the ink, then crops
         page.status = PageStatus.DONE
         page.error = None
         page.processed_at = now_iso()
@@ -669,7 +689,8 @@ class ScholarOCR:
             labels = list(dict.fromkeys((el.figure.labels if el.figure else []) + figure.labels))
             el.figure = FigureData(description=figure.description, labels=labels, relationships=figure.relationships,
                                    figure_label=(el.figure.figure_label if el.figure else None) or figure.figure_label,
-                                   kind=figure.kind)
+                                   kind=figure.kind, image_clean=el.figure.image_clean if el.figure else None,
+                                   svg=el.figure.svg if el.figure else None)
             el.revisions.append(Revision(at=now_iso(), by=by.replace("review:", "describe:"), field="figure",
                                          previous=previous))
             el.uncertainty_reasons = [r for r in el.uncertainty_reasons if "not described" not in r]
@@ -687,6 +708,214 @@ class ScholarOCR:
         return {"document_id": document_id, "element_id": element_id, "verdict": resp.verdict,
                 "uncertainty": el.uncertainty.value, "content": el.content[:500], "latex": el.latex,
                 "revisions": len(el.revisions)}
+
+    # ------------------------------------------------------------------ layout refinement & figures
+    def refine_document(self, document_id: str, *, pages: str | None = None,
+                        clean_text: bool = True) -> dict[str, Any]:
+        """Bring stored pages up to date without reading them again (no model call): the deterministic box
+        refinement, the figure crops (original and cleaned) and, with ``clean_text``, cleaned text from the rule
+        normaliser for text elements that have none. For documents read before these features existed; boxes
+        always start again from the model's own estimate, and existing cleaned text is kept."""
+        from .intelligence import clean_text as cleaner
+
+        manifest = self.load_manifest(document_id)
+        out: dict[str, Any] = {"document_id": document_id, "pages": [], "skipped_pages": []}
+        totals = {"refined": 0, "kept_model_box": 0, "figures": 0, "figures_cleaned": 0, "clean_text_added": 0}
+        for n in parse_page_range(pages, len(manifest.pages)):
+            page = load_page(self.store, document_id, n)
+            if page is None or page.status != PageStatus.DONE:
+                out["skipped_pages"].append(n)
+                continue
+            img, dpi = self._page_image(document_id, page)
+            ink = self.pipeline.refine_boxes(page, img, dpi)
+            self.pipeline._save_crops(page, img, dpi, ink)
+            added = 0
+            if clean_text:
+                proper = cleaner.page_proper_nouns(e.content for e in page.elements)
+                for el in page.elements:
+                    if el.clean_content is None and el.content:
+                        cleaned, source, _ = cleaner.resolve_clean(el.content, None, el.type.value, proper=proper)
+                        if cleaned is not None:
+                            el.clean_content, el.clean_content_source = cleaned, source
+                            added += 1
+            save_page(self.store, page)
+            row = {"page": n,
+                   "refined": sum(1 for e in page.elements if e.bbox_source == "refined"),
+                   "kept_model_box": sum(1 for e in page.elements if e.bbox_source == "model_estimate"),
+                   "figures": sum(1 for e in page.elements if e.type in VISUAL_TYPES and e.source.region_image),
+                   "figures_cleaned": sum(1 for e in page.elements if e.type in VISUAL_TYPES and e.figure
+                                          and e.figure.image_clean),
+                   "clean_text_added": added}
+            out["pages"].append(row)
+            for k in totals:
+                totals[k] += row[k]
+        out["totals"] = totals
+        if out["pages"]:
+            self.repo.update_document(document_id)
+        return out
+
+    def layout_outdated(self, document_id: str, doc: Document | None = None) -> dict[str, Any]:
+        """Whether ``refine_document`` would add anything to this document: model-estimated boxes never refined,
+        figures without a stored crop, or text without cleaned text. Cheap: reads the stored pages only."""
+        from .intelligence.clean_text import CLEANABLE_TYPES
+        from .pipeline.layout_refine import needs_refinement
+
+        reasons: dict[str, int] = {"boxes": 0, "figures": 0, "clean_text": 0}
+        for page in (doc or self.get_document(document_id)).pages:
+            if page.status != PageStatus.DONE:
+                continue
+            for el in page.elements:
+                if page.layout_refined_at is None and needs_refinement(el):
+                    reasons["boxes"] += 1
+                if el.type in VISUAL_TYPES and el.bbox is not None and not el.source.region_image:
+                    reasons["figures"] += 1
+                if el.type.value in CLEANABLE_TYPES and el.content and el.clean_content is None:
+                    reasons["clean_text"] += 1
+        return {"outdated": any(reasons.values()), "counts": reasons}
+
+    def _figure_element(self, document_id: str, element_id: str) -> tuple[Page, Element]:
+        page, el = self.find_element(document_id, element_id)
+        if el.type not in VISUAL_TYPES:
+            raise InputError(f"{element_id} is a {el.type.value}, not a figure, diagram or image")
+        return page, el
+
+    def figure_crop(self, document_id: str, element_id: str, variant: str = "clean") -> tuple[bytes, str]:
+        """(bytes, media type) of a figure's stored image: ``clean``, ``original`` or ``svg`` (falls back
+        clean -> original). ``svg`` returns a stored redraw even when it failed the fidelity check, for inspection
+        in the app (which labels it); exports never use such a redraw."""
+        from .export.base import figure_image_path
+
+        _, el = self._figure_element(document_id, element_id)
+        if variant == "svg":
+            if not (el.figure and el.figure.svg):
+                raise NotFoundError(f"no redrawn image stored for {element_id}")
+            path = self.store.resolve(document_id, el.figure.svg)
+            if not path.is_file():
+                raise NotFoundError(f"no redrawn image stored for {element_id}")
+            return path.read_bytes(), "image/svg+xml"
+        path = figure_image_path(self.store.doc_dir(document_id), el, variant)
+        if path is None or (variant == "svg" and path.suffix != ".svg"):
+            raise NotFoundError(f"no {variant} image stored for {element_id}")
+        return path.read_bytes(), "image/svg+xml" if path.suffix == ".svg" else "image/png"
+
+    def _redraw_reference(self, document_id: str, element_id: str) -> bytes:
+        """The image a redraw copies and is checked against: the cleaned crop, else the crop, else the region."""
+        for variant in ("clean", "original"):
+            try:
+                return self.figure_crop(document_id, element_id, variant)[0]
+            except NotFoundError:
+                continue
+        return self.get_source_region(document_id, element_id=element_id, padding_pt=4, max_side=2000)[0]
+
+    def figure_redraw_request(self, document_id: str, element_id: str, *, feedback: list[str] | None = None
+                              ) -> tuple[bytes, dict[str, Any]]:
+        """What a model needs to copy one figure as SVG: the crop (the cleaned one when stored) and the strict
+        brief. Without ``feedback`` it starts a new redraw (one retry is allowed after a failed fidelity check).
+        Host mode: the client's model draws it and calls ``submit_figure_svg``."""
+        from .intelligence.redraw import redraw_brief
+
+        page, el = self._figure_element(document_id, element_id)
+        if el.figure is not None and el.figure.redraw_attempts and feedback is None:
+            el.figure.redraw_attempts = 0
+            save_page(self.store, page)
+        data = self._redraw_reference(document_id, element_id)
+        size = Image.open(io.BytesIO(data)).size
+        return data, {"document_id": document_id, "element_id": element_id, "page_number": page.page_number,
+                      "image_size_px": list(size), "view_box": f"0 0 {size[0]} {size[1]}",
+                      "instructions": redraw_brief(el, size, feedback),
+                      "next_step": "call submit_figure_svg(document_id, element_id, svg) with the SVG"}
+
+    def submit_figure_svg(self, document_id: str, element_id: str, svg: str, *, by: str = "host") -> dict[str, Any]:
+        """Sanitise a redrawn SVG and check it against the crop (``pipeline/svg_fidelity``).
+
+        Passed: stored as ``figure.svg`` with ``figure.svg_fidelity``. Failed the first time: nothing is stored;
+        the answer has ``accepted=False``, the specific feedback and ``retry_allowed=True``. Failed again: the SVG
+        is stored for inspection but marked not faithful (``svg_fidelity.passed`` false), so the app and the
+        exports keep showing the crop. The crop itself is never changed. Raises ``InputError`` when the SVG is
+        refused outright (unsafe or not renderable)."""
+        from .intelligence.redraw import MAX_REDRAW_ATTEMPTS
+        from .pipeline.figures import figure_dir
+        from .pipeline.svg_fidelity import check_fidelity
+        from .storage.artifacts import atomic_write_text
+        from .svg_sanitize import extract_svg, sanitize_svg
+
+        page, el = self._figure_element(document_id, element_id)
+        clean = sanitize_svg(extract_svg(svg) or svg)
+        try:  # it must render: the check rasterises it, Word gets a rendering, LaTeX a PDF conversion
+            import pymupdf
+
+            with pymupdf.open(stream=clean.svg.encode("utf-8"), filetype="svg") as d:
+                if d.page_count < 1 or d[0].rect.width <= 0:
+                    raise InputError("the SVG renders as an empty page")
+        except InputError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise InputError(f"the SVG could not be rendered ({e.__class__.__name__})") from None
+        if el.figure is None:
+            el.figure = FigureData()
+        reference = Image.open(io.BytesIO(self._redraw_reference(document_id, element_id))).convert("RGB")
+        fid = check_fidelity(clean.svg, clean.texts, reference, el.figure.labels)
+        attempt = el.figure.redraw_attempts + 1
+        record = {**fid.to_dict(), "attempt": attempt, "checked_at": now_iso(), "by": by}
+        base = {"document_id": document_id, "element_id": element_id, "faithful": fid.passed, "fidelity": record,
+                "removed": clean.removed, "labels": clean.texts[:40]}
+        if not fid.passed and attempt < MAX_REDRAW_ATTEMPTS:
+            el.figure.redraw_attempts = attempt
+            save_page(self.store, page)
+            return {**base, "accepted": False, "retry_allowed": True, "feedback": fid.feedback(),
+                    "next_step": "Nothing was stored. Copy the figure again fixing the listed places (same viewBox "
+                                 f"0 0 {fid.size[0]} {fid.size[1]}) and call submit_figure_svg once more."}
+        path = figure_dir(self.store, document_id, page.page_number) / f"{element_id}.svg"
+        atomic_write_text(path, clean.svg)
+        previous = el.figure.svg
+        el.figure.svg = self.store.rel(document_id, path)
+        el.figure.svg_fidelity = record
+        el.figure.redraw_attempts = 0
+        verdict = "passed" if fid.passed else "NOT faithful"
+        note = f"fidelity {fid.score:.0%} ({verdict}); {clean.elements} SVG elements"
+        if clean.removed:
+            note += f"; removed: {', '.join(clean.removed)[:200]}"
+        el.revisions.append(Revision(at=now_iso(), by=f"redraw:{by}", field="figure.svg", previous=previous,
+                                     note=note))
+        save_page(self.store, page)
+        self.repo.update_document(document_id)
+        if fid.passed:
+            return {**base, "accepted": True, "svg": el.figure.svg,
+                    "note": "stored as figure.svg; the crop is unchanged. Exports use it with "
+                            "figure_variant='redrawn'."}
+        return {**base, "accepted": False, "retry_allowed": False, "svg": el.figure.svg, "feedback": fid.feedback(),
+                "note": "Failed the fidelity check twice: stored for inspection but marked NOT faithful. The app and "
+                        "the exports keep using the crop."}
+
+    def redraw_figure(self, document_id: str, element_id: str, *, client: GeminiClient | None = None,
+                      model: str | None = None) -> dict[str, Any]:
+        """Copy one figure as SVG with a server-side model (key provider or MCP sampling): one call, and one retry
+        with the fidelity check's feedback when the first copy is not faithful."""
+        from .intelligence.redraw import MAX_REDRAW_ATTEMPTS, redraw_with_client
+
+        client = client or self.gemini
+        if not client.available:
+            raise ModelUnavailableError(
+                "redraw needs a model: in host mode call redraw_figure (MCP) to get the crop and instructions, "
+                "draw the SVG yourself and submit it with submit_figure_svg.")
+        data, _info = self.figure_redraw_request(document_id, element_id)
+        crop = Image.open(io.BytesIO(data)).convert("RGB")
+        usage: dict[str, int] = {}
+        feedback = None
+        out: dict[str, Any] = {}
+        for _ in range(MAX_REDRAW_ATTEMPTS):
+            _, el = self._figure_element(document_id, element_id)
+            resp, call = redraw_with_client(client, self.settings, el, crop, document_id=document_id, model=model,
+                                            feedback=feedback)
+            for k, v in call["usage"].items():
+                usage[k] = usage.get(k, 0) + (v or 0)
+            out = self.submit_figure_svg(document_id, element_id, resp.svg, by=call["model"])
+            out["model_notes"] = resp.notes
+            if out["accepted"] or not out.get("retry_allowed"):
+                break
+            feedback = out["feedback"]
+        out["usage"] = usage
+        return out
 
     # ------------------------------------------------------------------ export
     def export(self, document_id: str, fmt: str, *, options: dict | None = None,

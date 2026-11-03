@@ -151,6 +151,7 @@ class Page(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     processed_at: str | None = None
+    layout_refined_at: str | None = None  # when boxes were last snapped to the ink (pipeline/layout_refine)
 
     @property
     def reading_order(self) -> list[str]:

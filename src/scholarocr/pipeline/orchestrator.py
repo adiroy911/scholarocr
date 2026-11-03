@@ -35,7 +35,7 @@ from ..schemas.elements import MATH_TYPES, VISUAL_TYPES
 from ..storage import ArtifactStore, Repository
 from ..storage.artifacts import atomic_write_bytes
 from ..utils import element_id, now_iso, parse_page_range
-from . import host, structure
+from . import figures, host, layout_refine, structure
 from .checkpoints import cache_key, load_page, save_page
 from .routing import decide_route
 from .text_layer import extract_elements
@@ -312,6 +312,7 @@ class Pipeline:
         if info.repaired:
             page.warnings.append("extraction output required a repair request")
         structure.annotate(page.elements)
+        ink = self.refine_boxes(page, original, dpi)  # before review, so review crops use the snapped boxes
         if options.review:
             for el in reviewer.select_for_review(page.elements, detail=options.detail):
                 try:
@@ -320,7 +321,7 @@ class Pipeline:
                 except GeminiError as exc:
                     el.uncertainty_reasons.append(f"review failed: {exc.category}")
                     page.warnings.append(f"review of {el.element_id} failed ({exc.category})")
-        self._save_crops(page, original, dpi)
+        self._save_crops(page, original, dpi, ink)
 
     def _save_processed(self, page: Page, processed: Image.Image, transforms) -> None:
         proc_path = self.store.page_dir(page.document_id, page.page_number) / "processed.png"
@@ -340,10 +341,33 @@ class Pipeline:
         page.model = self.settings.gemini_model
         page.prompt_version = PROMPT_VERSION
 
-    def _save_crops(self, page: Page, original: Image.Image, dpi: float) -> None:
+    def refine_boxes(self, page: Page, original: Image.Image, dpi: float) -> layout_refine.PageInk | None:
+        """Snap model-estimated boxes to the ink (deterministic; see ``layout_refine``). Never fails the page."""
+        ink = layout_refine.refine_page(page.elements, original, dpi, page.width_pt, page.height_pt)
+        page.layout_refined_at = now_iso()
+        if ink is not None:
+            kept = [r for r in ink.results.values() if not r.refined]
+            if kept:
+                page.warnings.append(f"box refinement kept the model's box for {len(kept)} element(s): "
+                                     + "; ".join(sorted({r.reason for r in kept}))[:300])
+        return ink
+
+    def _save_crops(self, page: Page, original: Image.Image, dpi: float,
+                    ink: layout_refine.PageInk | None = None) -> None:
+        """Refine boxes (unless ``ink`` says it was done), write figure images (crop, cleaned crop) and the
+        region crops of math, tables and unreadable regions."""
+        if ink is None and any(layout_refine.needs_refinement(e) and e.bbox_source != "refined"
+                               for e in page.elements):
+            ink = self.refine_boxes(page, original, dpi)
+        scanned = page.route not in (Route.EMBEDDED_TEXT, Route.DOCX_TEXT)
+        try:
+            figures.save_figure_images(self.store, page, original, dpi, ink, clean=scanned)
+        except Exception as exc:  # figure images are an addition; a failure must not lose the page
+            log.warning("figure images for %s p%d failed: %s", page.document_id, page.page_number, exc)
+            page.warnings.append(f"figure images could not be saved ({exc.__class__.__name__})")
         regions = self.store.page_dir(page.document_id, page.page_number) / "regions"
         for el in page.elements:
-            if el.type in CROP_TYPES and el.bbox is not None:
+            if el.type in CROP_TYPES and el.type not in VISUAL_TYPES and el.bbox is not None:
                 crop = reviewer.crop_region(original, el, dpi, pad_pt=2)
                 path = regions / f"{el.element_id}.png"
                 atomic_write_bytes(path, _png(crop))

@@ -24,7 +24,7 @@ from ..ingestion.images import load_frame
 from ..ingestion.validation import DOCX_TYPE, IMAGE_TYPES
 from ..schemas import Element, ElementType, ManifestEntry, Page
 from ..schemas.elements import MODEL_METHODS
-from .base import ExportContext, ExportResult, ordered_elements
+from .base import ExportContext, ExportResult, export_variant_context, ordered_elements
 
 FONT_CANDIDATES: tuple[str, ...] = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -238,6 +238,7 @@ def _image_stream(path: Path, media_type: str, index: int, frames: int) -> tuple
 
 
 def export_searchable_pdf(ctx: ExportContext) -> ExportResult:
+    ctx, variant = export_variant_context(ctx)  # the invisible text layer uses the chosen text variant
     manifest = ctx.manifest
     warnings: list[str] = []
     entries = sorted(manifest.pages, key=lambda e: e.page_number)
@@ -327,6 +328,7 @@ def export_searchable_pdf(ctx: ExportContext) -> ExportResult:
             d.close()
     verification["text_layer_font"] = lf.fontfile or "helv"
     verification["elements_without_position"] = unplaced_total
+    verification["text_variant"] = variant
     return ExportResult(format="searchable-pdf", primary_file=str(out_path), files=[str(out_path)],
                         warnings=warnings, verification=verification)
 

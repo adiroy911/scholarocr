@@ -18,6 +18,8 @@ DEFAULT_AGY_MODEL = "gemini-3.8-flash-medium"
 ENGINE_CHOICES = ("auto", "antigravity", "gemini", "openrouter")
 MAX_SAVED_INSTRUCTIONS = 4000
 MAX_MESSAGE_CHARS = 8000
+DEFAULT_READ_CONCURRENCY = 3
+MAX_READ_CONCURRENCY = 6
 
 
 def default_app_dir(environ: dict[str, str] | None = None) -> Path:
@@ -34,8 +36,12 @@ class AppConfig(BaseModel):
     agy_path: str | None = None  # None: look up ``agy`` on PATH
     page_timeout_s: float = 300.0  # one agy call for one page
     chat_timeout_s: float = 240.0
+    redraw_timeout_s: float = 600.0  # one agy call copying one figure as SVG (a detailed drawing takes minutes)
     max_retries: int = 2  # re-prompts after a rejected page submission
     upload_ttl_s: float = 86400.0  # staged uploads not used by a message are removed after this
+    rate_limit_backoff_s: float = 20.0  # first pause after agy reports throttling (doubles each time)
+    rate_limit_retries: int = 3  # a page throttled more often than this stays unread
+    use_reader_agent: bool = True  # see agy.py: a minimal workspace agent for page reads
 
     @property
     def host(self) -> str:
@@ -78,6 +84,14 @@ class Prefs(BaseModel):
     max_files: int = Field(default=30, ge=1, le=200)
     max_pages: int = Field(default=60, ge=1, le=1000)
     theme: Literal["system", "light", "dark"] = "system"
+    # Text shown and exported: auto = cleaned for handwritten documents, as written for printed ones.
+    text_variant: Literal["auto", "clean", "faithful"] = "auto"
+    figure_variant: Literal["clean", "original", "redrawn"] = "clean"  # figure images in exports
+    # Antigravity: pages read at the same time (one agy process each, shared by every document being read).
+    read_concurrency: int = Field(default=DEFAULT_READ_CONCURRENCY, ge=1, le=MAX_READ_CONCURRENCY)
+    # Antigravity reasoning effort (agy --effort): page transcription, and follow-up chat + Redraw.
+    read_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
+    chat_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
 
     @field_validator("saved_instructions")
     @classmethod

@@ -5,6 +5,7 @@
 | Hand data to another agent/program | `json` | Full IR, including uncertainty and source references |
 | Read/search/summarize | `markdown` | `$$…$$` math, GFM tables, figure crops in `assets/`, `⟦unclear: …⟧` markers |
 | Keep the original look but make it searchable | `searchable-pdf` | Original pages unchanged + invisible text layer; `verification.overall_recall` reports how much IR text is extractable |
+| A clean typeset copy that looks like the original pages | `layout-pdf` | Same page sizes, every element at its box, KaTeX math, figure crops; needs a Chromium-family browser for typeset math (else a basic fallback, with a warning); `verification.layout_fidelity` lists shrunk/overflowed elements |
 | Editable document | `docx` | Native Word equations when pandoc is installed (else LaTeX source + warning); tables, figure crops, page markers |
 | Typesetting | `latex` | XeLaTeX; compiled automatically when an engine exists (`verification.compiled`); `options.main_font` (e.g. "DejaVu Serif") — the default is Latin Modern; `verification.fonts_in_pdf` shows the real fonts |
 | Tables only | `xlsx` / `csv` | One sheet/file per table; error if the document has no tables |

@@ -57,6 +57,10 @@ class XElement(BaseModel):
     type: ExtractedType
     role: ExtractedRole = "none"
     text: str = Field(default="", description="Transcribed text in reading order. For math, a readable linear form.")
+    clean_text: str | None = Field(
+        default=None,
+        description="Text elements only: the same text with casing, punctuation and spacing normalised and obvious "
+                    "slips of the pen fixed. Same words, numbers, symbols and math; no rephrasing. Omit if identical.")
     latex: str | None = Field(default=None, description="LaTeX for equation/chemical_equation (use \\ce{} for chemistry).")
     level: int | None = Field(default=None, description="Heading level, 1 = top.")
     items: list[str] | None = Field(default=None, description="List items, for type=list.")

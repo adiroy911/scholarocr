@@ -47,7 +47,8 @@ Element uncertainty labels (low/medium/high/unresolved) are ordinal judgements, 
 
 DocTypeLit = Literal[tuple(t.value for t in DocumentType)]  # type: ignore[valid-type]
 ElementTypeLit = Literal[tuple(t.value for t in ElementType)]  # type: ignore[valid-type]
-FormatLit = Literal["json", "markdown", "searchable-pdf", "docx", "latex", "csv", "xlsx"]
+FormatLit = Literal["json", "markdown", "searchable-pdf", "layout-pdf", "docx", "latex", "csv", "xlsx"]
+TextVariantLit = Literal["clean", "faithful", "auto"]
 ScopeLit = Literal["completeness", "duplicates", "page_order", "content", "reading_order", "math", "tables",
                    "structure", "uncertainty", "traceability", "exports"]
 
@@ -143,11 +144,15 @@ def build_server(service: ScholarOCR | None = None) -> MCPServer:
                                                                      "id anchors), json (full IR), or text.")] = "markdown",
         max_chars: Annotated[int, Field(ge=1000, le=200000)] = 30000,
         cursor: Annotated[int | None, Field(description="next_cursor from a previous call.")] = None,
+        text_variant: Annotated[TextVariantLit | None, Field(description=(
+            "clean: casing, punctuation and spacing normalised, slips of the pen fixed (same words, numbers and "
+            "math); faithful: exactly as written. Default: clean for handwritten documents, faithful for "
+            "printed ones. format=json always carries both (content, clean_content)."))] = None,
     ) -> dict[str, Any]:
         """Retrieve extracted content, paginated by page. Markdown includes <!-- el:ID --> anchors that can be
         passed to get_source_region. Unreadable regions appear as ⟦unclear: …⟧."""
         return _call(svc().get_content, document_id, pages=pages, element_types=element_types, fmt=format,
-                     max_chars=max_chars, cursor=cursor)
+                     max_chars=max_chars, cursor=cursor, text_variant=text_variant)
 
     @mcp.tool(annotations=READ_ONLY)
     def get_page_content(
@@ -283,10 +288,49 @@ def build_server(service: ScholarOCR | None = None) -> MCPServer:
         format: FormatLit,
         options: Annotated[dict[str, Any] | None, Field(description="Format options, e.g. {'main_font': 'DejaVu "
                                                         "Serif'} for latex, {'include_furniture': true} for markdown.")] = None,
+        text_variant: Annotated[TextVariantLit | None, Field(description=(
+            "clean (normalised casing/punctuation) or faithful (exactly as written). Default: clean for "
+            "handwritten documents, faithful for printed ones. JSON keeps both."))] = None,
+        figure_variant: Annotated[Literal["clean", "original", "redrawn"] | None, Field(description=(
+            "Figure images: clean (default; paper whitened, ruled lines removed), original (the crop as "
+            "scanned) or redrawn (the SVG from redraw_figure, where one exists).") )] = None,
     ) -> dict[str, Any]:
         """Generate a file from the stored extraction (no OCR is re-run). Returns file paths, warnings and
         post-generation verification (e.g. searchable-PDF text recall, LaTeX compile status)."""
-        return _call(svc().export, document_id, format, options=options)
+        opts = dict(options or {})
+        if text_variant is not None:
+            opts["text_variant"] = text_variant
+        if figure_variant is not None:
+            opts["figure_variant"] = figure_variant
+        return _call(svc().export, document_id, format, options=opts)
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    def redraw_figure(document_id: str, element_id: Annotated[str, Field(description=(
+            "Id of a figure, diagram or image element."))]) -> list:
+        """OPTIONAL, costs model output: copy one figure as clean vector SVG WITHOUT CHANGING ANYTHING. Returns the
+        figure's cleaned crop and the strict instructions (viewBox = the crop's pixels). Trace it faithfully and
+        store it with submit_figure_svg, which checks it against the crop. The crop is never replaced. Only do
+        this when the user asks for it."""
+        data, info = _call(svc().figure_redraw_request, document_id, element_id)
+        text = info.pop("instructions")
+        return [Image(data=data, format="png"),
+                TextContent(type="text", text=text + "\n\nFigure info: " + json.dumps(info, ensure_ascii=False))]
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                                          open_world_hint=False))
+    def submit_figure_svg(
+        document_id: str,
+        element_id: str,
+        svg: Annotated[str, Field(description="The complete SVG document (<svg viewBox=...>...</svg>).")],
+        ctx: Context = None,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        """Store a redrawn SVG for a figure (after redraw_figure). It is sanitised strictly (scripts, styles,
+        event handlers, links, images, foreignObject and external references removed), then rasterised and
+        compared with the crop both ways plus every label. accepted=false with retry_allowed=true: nothing was
+        stored; fix exactly the places in feedback and submit once more. A second failure is stored but marked
+        not faithful and is never used instead of the crop. Exports use a faithful SVG with
+        figure_variant='redrawn'."""
+        return _call(svc().submit_figure_svg, document_id, element_id, svg, by=client_name(ctx) or "host")
 
     @mcp.tool(annotations=READ_ONLY)
     def list_documents(
@@ -311,6 +355,18 @@ def build_server(service: ScholarOCR | None = None) -> MCPServer:
         level, topics, an ordinal certainty and whether the hint is consistent with the evidence. Needs a
         server-side model key; in host mode it returns model_unavailable (classify from the content yourself)."""
         return _call(svc().classify, document_id, context_hint=context_hint, pages=pages)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                                          open_world_hint=False))
+    def update_layout(
+        document_id: str,
+        pages: Annotated[str | None, Field(description="Page range like '1-5,8'. Default: all read pages.")] = None,
+    ) -> dict[str, Any]:
+        """Bring a document read by an older ScholarOCR up to date without reading it again (no model call):
+        boxes snapped to the ink, figure crops (original and cleaned), and cleaned text from the deterministic rule
+        normaliser for text elements that have none (existing cleaned text and every transcription are kept).
+        Returns per-page counts."""
+        return _call(svc().refine_document, document_id, pages=pages)
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True,
                                           open_world_hint=False))

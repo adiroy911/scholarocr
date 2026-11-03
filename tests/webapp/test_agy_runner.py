@@ -191,7 +191,85 @@ def test_page_prompt_and_schema_use_page_doubt():
     from scholarocr.intelligence.schema_utils import to_gemini_schema
     from scholarocr.webapp import prompts as app_prompts
 
-    text = app_prompts.page_prompt("C:/x/page.png", "brief")
+    from scholarocr.schemas import Route
+
+    task = {"route": Route.VISUAL_HANDWRITING, "hints": {"context_hint": "Class 11 physics"}, "text_layer": None}
+    text = app_prompts.page_prompt("C:/x/page.png", app_prompts.page_brief(task))
     assert "page_doubt" in text and "legibility" not in text and "DOUBT" in text
+    assert "Class 11 physics" in text and "handwritten" in text  # caller hints and the page profile
+    # compact: the schema already defines the fields, so the MCP call shape and type list are not repeated
+    assert "submit_page_content" not in text and "bibliography_entry" not in text
+    assert len(app_prompts.page_prompt("C:/x/page.png", app_prompts.PAGE_RULES)) < 3800
     props = to_gemini_schema(PageExtractionResponse)["properties"]
     assert "page_doubt" in props and "legibility" not in props
+
+
+# ---------------------------------------------------------------------- speed: effort, reader agent, throttling
+def test_effort_goes_through_the_model_family():
+    from scholarocr.webapp.agy import model_for_effort
+
+    ids = ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "claude-sonnet-4-6"]
+    # agy refuses "--model gemini-3.8-flash-medium --effort low" as a conflict; the family + --effort resolves
+    assert model_for_effort("gemini-3.8-flash-medium", "low", ids) == ("gemini-3.8-flash", "low")
+    assert model_for_effort("gemini-3.8-flash-low", "medium", ids) == ("gemini-3.8-flash", "medium")
+    # no such variant, or a model without effort variants: the model as chosen, no --effort
+    assert model_for_effort("gemini-3.8-flash-medium", "max", ids) == ("gemini-3.8-flash-medium", None)
+    assert model_for_effort("claude-sonnet-4-6", "low", ids) == ("claude-sonnet-4-6", None)
+    assert model_for_effort(None, "low", ids) == (None, None)
+    assert model_for_effort("gemini-3.8-flash-medium", None, ids) == ("gemini-3.8-flash-medium", None)
+
+
+def test_page_read_uses_the_reader_agent_and_effort(tmp_path):
+    from scholarocr.webapp.agy import READER_AGENT
+
+    AgyRunner.reader_agent_ok = True
+    r, popen = runner(tmp_path, FakeProc([result_line(structured_output={"elements": []})]))
+    img_dir = tmp_path / "run" / "page"
+    img_dir.mkdir(parents=True)
+    r.run("P", run_dir=tmp_path / "run", model="gemini-3.8-flash", read_dirs=[img_dir], schema={"type": "object"},
+          effort="low")
+    cmd = popen.calls[0][0]
+    assert cmd[cmd.index("--effort") + 1] == "low" and cmd[cmd.index("--agent") + 1] == READER_AGENT
+    agent = (tmp_path / "run" / ".agents" / "agents" / f"{READER_AGENT}.md").read_text(encoding="utf-8")
+    assert "  - read_file\n  - finish\n" in agent and "mainAgent: true" in agent and "finish tool" in agent
+    # chat (nothing to read) keeps agy's default agent
+    r2, popen2 = runner(tmp_path, FakeProc([result_line(response="hi")]))
+    r2.run("Q", run_dir=tmp_path / "chat", model="m", read_dirs=[], schema=None)
+    assert "--agent" not in popen2.calls[0][0] and "--effort" not in popen2.calls[0][0]
+
+
+def test_unknown_reader_agent_falls_back_to_the_default_agent(tmp_path):
+    AgyRunner.reader_agent_ok = True
+    refused = FakeProc([result_line(status="ERROR", error='unknown agent "scholarocr-reader"')])
+    ok = FakeProc([result_line(structured_output={"elements": []})])
+    procs = [refused, ok]
+    calls = []
+
+    def popen(cmd, **kw):
+        calls.append(cmd)
+        return procs.pop(0)
+
+    r = AgyRunner("agy", tmp_path / "runs", popen=popen, kill=lambda p: p.kill())
+    img_dir = tmp_path / "run" / "page"
+    img_dir.mkdir(parents=True)
+    try:
+        out = r.run("P", run_dir=tmp_path / "run", model="m", read_dirs=[img_dir], schema={"type": "object"})
+        assert out.structured == {"elements": []}
+        assert "--agent" in calls[0] and "--agent" not in calls[1]
+        assert AgyRunner.reader_agent_ok is False  # not tried again in this process
+    finally:
+        AgyRunner.reader_agent_ok = True
+
+
+def test_rate_limits_are_recognised(tmp_path):
+    from scholarocr.webapp.agy import AgyRateLimited, is_rate_limited
+
+    assert is_rate_limited("googleapi: Error 429: RESOURCE_EXHAUSTED") and is_rate_limited("individual quota reached")
+    assert is_rate_limited("503 UNAVAILABLE: the model is overloaded")
+    assert not is_rate_limited("a tool required the permission")
+    r, _ = runner(tmp_path, FakeProc([result_line(status="ERROR", error="Error 429: RESOURCE_EXHAUSTED")]))
+    with pytest.raises(AgyRateLimited):
+        r.run("p", run_dir=tmp_path / "r", model="m")
+    r, _ = runner(tmp_path, FakeProc([b"x\n"], stderr=b"error: individual quota reached, resets at 14:00\n"))
+    with pytest.raises(AgyRateLimited):
+        r.run("p", run_dir=tmp_path / "r2", model="m")

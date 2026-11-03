@@ -185,6 +185,22 @@
         <label>Files per message <input type="number" id="max-files" min="1" max="200" step="1"></label>
         <label>Pages per document <input type="number" id="max-pages" min="1" max="1000" step="1"></label>
       </section>
+      <section class="set-section set-grid">
+        <h3>Reading with Antigravity</h3>
+        <p class="set-help">Pages read at the same time (one Antigravity process each, shared by all documents). Fewer is gentler on your quota; the app slows down by itself if Antigravity reports rate limiting. Effort is the model's reasoning effort; a level the model does not offer is ignored.</p>
+        <label>Pages at once <select id="read-concurrency"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option></select></label>
+        <label>Effort for reading pages <select id="read-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Max</option></select></label>
+        <label>Effort for questions and Redraw <select id="chat-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Max</option></select></label>
+      </section>
+      <section class="set-section">
+        <h3 id="textvar-heading">Text shown and exported</h3>
+        <p class="set-help">Cleaned fixes casing, punctuation and spacing slips (same words, numbers and math). As written keeps the transcription exactly. Automatic: cleaned for handwritten documents, as written for printed ones.</p>
+        <div class="seg" role="radiogroup" aria-labelledby="textvar-heading">
+          <label><input type="radio" name="text-variant" value="auto"> Automatic</label>
+          <label><input type="radio" name="text-variant" value="clean"> Cleaned</label>
+          <label><input type="radio" name="text-variant" value="faithful"> As written</label>
+        </div>
+      </section>
       <section class="set-section">
         <h3 id="theme-heading">Theme</h3>
         <div class="seg" role="radiogroup" aria-labelledby="theme-heading">

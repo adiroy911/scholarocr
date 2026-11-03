@@ -174,6 +174,8 @@ def _normalise(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         if "doubt" in el and "uncertainty" not in el:
             el["uncertainty"] = el.pop("doubt")
+        if "clean_content" in el and "clean_text" not in el:  # the stored field's name, accepted as an alias
+            el["clean_text"] = el.pop("clean_content")
         if isinstance(el.get("uncertainty"), str):
             label = el["uncertainty"].strip().lower()
             el["uncertainty"] = DOUBT_SYNONYMS.get(label, label)

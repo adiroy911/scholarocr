@@ -75,6 +75,10 @@ def apply_review(el: Element, resp: ReviewResponse, *, by: str) -> None:
         if resp.text and resp.text != el.content:
             el.revisions.append(Revision(at=ts, by=by, field="content", previous=el.content))
             el.content = resp.text
+            if el.clean_content is not None:  # the cleaned text followed the old reading: derive it again
+                from .clean_text import rule_clean
+
+                el.clean_content, el.clean_content_source = rule_clean(el.content, el.type.value), "rules"
         if resp.latex and resp.latex != el.latex:
             el.revisions.append(Revision(at=ts, by=by, field="latex", previous=el.latex))
             el.latex = resp.latex

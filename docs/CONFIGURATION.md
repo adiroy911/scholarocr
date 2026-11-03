@@ -67,6 +67,21 @@ none of the target clients supports it (see ARCHITECTURE.md).
 | `SCHOLAROCR_LOG_LEVEL` | `INFO` (`WARNING` for the CLI) | Logs go to stderr. |
 | `SCHOLAROCR_APP_NAME` | `ScholarOCR` | Display name (MCP server title). |
 
+## Web app settings (`prefs.json`)
+
+Set in the app's Settings dialog and stored in `<app data dir>/prefs.json` (not environment variables):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `read_concurrency` | `3` | Antigravity: pages read at the same time (1-6), one `agy` process each, shared by every document the app is reading. Halved for the rest of a run when agy reports rate limiting or an exhausted quota. |
+| `read_effort` | `low` | Antigravity reasoning effort for reading pages (`low`, `medium`, `high`, `xhigh`, `max`). Passed as `--model <family> --effort <level>` when `agy models` lists that variant of the chosen model, otherwise ignored. |
+| `chat_effort` | `medium` | The same for follow-up questions and Redraw. |
+| `text_variant`, `figure_variant` | `auto`, `clean` | Text and figure images shown and exported (docs/WEB_APP.md). |
+| `max_file_mb`, `max_files`, `max_pages` | `50`, `30`, `60` | Upload limits. |
+
+Process-level limits (`AppConfig`): one page read times out after 300 s, a Redraw call after 600 s, a question
+after 240 s; a page throttled more than 3 times stays unread; the first pause after throttling is 20 s.
+
 ## Pricing file
 
 ```json

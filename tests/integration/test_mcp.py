@@ -11,11 +11,13 @@ from scholarocr.mcp.server import build_server
 from scholarocr.service import ScholarOCR
 from tests.fixtures.fake_gemini import FakeTransport
 
-EXPECTED_TOOLS = {"ocr_document", "get_document_status", "get_document_content", "get_page_content",
+EXPECTED_TOOLS = {"update_layout", "ocr_document", "get_document_status", "get_document_content", "get_page_content",
                   "get_source_region", "verify_document", "export_document", "list_documents", "classify_document",
                   "delete_document", "manage_job",
                   # host mode (the client's model is the vision model)
-                  "get_page_image", "submit_page_content", "submit_review"}
+                  "get_page_image", "submit_page_content", "submit_review",
+                  # optional figure redraw (host mode: the client draws the SVG)
+                  "redraw_figure", "submit_figure_svg"}
 
 
 @pytest.fixture

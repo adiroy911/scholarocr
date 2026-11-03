@@ -1,11 +1,14 @@
-"""JSON export: the full IR document, re-parsed after writing as a round-trip check."""
+"""JSON export: the full IR document, re-parsed after writing as a round-trip check.
+
+Both text variants are in the IR (``content`` exactly as written, ``clean_content`` normalised), and figure image
+paths (``source.region_image``, ``figure.image_clean``, ``figure.svg``) are relative to the document directory."""
 
 from __future__ import annotations
 
 from pydantic import ValidationError
 
 from ..schemas import Document
-from .base import ExportContext, ExportResult, write_text
+from .base import ExportContext, ExportResult, resolve_text_variant, write_text
 
 
 def export_json(ctx: ExportContext) -> ExportResult:
@@ -27,6 +30,10 @@ def export_json(ctx: ExportContext) -> ExportResult:
         "elements_expected": expected,
         "elements_found": found,
         "pages": len(ctx.document.pages),
+        # JSON keeps both variants; this is the one other formats would use by default (or as requested)
+        "text_variant": resolve_text_variant(ctx.document, ctx.option("text_variant")),
+        "figure_images": sum(1 for p in ctx.document.pages for e in p.elements if e.source.region_image
+                             and e.figure is not None),
     }
     return ExportResult(format="json", primary_file=str(out), files=[str(out)], warnings=warnings,
                         verification=verification)

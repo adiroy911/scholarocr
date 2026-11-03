@@ -75,7 +75,7 @@ def test_scanned_math_visual_pipeline(settings, corpus):
     unc = [e for e in page.elements if e.type == ElementType.UNCERTAIN][0]
     assert unc.uncertainty == Uncertainty.UNRESOLVED and "[illegible" in unc.content
     png, meta = s.get_source_region(r["document_id"], element_id=eqs[0].element_id)
-    assert Image.open(io.BytesIO(png)).size[0] > 10 and meta["bbox_source"] == "model_estimate"
+    assert Image.open(io.BytesIO(png)).size[0] > 10 and meta["bbox_source"] in ("refined", "model_estimate")
     usage = s.usage(r["document_id"])
     assert usage["totals"]["calls"] >= 2 and usage["estimated_cost"] is None
 

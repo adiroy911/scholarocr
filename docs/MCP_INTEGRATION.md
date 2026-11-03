@@ -20,6 +20,7 @@ Server: `scholarocr-mcp` (module `scholarocr.mcp.server`), built on the official
 | `export_document` | no | JSON, Markdown, searchable PDF, DOCX, LaTeX, CSV, XLSX |
 | `list_documents` | yes | Catalogue with filters/pagination |
 | `classify_document` | no | Document type, subjects, level, topics (needs a key; `model_unavailable` in host mode) |
+| `update_layout` | no | Bring a document read by an older version up to date without reading it again: boxes snapped to the ink, figure crops, rule-cleaned text |
 | `delete_document` | no (destructive) | Delete generated artifacts, or everything with `confirm` |
 | `manage_job` | no | Cancel / resume |
 

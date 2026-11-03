@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -92,13 +93,26 @@ class ArtifactStore:
             shutil.rmtree(d)
 
 
+def _replace(tmp: str, path: Path) -> None:
+    """``os.replace`` that waits out a reader: on Windows the target cannot be replaced while another thread has
+    it open (the web app reads page records while pages are being stored), which fails with PermissionError."""
+    for attempt in range(40):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 39:
+                raise
+            time.sleep(0.025)
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=path.suffix)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        os.replace(tmp, path)
+        _replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -113,7 +127,7 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        os.replace(tmp, path)
+        _replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)

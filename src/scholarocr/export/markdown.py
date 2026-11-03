@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 from ..schemas import Document, Element, ElementType, Page, PageStatus, TableData
@@ -10,7 +11,11 @@ from ..schemas.elements import FURNITURE_TYPES, HEADING_TYPES, MATH_TYPES, VISUA
 from .base import (
     ExportContext,
     ExportResult,
-    copy_asset,
+    export_variant_context,
+    figure_image_path,
+    figure_image_rel,
+    figure_preference,
+    redraw_note,
     heading_level,
     is_unclear,
     iter_document,
@@ -23,6 +28,7 @@ from .base import (
     region_image,
     starts_with_question_number,
     unclear_text,
+    with_text_variant,
     write_text,
 )
 
@@ -83,13 +89,21 @@ def _question_wrap(el: Element, text: str) -> str:
     return f"{prefix}{text}{suffix}"
 
 
-def _figure_md(page: Page, el: Element, asset_prefix: str | None) -> str:
+def _figure_md(page: Page, el: Element, asset_prefix: str | None, figure_prefer: str = "original",
+               figure_links: dict[str, str] | None = None) -> str:
     fig = el.figure
     desc = " ".join((fig.description if fig and fig.description else el.content).split())
     parts: list[str] = []
-    rel = region_image(page, el)
-    if rel:
-        link = f"{asset_prefix.rstrip('/')}/{Path(rel).name}" if asset_prefix is not None else rel
+    if figure_links is not None:
+        link = figure_links.get(el.element_id)
+    else:
+        rel = figure_image_rel(el, figure_prefer) if figure_prefer != "original" else region_image(page, el)
+        if rel in (page.original_image, page.processed_image, el.source.page_image):
+            rel = None
+        link = None
+        if rel:
+            link = f"{asset_prefix.rstrip('/')}/{Path(rel).name}" if asset_prefix is not None else rel
+    if link:
         alt = (desc[:120] or el.type.value).replace("[", "(").replace("]", ")")
         parts.append(f"![{alt}]({link})")
     head = el.type.value.capitalize()
@@ -106,7 +120,8 @@ def _figure_md(page: Page, el: Element, asset_prefix: str | None) -> str:
     return "\n".join(parts)
 
 
-def element_to_markdown(page: Page, el: Element, asset_prefix: str | None = None) -> str:
+def element_to_markdown(page: Page, el: Element, asset_prefix: str | None = None, figure_prefer: str = "original",
+                        figure_links: dict[str, str] | None = None) -> str:
     """Markdown for one element (no trailing newline)."""
     if el.type == ElementType.UNCERTAIN:
         return unclear(unclear_text(el))
@@ -130,7 +145,7 @@ def element_to_markdown(page: Page, el: Element, asset_prefix: str | None = None
         head = " ".join(x for x in (el.table.label and f"**{el.table.label}**", caption) if x)
         return note + (head + "\n\n" if head else "") + table_to_gfm(el.table)
     if el.type in VISUAL_TYPES:
-        return note + _figure_md(page, el, asset_prefix)
+        return note + _figure_md(page, el, asset_prefix, figure_prefer, figure_links)
     if el.type == ElementType.LIST:
         items = el.items if el.items else plain_text(el).split("\n")
         rendered = "\n".join(f"- {txt(' '.join(i.split()))}" for i in items if i.strip())
@@ -168,14 +183,21 @@ def document_to_markdown(
     element_types: set[ElementType] | None = None,
     page_numbers: set[int] | None = None,
     include_furniture: bool = False,
+    text_variant: str | None = None,
+    figure_prefer: str = "original",
+    figure_links: dict[str, str] | None = None,
 ) -> str:
     """Render the IR as compact, deterministic Markdown.
 
     Header/footer/page-number elements are omitted unless ``include_furniture`` is set or
     their type is requested explicitly in ``element_types``. Figure links point to
     ``asset_prefix/<crop file>`` or, when ``asset_prefix`` is None, to the crop's path
-    relative to the document directory.
+    relative to the document directory; ``figure_prefer`` (clean | original | svg) picks which stored image,
+    and ``figure_links`` (element id -> link) overrides both. ``text_variant="clean"`` renders the cleaned text
+    (``clean_content``) where it exists.
     """
+    if text_variant:
+        document = with_text_variant(document, text_variant)
     blocks: list[str] = []
     for page in ordered_pages(document):
         if page_numbers is not None and page.page_number not in page_numbers:
@@ -189,7 +211,7 @@ def document_to_markdown(
                     continue
             elif el.type in FURNITURE_TYPES and not include_furniture:
                 continue
-            block = element_to_markdown(page, el, asset_prefix)
+            block = element_to_markdown(page, el, asset_prefix, figure_prefer, figure_links)
             if include_ids:
                 unc = f" uncertainty={el.uncertainty.value}" if el.uncertainty.value != "low" else ""
                 block += ("\n" if "\n" in block else " ") + f"<!-- el:{el.element_id}{unc} -->"
@@ -199,17 +221,31 @@ def document_to_markdown(
 
 def export_markdown(ctx: ExportContext) -> ExportResult:
     warnings: list[str] = []
+    ctx, variant = export_variant_context(ctx)
+    prefer = figure_preference(ctx)
     include_furniture = ctx.flag("include_furniture", False)
     assets_dir = ctx.out_dir / "assets"
     files: list[str] = []
+    links: dict[str, str] = {}
     for page in ordered_pages(ctx.document):
         for el in ordered_elements(page):
-            rel = region_image(page, el) if el.type in VISUAL_TYPES else None
-            if rel and (copied := copy_asset(ctx, rel, assets_dir, warnings)):
-                files.append(str(copied))
+            if el.type not in VISUAL_TYPES:
+                continue
+            src = figure_image_path(ctx.doc_dir, el, prefer)
+            if note := redraw_note(el, prefer):
+                warnings.append(note)
+            if src is None:
+                if el.source.region_image or (el.figure and (el.figure.image_clean or el.figure.svg)):
+                    warnings.append(f"Figure image missing on disk for {el.element_id}")
+                continue
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            dest = assets_dir / src.name
+            shutil.copyfile(src, dest)
+            files.append(str(dest))
+            links[el.element_id] = f"assets/{dest.name}"
     text = document_to_markdown(
         ctx.document, include_ids=ctx.flag("include_ids", False), asset_prefix="assets",
-        include_furniture=include_furniture,
+        include_furniture=include_furniture, figure_links=links,
     )
     out = ctx.out_dir / "document.md"
     write_text(out, text)
@@ -231,6 +267,8 @@ def export_markdown(ctx: ExportContext) -> ExportResult:
         "broken_image_links": broken,
         "unclear_markers": written.count("⟦unclear:"),
         "unclear_elements": unclear_elements,
+        "text_variant": variant,
+        "figure_variant": prefer,
     }
     return ExportResult(format="markdown", primary_file=str(out), files=files, warnings=warnings,
                         verification=verification)

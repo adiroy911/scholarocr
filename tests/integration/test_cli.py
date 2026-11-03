@@ -99,3 +99,16 @@ def test_cli_without_keys_is_host_mode(settings, corpus, tmp_path):
     p = subprocess.run([sys.executable, "-m", "scholarocr.cli.main", "info"], capture_output=True, text=True, env=env,
                        cwd=str(tmp_path))
     assert p.returncode == 0 and '"mode": "host"' in p.stdout and '"gemini_available": false' in p.stdout
+
+
+def test_cli_refine(run, corpus):
+    code, out, err = run("--json", "process", str(corpus["clean_digital.pdf"]))
+    assert code == 0, err
+    doc_id = json.loads(out)["document_id"]
+    code, out, err = run("refine", doc_id)
+    assert code == 0, err
+    assert "pages updated: 2" in out and "boxes refined: 0" in out and "cleaned text added:" in out
+    code, out, err = run("--json", "refine", doc_id, "--pages", "1", "--no-clean-text")
+    assert code == 0 and json.loads(out)["totals"]["clean_text_added"] == 0
+    code, _, err = run("refine", "doc_0000000000000000")
+    assert code != 0

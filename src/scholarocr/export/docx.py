@@ -29,13 +29,16 @@ from docx.text.paragraph import Paragraph
 from lxml import etree
 from PIL import Image
 
-from ..exceptions import ExportError
 from ..schemas import Element, ElementType, Page
 from ..schemas.elements import FURNITURE_TYPES, HEADING_TYPES, MATH_TYPES, VISUAL_TYPES
 from .base import (
     ExportContext,
     ExportResult,
     ce_to_math,
+    export_variant_context,
+    figure_image_path,
+    figure_preference,
+    redraw_note,
     heading_level,
     is_unclear,
     latex_to_readable,
@@ -45,9 +48,9 @@ from .base import (
     ordered_elements,
     ordered_pages,
     plain_text,
-    region_image,
     split_inline_math,
     starts_with_question_number,
+    svg_to_png,
     unclear_text,
 )
 
@@ -123,6 +126,8 @@ class _DocxBuilder:
         self.inline_native = 0
         self.images = 0
         self.include_furniture = ctx.flag("include_furniture", False)
+        self.figure_prefer = figure_preference(ctx)
+        self._tmp = tempfile.TemporaryDirectory(prefix="scholarocr-docx-")
 
     # -- run helpers
     def _unclear_run(self, p: Paragraph, text: str) -> None:
@@ -273,24 +278,36 @@ class _DocxBuilder:
             hdr.set(qn("w:val"), "true")
             tr_pr.append(hdr)
 
+    def _text_width_pt(self) -> float:
+        sec = self.doc.sections[-1]
+        try:
+            return float((sec.page_width - sec.left_margin - sec.right_margin) / 12700)  # EMU -> pt
+        except TypeError:
+            return MAX_IMAGE_WIDTH_PT
+
     def _figure(self, page: Page, el: Element) -> None:
         self._note_if_unresolved(el)
-        rel = region_image(page, el)
-        path = None
-        if rel:
-            try:
-                path = self.ctx.resolve(rel)
-            except ExportError as e:
-                self.warnings.append(str(e))
-            if path is not None and not path.is_file():
-                self.warnings.append(f"Region image missing on disk: {rel}")
-                path = None
+        path = figure_image_path(self.ctx.doc_dir, el, self.figure_prefer)
+        if note := redraw_note(el, self.figure_prefer):
+            self.warnings.append(note)
+        if path is None and (el.source.region_image or (el.figure and (el.figure.image_clean or el.figure.svg))):
+            self.warnings.append(f"Figure image missing on disk for {el.element_id}")
+        if path is not None and path.suffix.lower() == ".svg":
+            try:  # Word cannot take SVG through python-docx: insert a high-resolution rendering
+                path = svg_to_png(path, Path(self._tmp.name) / f"{el.element_id}.png")
+            except Exception as e:  # noqa: BLE001 - fall back to the cleaned crop
+                self.warnings.append(f"redrawn figure {el.element_id} could not be rendered ({e.__class__.__name__}); "
+                                     "used the cleaned crop")
+                path = figure_image_path(self.ctx.doc_dir, el, "clean")
         if path is not None:
-            width_pt = el.bbox.width if el.bbox is not None and el.bbox.width > 0 else None
-            if width_pt is None:
+            # Same share of the text width as the figure had of the source page width.
+            text_w = self._text_width_pt()
+            if el.bbox is not None and el.bbox.width > 0 and page.width_pt > 0:
+                width_pt = el.bbox.width / page.width_pt * text_w
+            else:
                 with Image.open(path) as im:
                     width_pt = im.width * 72.0 / float(im.info.get("dpi", (FALLBACK_IMAGE_DPI,))[0] or FALLBACK_IMAGE_DPI)
-            self.doc.add_picture(str(path), width=Pt(min(width_pt, MAX_IMAGE_WIDTH_PT)))
+            self.doc.add_picture(str(path), width=Pt(max(36.0, min(width_pt, text_w))))
             self.images += 1
         fig = el.figure
         desc = " ".join((fig.description if fig and fig.description else el.content).split())
@@ -335,6 +352,7 @@ class _DocxBuilder:
 
 def export_docx(ctx: ExportContext) -> ExportResult:
     warnings: list[str] = []
+    ctx, variant = export_variant_context(ctx)
     builder = _DocxBuilder(ctx, warnings)
     markers = ctx.flag("page_markers", True)
     if ctx.document.title:
@@ -348,6 +366,7 @@ def export_docx(ctx: ExportContext) -> ExportResult:
     ctx.out_dir.mkdir(parents=True, exist_ok=True)
     out = ctx.out_dir / "document.docx"
     builder.doc.save(str(out))
+    builder._tmp.cleanup()
 
     reopened = docx.Document(str(out))
     styles = [p.style.name for p in reopened.paragraphs if p.style is not None]
@@ -363,6 +382,8 @@ def export_docx(ctx: ExportContext) -> ExportResult:
         "inline_math": len(builder.inline_math),
         "inline_math_native": builder.inline_native,
         "page_markers": markers,
+        "text_variant": variant,
+        "figure_variant": builder.figure_prefer,
     }
     if verification["native_equations"] != native:
         warnings.append(f"Native equation count after reopening ({verification['native_equations']}) "

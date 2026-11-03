@@ -5,19 +5,27 @@ A run is one assistant message. Its worker thread emits events (``stage``, ``pag
 the final state is written to the message in ``app.db``, so history shows what happened even after a
 restart.
 
-Reading with Antigravity: the service runs in host mode, so after ingestion every page that needs vision is
-``awaiting_transcription`` with a prepared image. For each such page the worker calls ``agy -p`` with the image
-folder as the only readable path, then submits the JSON reply through ``ScholarOCR.submit_page_content``:
-the same strict validation, conversion, uncertainty rules and storage as an MCP submission. A rejection is
-sent back to the model with every problem (at most ``max_retries`` times).
+Reading with Antigravity: the service runs in host mode, so ingestion prepares every page that needs vision
+(render, preprocess, host task) and marks it ``awaiting_transcription``. The page reader starts as soon as the
+first page is prepared (the job keeps preparing the rest in the background) and reads several pages at once,
+one ``agy -p`` process each: at most ``Prefs.read_concurrency`` per run, and at most that many in the whole app
+(a ``Limiter`` shared by every document being read). Each call gets the page image folder as its only readable
+path; the JSON reply goes through ``ScholarOCR.submit_page_content`` (strict validation, conversion,
+uncertainty rules, box refinement, figure crops and cleaned text for that page, storage) right after it
+arrives. A rejection is sent back to the model with every problem (at most ``max_retries`` times). Pages are
+stored by number, so finishing out of order changes nothing about the result. When agy reports throttling or
+an exhausted quota (or two pages in a row fail), the reader pauses, halves its concurrency for the rest of the
+run and tries those pages again. Stop kills every running agy process of the run.
 """
 
 from __future__ import annotations
 
+import re
 import shutil
 import threading
 import time
 import traceback
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -30,8 +38,8 @@ from ..logging_config import get_logger
 from ..schemas import ProcessingOptions
 from ..service import ScholarOCR
 from . import prompts
-from .agy import AgyCancelled, AgyError, AgyRunner, AgyTimeout
-from .config import AppConfig, Prefs
+from .agy import AgyCancelled, AgyError, AgyRateLimited, AgyRunner, AgyTimeout, model_for_effort
+from .config import DEFAULT_READ_CONCURRENCY, MAX_READ_CONCURRENCY, AppConfig, Prefs
 from .engines import EngineStatus, ServicePool
 from .store import AppStore, new_id
 from .view import chat_context, document_view, verification_view
@@ -41,10 +49,67 @@ TERMINAL_JOB = {"completed", "partial", "failed", "cancelled", "interrupted", "a
 CHAT_CONTEXT_CHARS = 18000  # leaves room for rules and history inside agy's command-line limit
 CHAT_CONTEXT_CHARS_KEY = 120000
 MAX_ROTATION_RETRIES = 2
+POLL_S = 0.25
+FAILURES_AS_THROTTLE = 2  # consecutive failed pages treated like a rate limit
+_STAGE_PAGE = re.compile(r"^page (\d+)$")
 
 
 class Cancelled(Exception):
     pass
+
+
+class Limiter:
+    """A counting semaphore whose capacity can change: the app-wide cap on agy page reads running at once."""
+
+    def __init__(self, capacity: int = DEFAULT_READ_CONCURRENCY):
+        self._cap = max(1, capacity)
+        self._used = 0
+        self._cond = threading.Condition()
+
+    @property
+    def capacity(self) -> int:
+        return self._cap
+
+    @property
+    def in_use(self) -> int:
+        return self._used
+
+    def set_capacity(self, n: int) -> None:
+        with self._cond:
+            self._cap = max(1, min(int(n), MAX_READ_CONCURRENCY))
+            self._cond.notify_all()
+
+    def acquire(self, cancel: threading.Event) -> bool:
+        with self._cond:
+            while self._used >= self._cap:
+                if cancel.is_set():
+                    return False
+                self._cond.wait(POLL_S)
+            if cancel.is_set():
+                return False
+            self._used += 1
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            self._used = max(0, self._used - 1)
+            self._cond.notify_all()
+
+
+@dataclass
+class ReadProgress:
+    """Shared state of one document's page reader (what the progress line shows)."""
+
+    total: int
+    concurrency: int
+    reading: set[int] = field(default_factory=set)
+    read: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {"reading": sorted(self.reading), "read": self.read, "total": self.total,
+                    "concurrency": self.concurrency}
 
 
 @dataclass
@@ -94,10 +159,15 @@ class RunManager:
         self.threaded = threaded
         self._runs: dict[str, Run] = {}
         self._lock = threading.Lock()
+        self.limiter = Limiter()  # every document read by this app shares it
 
     def get(self, run_id: str) -> Run | None:
         with self._lock:
             return self._runs.get(run_id)
+
+    def running(self) -> list[Run]:
+        with self._lock:
+            return [r for r in self._runs.values() if r.state == "running"]
 
     def active_for(self, conversation_id: str) -> Run | None:
         with self._lock:
@@ -135,6 +205,8 @@ class RunManager:
     def _read_worker(self, run: Run, groups, names, engine: EngineStatus, model, prefs: Prefs, instructions: str):
         data: dict[str, Any] = {"engine": engine.id, "engine_label": engine.label, "model": model,
                                 "instructions": instructions, "documents": [], "pages": {}, "usage": {}}
+        if engine.id == "antigravity":
+            data.update(effort=prefs.read_effort, concurrency=prefs.read_concurrency)
         state = "done"
         try:
             run.emit("stage", stage="starting", engine=engine.id, engine_label=engine.label, model=model)
@@ -176,23 +248,22 @@ class RunManager:
         entry["state"] = "running"
         run.emit("document_started", document_id=doc_id, page_count=result["page_count"], files=names)
         self._persist(run, data, "running")
-        last = None
-        while True:
-            if run.cancel.is_set():
-                svc.cancel_job(job_id)
-            job = svc.job_status(job_id)
-            snap = (job["completed_pages"], job["failed_pages"], job.get("stage"))
-            if snap != last:
-                run.emit("job", document_id=doc_id, completed=job["completed_pages"], failed=job["failed_pages"],
-                         total=job["total_pages"], stage=(job.get("stage") or "")[:200], status=job["status"])
-                last = snap
-            if job["status"] in TERMINAL_JOB:
-                break
-            time.sleep(0.3)
-        if job["status"] == "cancelled" or run.cancel.is_set():
-            raise Cancelled()
         if engine.id == "antigravity":
-            self._transcribe_with_agy(run, svc, doc_id, model, data)
+            # pages are read while the job is still preparing the later ones
+            self._transcribe_with_agy(run, svc, doc_id, job_id, engine, model, prefs, data,
+                                      page_count=result["page_count"])
+        else:
+            last = None
+            while True:
+                if run.cancel.is_set():
+                    svc.cancel_job(job_id)
+                job = svc.job_status(job_id)
+                last = self._job_event(run, doc_id, job, last)
+                if job["status"] in TERMINAL_JOB:
+                    break
+                time.sleep(0.3)
+            if job["status"] == "cancelled" or run.cancel.is_set():
+                raise Cancelled()
         run.check()
         try:
             report = svc.verify(doc_id)
@@ -200,7 +271,7 @@ class RunManager:
             run.emit("verification", document_id=doc_id, **entry["verification"])
         except ScholarOCRError as e:
             entry["verification"] = {"error": e.message}
-        view = document_view(svc, doc_id)
+        view = document_view(svc, doc_id, prefs.text_variant)
         entry["title"] = view["title"]
         waiting = [p["page_number"] for p in view["pages"] if p["status"] == "awaiting_transcription"]
         failed = [p["page_number"] for p in view["pages"] if p["status"] == "failed"]
@@ -226,26 +297,163 @@ class RunManager:
             except ScholarOCRError:
                 pass
 
-    def _transcribe_with_agy(self, run: Run, svc: ScholarOCR, doc_id: str, model: str | None, data: dict) -> None:
-        waiting = svc.awaiting_pages(doc_id)
-        if not waiting:
-            return
-        runner = self.agy_factory()
-        if runner is None:
-            raise AgyError("Antigravity CLI (agy) is no longer on PATH")
-        total = len(waiting)
-        for i, n in enumerate(waiting, start=1):
-            run.check()
-            stats = self._agy_page(run, runner, svc, doc_id, n, model, index=i, total=total)
+    @staticmethod
+    def _job_event(run: Run, doc_id: str, job: dict, last: tuple | None) -> tuple:
+        snap = (job["completed_pages"], job["failed_pages"], job.get("stage"))
+        if snap != last:
+            run.emit("job", document_id=doc_id, completed=job["completed_pages"], failed=job["failed_pages"],
+                     total=job["total_pages"], stage=(job.get("stage") or "")[:200], status=job["status"])
+        return snap
+
+    def _transcribe_with_agy(self, run: Run, svc: ScholarOCR, doc_id: str, job_id: str, engine: EngineStatus,
+                             model: str | None, prefs: Prefs, data: dict, *, page_count: int) -> None:
+        """Read every page that waits for transcription, several at once, starting while the job still prepares
+        the later pages. Returns when the job is terminal and no page is waiting or being read."""
+        model_arg, effort_arg = model_for_effort(model, prefs.read_effort, [m["id"] for m in engine.models])
+        label = f"{model_arg}-{effort_arg}" if effort_arg else (model or "default")
+        self.limiter.set_capacity(prefs.read_concurrency)
+        progress = ReadProgress(total=page_count, concurrency=prefs.read_concurrency)
+        runner: AgyRunner | None = None
+        dispatched: set[int] = set()
+        queue: list[int] = []  # pages to (re)start, in page order
+        requeued: dict[int, int] = {}
+        futures: dict[Future, int] = {}
+        pause_until = 0.0
+        backoffs = 0
+        failed_streak: dict[int, dict[str, Any]] = {}  # failed pages not yet recorded (see FAILURES_AS_THROTTLE)
+        last_job = None
+        job_terminal = False
+        cancel_sent = False
+        pool = ThreadPoolExecutor(max_workers=MAX_READ_CONCURRENCY, thread_name_prefix=f"agy-{run.id}")
+        try:
+            while True:
+                if run.cancel.is_set():
+                    if not cancel_sent:
+                        svc.cancel_job(job_id)
+                        cancel_sent = True
+                    if not futures:
+                        raise Cancelled()
+                if not job_terminal:
+                    job = svc.job_status(job_id)
+                    last_job = self._job_event(run, doc_id, job, last_job)
+                    job_terminal = job["status"] in TERMINAL_JOB
+                    if job["status"] == "cancelled" and not futures:
+                        raise Cancelled()
+                    m = _STAGE_PAGE.match(job.get("stage") or "")
+                    prepared_upto = page_count if job_terminal else (int(m.group(1)) if m else 0)
+                    rows = svc.repo.get_pages(doc_id)
+                    for n in sorted(rows):
+                        if (n <= prepared_upto and n not in dispatched
+                                and rows[n].get("status") == "awaiting_transcription"):
+                            dispatched.add(n)
+                            queue.append(n)
+                elif not dispatched and not queue and not futures:
+                    # a terminal job with pages still waiting from an earlier run of the same document
+                    for n in svc.awaiting_pages(doc_id):
+                        if n not in dispatched:
+                            dispatched.add(n)
+                            queue.append(n)
+                now = time.monotonic()
+                while (queue and not run.cancel.is_set() and now >= pause_until
+                       and len(futures) < progress.concurrency):
+                    if runner is None:
+                        runner = self.agy_factory()
+                        if runner is None:
+                            raise AgyError("Antigravity CLI (agy) is no longer on PATH")
+                    queue.sort()
+                    n = queue.pop(0)
+                    fut = pool.submit(self._agy_page, run, runner, svc, doc_id, n, model_arg, effort=effort_arg,
+                                      label=label, progress=progress)
+                    futures[fut] = n
+                if job_terminal and not queue and not futures:
+                    break
+                if not futures:
+                    time.sleep(POLL_S)
+                    continue
+                done, _ = wait(list(futures), timeout=POLL_S, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    n = futures.pop(fut)
+                    try:
+                        stats = fut.result()
+                    except Cancelled:  # agy was stopped: stop the whole run (and every other page's agy)
+                        run.cancel.set()
+                        continue
+                    status = stats.get("status")
+                    throttled = status == "rate_limited"
+                    retry_pages = [n]
+                    if status == "error" and requeued.get(n, 0) == 0:
+                        # a failure on its own is final, unless the next page fails too: then both are retried
+                        failed_streak[n] = stats
+                        if len(failed_streak) < FAILURES_AS_THROTTLE:
+                            continue
+                        throttled, retry_pages = True, sorted(failed_streak)
+                        failed_streak.clear()
+                    elif status != "rate_limited":
+                        self._record_pages(run, data, doc_id, failed_streak)
+                        failed_streak.clear()
+                    if throttled and requeued.get(n, 0) < self.cfg.rate_limit_retries and not run.cancel.is_set():
+                        for p in retry_pages:
+                            requeued[p] = requeued.get(p, 0) + 1
+                            queue.append(p)
+                        self._add_usage(data, stats)  # the tokens of the attempt that is repeated still count
+                        delay = self.cfg.rate_limit_backoff_s * (2 ** min(backoffs, 4))
+                        backoffs += 1
+                        pause_until = max(pause_until, time.monotonic() + delay)
+                        with progress.lock:
+                            progress.concurrency = max(1, progress.concurrency // 2)
+                        reason = "rate limiting or quota" if status == "rate_limited" else "repeated failures"
+                        run.emit("stage", stage="throttled", document_id=doc_id, concurrency=progress.concurrency,
+                                 pause_seconds=round(delay), message=(
+                                     f"Antigravity reported {reason}; waiting {round(delay)} s, then reading "
+                                     f"{progress.concurrency} page{'s' if progress.concurrency > 1 else ''} at a time"))
+                        for p in retry_pages:
+                            run.emit("page", document_id=doc_id, page=p, status="waiting", message=stats.get("error"),
+                                     **progress.snapshot())
+                        continue
+                    if status == "rate_limited":  # out of retries: report it like any other failure
+                        stats["status"] = "error"
+                        run.emit("page", document_id=doc_id, page=n, status="error", message=stats.get("error"),
+                                 **progress.snapshot())
+                    self._record_pages(run, data, doc_id, {n: stats})
+                if job_terminal and not queue and not futures and failed_streak:
+                    self._record_pages(run, data, doc_id, failed_streak)
+                    failed_streak.clear()
+        finally:
+            if futures:  # an error ended the reader: every agy process still running sees run.cancel and is killed
+                run.cancel.set()
+                wait(list(futures), timeout=60)
+            pool.shutdown(wait=False, cancel_futures=True)
+            # page results in page order, whatever order they finished in
+            data["pages"] = dict(sorted(data["pages"].items(), key=lambda kv: (kv[0].rsplit(":", 1)[0],
+                                                                                int(kv[0].rsplit(":", 1)[1]))))
+
+    @staticmethod
+    def _add_usage(data: dict, stats: dict) -> None:
+        for k, v in stats.get("usage", {}).items():
+            data["usage"][k] = data["usage"].get(k, 0) + v
+
+    def _record_pages(self, run: Run, data: dict, doc_id: str, results: dict[int, dict[str, Any]]) -> None:
+        for n, stats in results.items():
             data["pages"][f"{doc_id}:{n}"] = stats
-            for k, v in stats.get("usage", {}).items():
-                data["usage"][k] = data["usage"].get(k, 0) + v
+            self._add_usage(data, stats)
+        if results:
             self._persist(run, data, "running")
 
     def _agy_page(self, run: Run, runner: AgyRunner, svc: ScholarOCR, doc_id: str, n: int, model: str | None, *,
-                  index: int, total: int) -> dict[str, Any]:
+                  effort: str | None = None, label: str | None = None,
+                  progress: ReadProgress | None = None) -> dict[str, Any]:
+        progress = progress or ReadProgress(total=1, concurrency=1)
         stats: dict[str, Any] = {"page": n, "attempts": 0, "usage": {}, "seconds": 0.0, "status": "reading"}
-        run.emit("page", document_id=doc_id, page=n, index=index, total=total, status="reading", attempt=1)
+        if not self.limiter.acquire(run.cancel):
+            raise Cancelled()
+        with progress.lock:
+            progress.reading.add(n)
+        index = n
+
+        def emit(status: str, **kw: Any) -> None:
+            run.emit("page", document_id=doc_id, page=n, index=index, status=status, **progress.snapshot(), **kw)
+
+        emit("reading", attempt=1)
         run_dir = self.cfg.runs_dir / f"{run.id}-p{n}"
         img_dir = run_dir / "page"
         img_dir.mkdir(parents=True, exist_ok=True)
@@ -254,37 +462,42 @@ class RunManager:
         previous: Any = None
         conversation: str | None = None
         started = time.monotonic()
+        transcriber = f"antigravity:{label or model or 'default'}"
+        stats["model"] = label or model
         try:
             while True:
                 run.check()
-                img, mime, info = svc.host_page_image(doc_id, n, instructions="full")
+                img, mime, info = svc.host_page_image(doc_id, n, instructions="none")
                 if img is None:
                     stats["status"] = "done"
                     return stats
+                brief = prompts.page_brief(info["task"])
                 image_path = img_dir / ("page.png" if mime == "image/png" else "page.jpg")
                 image_path.write_bytes(img)
                 image_ref = str(image_path.resolve()).replace("\\", "/")
                 if errors is None:
-                    prompt = prompts.page_prompt(image_ref, info["instructions"])
+                    prompt = prompts.page_prompt(image_ref, brief)
                     resume = None
                 elif conversation:
                     prompt = prompts.retry_prompt(errors, previous, image_path=None, brief=None)
                     resume = conversation
                 else:
-                    prompt = prompts.retry_prompt(errors, previous, image_path=image_ref, brief=info["instructions"])
+                    prompt = prompts.retry_prompt(errors, previous, image_path=image_ref, brief=brief)
                     resume = None
                 stats["attempts"] += 1
                 try:
                     res = runner.run(prompt, run_dir=run_dir, model=model, read_dirs=[img_dir],
                                      schema=self.page_schema, timeout_s=self.cfg.page_timeout_s, cancel=run.cancel,
-                                     conversation_id=resume)
+                                     conversation_id=resume, effort=effort)
                 except AgyCancelled:
                     raise Cancelled() from None
+                except AgyRateLimited as e:
+                    stats.update(status="rate_limited", error=e.message)
+                    return stats
                 except AgyError:
                     if resume is not None:  # resuming failed: retry once more with a full prompt
                         conversation = None
-                        run.emit("page", document_id=doc_id, page=n, index=index, total=total, status="retrying",
-                                 attempt=stats["attempts"] + 1, message="Retrying with the full page prompt")
+                        emit("retrying", attempt=stats["attempts"] + 1, message="Retrying with the full page prompt")
                         continue
                     raise
                 for k, v in res.usage.items():
@@ -300,7 +513,7 @@ class RunManager:
                     previous = res.response[:6000]
                 else:
                     try:
-                        out = svc.submit_page_content(doc_id, n, payload, transcriber=f"antigravity:{model or 'default'}")
+                        out = svc.submit_page_content(doc_id, n, payload, transcriber=transcriber)
                     except SubmissionRejected as e:
                         errors = list((e.details or {}).get("errors") or [{"path": "(root)", "problem": e.message}])
                         previous = payload
@@ -310,35 +523,43 @@ class RunManager:
                             if rotations > MAX_ROTATION_RETRIES:
                                 raise AgyError("the page kept being reported as rotated")
                             errors, previous, conversation = None, None, None
-                            run.emit("page", document_id=doc_id, page=n, index=index, total=total, status="rotated",
-                                     attempt=stats["attempts"] + 1, message="Page re-oriented; reading it again")
+                            emit("rotated", attempt=stats["attempts"] + 1, message="Page re-oriented; reading it again")
                             continue
                         stats.update(status="done", elements=out.get("elements"), uncertainty=out.get("uncertainty"),
                                      warnings=(out.get("warnings") or [])[:5])
-                        run.emit("page", document_id=doc_id, page=n, index=index, total=total, status="done",
-                                 elements=out.get("elements"), uncertainty=out.get("uncertainty"),
-                                 attempts=stats["attempts"])
+                        with progress.lock:
+                            progress.reading.discard(n)
+                            progress.read += 1
+                        emit("done", elements=out.get("elements"), uncertainty=out.get("uncertainty"),
+                             attempts=stats["attempts"])
                         return stats
                 retries += 1
                 if retries > self.cfg.max_retries:
                     stats.update(status="rejected", errors=errors[:10])
-                    run.emit("page", document_id=doc_id, page=n, index=index, total=total, status="rejected",
-                             errors=errors[:10], attempts=stats["attempts"],
-                             message=f"Rejected {retries} times; the page stays unread")
+                    with progress.lock:
+                        progress.reading.discard(n)
+                    emit("rejected", errors=errors[:10], attempts=stats["attempts"],
+                         message=f"Rejected {retries} times; the page stays unread")
                     return stats
                 conversation = res.conversation_id
-                run.emit("page", document_id=doc_id, page=n, index=index, total=total, status="retrying",
-                         attempt=stats["attempts"] + 1, errors=errors[:10],
-                         message=f"Validator found {len(errors)} problem(s); asking again")
+                emit("retrying", attempt=stats["attempts"] + 1, errors=errors[:10],
+                     message=f"Validator found {len(errors)} problem(s); asking again")
         except AgyTimeout as e:
             stats.update(status="timeout", error=e.message)
-            run.emit("page", document_id=doc_id, page=n, index=index, total=total, status="timeout", message=e.message)
+            with progress.lock:
+                progress.reading.discard(n)
+            emit("timeout", message=e.message)
             return stats
         except AgyError as e:
             stats.update(status="error", error=e.message)
-            run.emit("page", document_id=doc_id, page=n, index=index, total=total, status="error", message=e.message)
+            with progress.lock:
+                progress.reading.discard(n)
+            emit("error", message=e.message)
             return stats
         finally:
+            with progress.lock:
+                progress.reading.discard(n)
+            self.limiter.release()
             stats["seconds"] = round(time.monotonic() - started, 1)
             shutil.rmtree(run_dir, ignore_errors=True)
 
@@ -387,9 +608,11 @@ class RunManager:
                     chunks.append(s)
                     run.emit("delta", text=s)
 
+                model_arg, effort_arg = model_for_effort(model, prefs.chat_effort, [m["id"] for m in engine.models])
                 try:
-                    res = runner.run(prompt, run_dir=run_dir, model=model, read_dirs=[], schema=None,
-                                     timeout_s=self.cfg.chat_timeout_s, cancel=run.cancel, on_delta=on_delta)
+                    res = runner.run(prompt, run_dir=run_dir, model=model_arg, read_dirs=[], schema=None,
+                                     timeout_s=self.cfg.chat_timeout_s, cancel=run.cancel, on_delta=on_delta,
+                                     effort=effort_arg)
                 except AgyCancelled:
                     text = "".join(chunks)
                     raise Cancelled() from None

@@ -28,7 +28,7 @@ from ..schemas import (
 )
 from ..storage.artifacts import atomic_write_text
 
-FORMATS = ("json", "markdown", "searchable-pdf", "docx", "latex", "csv", "xlsx")
+FORMATS = ("json", "markdown", "searchable-pdf", "layout-pdf", "docx", "latex", "csv", "xlsx")
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -386,3 +386,148 @@ def region_image(page: Page, el: Element) -> str | None:
 
 def write_text(path: Path, text: str) -> None:
     atomic_write_text(path, text)
+
+
+# ------------------------------------------------------------------ text variants and figure images
+TEXT_VARIANTS = ("clean", "faithful")
+FIGURE_PREFERENCES = ("clean", "original", "svg")
+_FIGURE_ORDER = {"svg": ("svg", "clean", "original"), "clean": ("clean", "original"), "original": ("original",)}
+_FIGURE_ALIASES = {"redrawn": "svg", "vector": "svg", "cleaned": "clean", "crop": "original", "as_written": "original"}
+
+
+def element_text(el: Element, variant: str) -> str:
+    """The element's text in ``variant``: ``"clean"`` gives ``clean_content`` when it exists, anything else (or
+    a missing clean version) gives ``content``, the faithful transcription."""
+    if variant == "clean" and el.clean_content is not None:
+        return el.clean_content
+    return el.content
+
+
+def svg_is_faithful(el: Element) -> bool:
+    """A redrawn SVG exists and passed the fidelity check against the crop (``figure.svg_fidelity.passed``)."""
+    fig = el.figure
+    return bool(fig and fig.svg and (fig.svg_fidelity or {}).get("passed"))
+
+
+def redraw_note(el: Element, prefer: str) -> str | None:
+    """Warning for an export that asked for redrawn figures where this figure's redraw is not usable."""
+    if resolve_figure_preference(prefer) != "svg" or not (el.figure and el.figure.svg) or svg_is_faithful(el):
+        return None
+    score = (el.figure.svg_fidelity or {}).get("score")
+    pct = f" (fidelity {score:.0%})" if isinstance(score, (int, float)) else ""
+    return f"figure {el.element_id}: the redraw is not faithful{pct}; the cleaned crop is used instead"
+
+
+def _figure_rels(el: Element) -> dict[str, str | None]:
+    fig = el.figure
+    # A redraw that failed the fidelity check is never used in place of the crop.
+    return {"svg": fig.svg if svg_is_faithful(el) else None, "clean": fig.image_clean if fig else None,
+            "original": el.source.region_image}
+
+
+def figure_image_rel(el: Element, prefer: str) -> str | None:
+    """The stored image path (relative to the document dir) to show for a figure, by preference with fallback:
+    ``svg`` -> svg, clean, original; ``clean`` -> clean, original; ``original`` -> original. No disk check."""
+    rels = _figure_rels(el)
+    for kind in _FIGURE_ORDER[resolve_figure_preference(prefer)]:
+        if rels[kind]:
+            return rels[kind]
+    return None
+
+
+def figure_image_path(doc_dir: Path, el: Element, prefer: str) -> Path | None:
+    """Absolute path of the figure image to use, by ``prefer`` (``"clean"``, ``"original"`` or ``"svg"``) with the
+    same fallback as ``figure_image_rel``, skipping files that are missing or would escape ``doc_dir``."""
+    base = Path(doc_dir).resolve()
+    rels = _figure_rels(el)
+    for kind in _FIGURE_ORDER[resolve_figure_preference(prefer)]:
+        rel = rels[kind]
+        if not rel:
+            continue
+        path = (base / rel).resolve()
+        if path.is_relative_to(base) and path.is_file():
+            return path
+    return None
+
+
+def resolve_figure_preference(value: str | None) -> str:
+    v = (value or "clean").strip().lower().replace("-", "_")
+    v = _FIGURE_ALIASES.get(v, v)
+    if v not in FIGURE_PREFERENCES:
+        raise ExportError(f"figure_variant must be one of clean, original, redrawn (svg); got {value!r}")
+    return v
+
+
+TEXT_TYPES_FOR_VARIANT = {ElementType.TITLE, ElementType.HEADING, ElementType.SUBHEADING, ElementType.PARAGRAPH,
+                          ElementType.TEXT, ElementType.HANDWRITING, ElementType.CAPTION, ElementType.FOOTNOTE,
+                          ElementType.LIST}
+
+
+def document_is_handwritten(document: Document) -> bool:
+    """True when most text elements were read as handwriting."""
+    els = [el for p in document.pages for el in p.elements if el.type in TEXT_TYPES_FOR_VARIANT]
+    return bool(els) and sum(1 for el in els if el.handwritten) * 2 >= len(els)
+
+
+def default_text_variant(document: Document) -> str:
+    """``clean`` for handwritten documents (slips of the pen are noise there), ``faithful`` for printed ones."""
+    return "clean" if document_is_handwritten(document) else "faithful"
+
+
+def resolve_text_variant(document: Document, requested: str | None) -> str:
+    v = (requested or "auto").strip().lower().replace("-", "_")
+    v = {"cleaned": "clean", "as_written": "faithful", "original": "faithful", "exact": "faithful"}.get(v, v)
+    if v == "auto":
+        return default_text_variant(document)
+    if v not in TEXT_VARIANTS:
+        raise ExportError(f"text_variant must be clean, faithful or auto; got {requested!r}")
+    return v
+
+
+def with_text_variant(document: Document, variant: str) -> Document:
+    """A copy of ``document`` whose ``content`` is the chosen variant (``clean`` swaps in ``clean_content``
+    where it exists). ``faithful`` returns the document unchanged."""
+    if variant != "clean":
+        return document
+    doc = document.model_copy(deep=True)
+    for page in doc.pages:
+        for el in page.elements:
+            if el.clean_content is not None:
+                el.content = el.clean_content
+    return doc
+
+
+def export_variant_context(ctx: ExportContext) -> tuple[ExportContext, str]:
+    """``ctx`` with its document in the requested text variant (option ``text_variant``: clean | faithful |
+    auto), and the variant used."""
+    variant = resolve_text_variant(ctx.document, ctx.option("text_variant"))
+    return ctx.model_copy(update={"document": with_text_variant(ctx.document, variant)}), variant
+
+
+def figure_preference(ctx: ExportContext) -> str:
+    """Option ``figure_variant``: clean (default) | original | redrawn (the sanitised SVG, if made)."""
+    return resolve_figure_preference(ctx.option("figure_variant", ctx.option("figures")))
+
+
+def svg_to_png(svg_path: Path, out: Path, *, width_px: int = 1600) -> Path:
+    """Rasterise a stored (already sanitised) SVG with PyMuPDF, for formats that cannot embed SVG."""
+    import pymupdf
+
+    with pymupdf.open(svg_path) as d:
+        page = d[0]
+        zoom = max(0.5, min(8.0, width_px / max(page.rect.width, 1.0)))
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pix.save(str(out))
+    return out
+
+
+def svg_to_pdf(svg_path: Path, out: Path) -> Path:
+    """Convert a stored SVG to a one-page vector PDF (LaTeX ``\\includegraphics`` cannot read SVG)."""
+    import pymupdf
+
+    with pymupdf.open(svg_path) as d:
+        data = d.convert_to_pdf()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    return out
