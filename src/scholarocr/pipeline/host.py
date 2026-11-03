@@ -110,7 +110,9 @@ def _known(model: type[BaseModel]) -> set[str]:
 
 
 KNOWN = {"element": _known(XElement), "table": _known(XTable), "cell": _known(XCell), "figure": _known(XFigure),
-         "question": _known(XQuestion), "page": _known(PageExtractionResponse)}
+         "question": _known(XQuestion), "page": _known(PageExtractionResponse) | {"legibility"}}
+# Element doubt labels: "none" is accepted for "low" (no doubt), and "doubt" as the field name.
+DOUBT_SYNONYMS = {"none": "low", "no": "low", "clear": "low", "certain": "low"}
 
 
 def _suggest(key: str, known: set[str]) -> str | None:
@@ -170,6 +172,11 @@ def _normalise(payload: dict[str, Any]) -> dict[str, Any]:
     for el in payload.get("elements") or []:
         if not isinstance(el, dict):
             continue
+        if "doubt" in el and "uncertainty" not in el:
+            el["uncertainty"] = el.pop("doubt")
+        if isinstance(el.get("uncertainty"), str):
+            label = el["uncertainty"].strip().lower()
+            el["uncertainty"] = DOUBT_SYNONYMS.get(label, label)
         box = el.get("box_2d")
         if isinstance(box, list) and all(isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip("-").replace(".", "", 1).isdigit())
                                          for v in box):
@@ -185,19 +192,35 @@ def validate_submission(payload: dict[str, Any]) -> tuple[PageExtractionResponse
     """Validate a host submission strictly. Returns (response, warnings) or raises ``SubmissionRejected``
     with every problem found (path, problem, fix). Nothing is partially accepted."""
     probs = _Problems()
+    if isinstance(payload.get("elements"), str):  # some clients send the array as a JSON string
+        try:
+            parsed = json.loads(payload["elements"])
+        except ValueError as e:
+            probs.add("elements", f"a string that is not valid JSON ({e.msg} at character {e.pos})",
+                      "pass elements as a JSON array of element objects, not a string")
+            _raise(probs)
+        payload = {**payload, "elements": parsed}
     if not isinstance(payload.get("elements"), list):
-        probs.add("elements", "must be a list of element objects", "pass elements=[{...}, ...]")
+        probs.add("elements", f"must be a list of element objects, got {_short(payload.get('elements'))}",
+                  "pass elements=[{\"type\": \"paragraph\", \"text\": \"...\"}, ...]")
         _raise(probs)
     payload = _normalise(payload)
+    if payload.get("legibility") is not None:
+        probs.warnings.append(f"'legibility' is the old name of page_doubt, a level of DOUBT (low = clean page); "
+                              f"stored as page_doubt={payload['legibility']!r}. It does not change element labels.")
     elements = payload["elements"]
     if len(elements) > MAX_ELEMENTS:
         probs.add("elements", f"{len(elements)} elements (max {MAX_ELEMENTS})", "merge consecutive lines of one paragraph")
     _check_unknown(payload, "page", "(root)", probs)
     for i, el in enumerate(elements):
         if not isinstance(el, dict):
-            probs.add(f"elements[{i}]", f"must be an object, got {_short(el)}")
+            probs.add(f"elements[{i}]", f"must be an object, got {_short(el)}",
+                      'each element is an object such as {"type": "paragraph", "text": "...", "box_2d": [...]}; '
+                      "see get_page_image(instructions='full')")
             continue
         _check_unknown(el, "element", f"elements[{i}]", probs)
+    if any(not isinstance(el, dict) for el in elements):
+        _raise(probs)  # pydantic would only repeat "valid dictionary" for each of them
     try:
         resp = PageExtractionResponse.model_validate(payload)
     except ValidationError as e:

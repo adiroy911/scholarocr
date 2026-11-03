@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp(scholarocr_scholarocr/*)",
+      "mcp(scholarocr/*)",
+      "read_file(C:/Users/<you>/.gemini/config/plugins/scholarocr)",
+      "read_file(C:/Users/<you>/.gemini/antigravity-cli/mcp)"
+    ],
+    "deny": [
+      "command(regex:.*)"
+    ]
+  }
+}

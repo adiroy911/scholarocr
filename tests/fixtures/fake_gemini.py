@@ -19,7 +19,7 @@ def default_page(text: str = "Q1. Solve x^2 + 5x + 6 = 0. [2]") -> dict:
     return {
         "page_language": "en",
         "page_label": "1",
-        "legibility": "low",
+        "page_doubt": "low",
         "elements": [
             {"type": "heading", "text": "Mathematics — Paper I", "level": 1, "box_2d": [60, 80, 110, 700]},
             {"type": "paragraph", "role": "question", "text": text, "question": {"number": "1", "marks": "2"},

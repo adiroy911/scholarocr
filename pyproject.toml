@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "scholarocr"
-version = "0.2.0"
+version = "0.3.0"
 description = "Source-traceable academic-document OCR for AI agents over MCP; no API key needed in host mode."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,11 +30,14 @@ Issues = "https://github.com/adiroy911/scholarocr/issues"
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
 # Hosted ChatGPT-app server (scholarocr-remote). starlette/uvicorn/httpx already come with mcp.
 remote = ["cryptography>=42", "uvicorn>=0.30", "starlette>=0.40", "httpx>=0.27"]
+# Local web app (scholarocr-app). keyring is optional: without it keys go to the user-level scholarocr.env.
+webapp = ["uvicorn>=0.30", "starlette>=0.40", "keyring>=25"]
 
 [project.scripts]
 scholarocr = "scholarocr.cli.main:main"
 scholarocr-mcp = "scholarocr.mcp.server:main"
 scholarocr-remote = "scholarocr.remote.server:main"
+scholarocr-app = "scholarocr.webapp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/scholarocr"]

@@ -37,7 +37,7 @@ repeat for each waiting page:
   get_page_image(document_id)      -> [image, text]: ONE processed page (deskewed, cropped), the rules,
                                       the element JSON shape (full the first time, short afterwards),
                                       page_number, next_waiting_page
-  submit_page_content(document_id, page_number, elements=[...], page_language, page_label, legibility,
+  submit_page_content(document_id, page_number, elements=[...], page_language, page_label, page_doubt,
                       rotation_detected, notes)
      rejected -> error submission_rejected, details.errors[] = {path, problem, fix}; nothing stored
      accepted -> counts, warnings, review_suggested, next_waiting_page
@@ -55,6 +55,11 @@ then get_document_content / verify_document / export_document as usual
   empty text, tables without rows, and LaTeX syntax errors at low/medium uncertainty. A LaTeX problem the
   model cannot fix is accepted once it marks the element `high`/`unresolved`.
 - `rotation_detected` 90/180/270 makes the server re-orient the page and ask again (at most twice).
+- Each element's `uncertainty` (alias `doubt`; `none` is read as `low`) is the model's doubt about that
+  element. `page_doubt` is the overall doubt and does not change element labels; `legibility` is its
+  deprecated name. `elements` is typed loosely on purpose: a malformed list or a JSON string reaches the
+  validator and gets the usual path / problem / fix answer instead of a schema error.
+- `get_page_content(compact=true)` or `fields=[...]` returns a fraction of the full page record.
 - Context use: one image per `get_page_image` call; nothing returns images except it and
   `get_source_region`. The full rules are sent until the first page of a document is submitted.
 

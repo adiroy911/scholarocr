@@ -2,11 +2,15 @@
 
 ## Uncertainty labels (ordinal, not probabilities)
 - Start: extractor's own label (deterministic text layer = low unless characters are garbled).
-- Escalated by evidence: invalid LaTeX → high; table structure problems → medium; poor page quality
-  for math/tables/handwriting → medium; model-reported poor legibility → medium; `uncertain`
-  elements → unresolved.
-- Targeted review (second model on the crop): confirmed → one step lower; corrected → content replaced
-  (old value in `revisions`), at least medium; unreadable → unresolved.
+- Escalated by evidence: invalid LaTeX → high; table structure problems → medium; poor (not fair) page
+  quality for math/tables/handwriting → medium; `uncertain` elements → unresolved. The page-level `page_doubt`
+  (old name `legibility`) is only a page warning; it does not raise element labels.
+- Host mode: each element's label is your doubt about it (`low` = you would bet it is exact, `medium` =
+  a specific character or word could differ, `high` = a guess among alternatives, `unresolved` = cannot
+  read). Label every element on its own.
+- Targeted review (second model on the crop): confirmed → one step lower (and not re-raised by the rule
+  that flagged it); corrected → content replaced (old value in `revisions`), at least medium; unreadable →
+  unresolved.
 
 ## Verification findings (`verify_document`)
 Severity `error` = must not be ignored (failed pages, empty extraction, broken traceability);
@@ -23,7 +27,7 @@ has padding.
 ## Error codes
 | code | meaning | what to do |
 |---|---|---|
-| `access_denied` | path outside authorized dirs | ask the user to add the folder to `SCHOLAROCR_ALLOWED_DIRS` and restart the server |
+| `access_denied` | path outside authorized dirs | ask the user to APPEND the folder to `SCHOLAROCR_ALLOWED_DIRS` in the settings file the message names (`;` on Windows, `:` elsewhere; keep the existing entries) and restart the server |
 | `invalid_input` / `unsupported_format` | bad arguments or file type | fix arguments; supported: PDF, PNG, JPEG, TIFF, WebP, BMP, GIF, DOCX |
 | `encrypted_document` | password-protected PDF | ask the user for a decrypted copy |
 | `corrupt_document` | damaged file | ask for another copy |

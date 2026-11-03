@@ -63,6 +63,7 @@ none of the target clients supports it (see ARCHITECTURE.md).
 | `SCHOLAROCR_RETENTION_DAYS` | — (keep forever) | On start-up and via `scholarocr purge`, delete generated artifacts of documents idle this many days. Preserved sources are never purged. |
 | `SCHOLAROCR_HOST_IMAGE_MAX_SIDE` | `2000` | Host mode: longest side in pixels of page images handed to the client's model (PNG, JPEG above 1.5 MB). Boxes are normalised, so this never changes coordinates. |
 | `SCHOLAROCR_ENV_FILE` | see above | User-level settings file. |
+| `SCHOLAROCR_APP_DATA_DIR` | `<data dir>pp` | Web app (`scholarocr-app`): conversations, settings, uploads and the app's own store. The app ignores keys in the environment and uses only keys saved in its Settings (docs/WEB_APP.md). |
 | `SCHOLAROCR_LOG_LEVEL` | `INFO` (`WARNING` for the CLI) | Logs go to stderr. |
 | `SCHOLAROCR_APP_NAME` | `ScholarOCR` | Display name (MCP server title). |
 

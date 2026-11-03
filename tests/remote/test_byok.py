@@ -153,3 +153,23 @@ async def test_operator_mode_serves_users_without_key(remote, corpus):
     assert ns.transports.built[0][2] == OPERATOR_ENV["GEMINI_API_KEY"]
     assert acct.structured_content["billing"] == "operator"
     assert OPERATOR_ENV["GEMINI_API_KEY"] not in acct.content[0].text
+
+
+async def test_host_mode_malformed_elements_get_validator_errors(remote, corpus):
+    # 0.3.0 regression: elements=[0, 1, ...] used to fail inside the MCP SDK with a raw pydantic error.
+    ns = remote()
+    ns.identity.user = ns.store.create_account()
+    f = ns.fetcher.add("https://files.example/q.png", corpus["handwritten.png"].read_bytes())
+    async with Client(ns.mcp) as c:
+        doc = (await c.call_tool("ocr_upload", {"files": [f]})).structured_content["document_id"]
+        bad = await c.call_tool("submit_page_content", {"document_id": doc, "page_number": 1, "elements": [0, 1]})
+        assert bad.is_error
+        payload = bad.structured_content or json.loads(bad.content[0].text)
+        assert payload["error"] == "submission_rejected"
+        assert [e["path"] for e in payload["details"]["errors"]] == ["elements[0]", "elements[1]"]
+        ok = await c.call_tool("submit_page_content", {
+            "document_id": doc, "page_number": 1, "page_doubt": "low",
+            "elements": json.dumps([{"type": "handwriting", "text": "Enzymes", "doubt": "none"}])})
+        assert not ok.is_error and ok.structured_content["accepted"]
+        page = await c.call_tool("get_page_content", {"document_id": doc, "page_number": 1, "compact": True})
+        assert page.structured_content["elements"][0]["uncertainty"] == "low"

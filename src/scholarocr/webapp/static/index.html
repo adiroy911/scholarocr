@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="scholarocr-token" content="__SCHOLAROCR_TOKEN__">
+<meta name="scholarocr-version" content="__SCHOLAROCR_VERSION__">
+<title>ScholarOCR</title>
+<link rel="icon" href="/static/mark.svg" type="image/svg+xml">
+<link rel="preload" href="/static/vendor/fonts/anek-latin-wdth.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="/static/app.css?v=__ASSET_V__">
+<script defer src="/static/vendor/katex/katex.min.js"></script>
+<script defer src="/static/vendor/katex/mhchem.min.js"></script>
+<script defer src="/static/app.js?v=__ASSET_V__"></script>
+</head>
+<body>
+<a class="skip-link" href="#composer-input">Skip to the message box</a>
+<div class="shell" id="shell">
+  <aside class="sidebar" id="sidebar" aria-label="History">
+    <div class="sb-head">
+      <button type="button" class="icon-btn" id="sb-toggle" aria-label="Collapse sidebar" aria-expanded="true" aria-controls="sidebar">
+        <svg aria-hidden="true"><use href="/static/icons.svg#panel-left-close"/></svg>
+      </button>
+    </div>
+    <button type="button" class="sb-new" id="new-btn" title="New document (Ctrl+Shift+O)">
+      <svg aria-hidden="true"><use href="/static/icons.svg#pen-line"/></svg><span class="sb-label">New document</span>
+    </button>
+    <nav class="history" aria-labelledby="history-heading">
+      <h2 class="sb-heading sb-label" id="history-heading">Recent</h2>
+      <ul class="history-list" id="history-list"></ul>
+      <p class="history-empty sb-label" id="history-empty">Documents you read appear here. They are stored on this computer.</p>
+    </nav>
+    <div class="sb-foot">
+      <button type="button" class="sb-item" id="settings-btn">
+        <svg aria-hidden="true"><use href="/static/icons.svg#settings"/></svg><span class="sb-label">Settings</span>
+      </button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+
+  <main class="main" id="main">
+    <header class="topbar">
+      <button type="button" class="icon-btn only-narrow" id="open-history" aria-label="Open history" aria-controls="sidebar">
+        <svg aria-hidden="true"><use href="/static/icons.svg#menu"/></svg>
+      </button>
+      <a class="wordmark" href="/" id="home-link"><img class="mark" src="/static/mark.svg" alt="" width="24" height="24"><span>ScholarOCR</span></a>
+      <span class="topbar-title" id="topbar-title"></span>
+      <button type="button" class="icon-btn" id="theme-btn" aria-label="Use dark theme">
+        <svg aria-hidden="true"><use href="/static/icons.svg#moon"/></svg>
+      </button>
+    </header>
+
+    <section class="scroller" id="scroller">
+      <div class="column">
+        <div class="empty" id="empty">
+          <h1 class="greeting" id="greeting">Read a document</h1>
+          <p class="greeting-sub">PDF, page photos or DOCX. Several photos become one document.</p>
+          <button type="button" class="saved-chip" id="saved-chip" hidden>
+            <svg aria-hidden="true"><use href="/static/icons.svg#pencil"/></svg><span id="saved-chip-text"></span>
+          </button>
+        </div>
+
+        <div class="setup" id="setup" hidden>
+          <h1 class="setup-title">Set up a reading engine</h1>
+          <p class="setup-sub">ScholarOCR needs a model to read scanned pages. Use your Google account through Antigravity CLI, or add an API key.</p>
+          <div class="setup-options">
+            <section class="setup-card">
+              <h2>Antigravity CLI</h2>
+              <ol>
+                <li>Install Antigravity CLI so that <code>agy</code> is on your PATH.</li>
+                <li>Run <code>agy</code> once in a terminal and sign in with your Google account.</li>
+                <li>Check again.</li>
+              </ol>
+              <p class="setup-reason" id="setup-reason"></p>
+              <button type="button" class="btn btn-primary" id="setup-recheck">
+                <svg aria-hidden="true"><use href="/static/icons.svg#refresh-cw"/></svg><span>Check again</span>
+              </button>
+            </section>
+            <section class="setup-card">
+              <h2>API key</h2>
+              <p>A Gemini or OpenRouter key runs ScholarOCR's own reading pipeline. The key stays on this computer.</p>
+              <button type="button" class="btn" id="setup-keys">
+                <svg aria-hidden="true"><use href="/static/icons.svg#key-round"/></svg><span>Add a key</span>
+              </button>
+            </section>
+          </div>
+        </div>
+
+        <ol class="messages" id="messages" aria-live="polite" aria-relevant="additions"></ol>
+      </div>
+    </section>
+
+    <div class="composer-wrap">
+      <form class="composer" id="composer" autocomplete="off">
+        <ul class="attachments" id="attachments" aria-label="Attached files"></ul>
+        <label class="visually-hidden" for="composer-input">Instructions or question</label>
+        <textarea id="composer-input" rows="1" maxlength="8000" placeholder="Attach a file, add instructions"></textarea>
+        <div class="composer-bar">
+          <button type="button" class="icon-btn round" id="attach-btn" aria-label="Attach files" title="Attach files">
+            <svg aria-hidden="true"><use href="/static/icons.svg#plus"/></svg>
+          </button>
+          <div class="bar-spacer"></div>
+          <button type="button" class="engine-btn" id="engine-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="engine-menu">
+            <span class="engine-btn-label" id="engine-btn-label">Engine</span>
+            <svg aria-hidden="true"><use href="/static/icons.svg#chevron-down"/></svg>
+          </button>
+          <button type="submit" class="send-btn" id="send-btn" aria-label="Send" disabled>
+            <svg aria-hidden="true"><use href="/static/icons.svg#arrow-up"/></svg>
+          </button>
+        </div>
+      </form>
+      <p class="composer-note" id="composer-note">Extracted text can contain mistakes. Highlighted parts were hard to read.</p>
+    </div>
+  </main>
+
+  <aside class="source-panel" id="source-panel" aria-label="Source of the selected element" hidden>
+    <header class="sp-head">
+      <h2 id="sp-title">Source</h2>
+      <button type="button" class="icon-btn" id="sp-close" aria-label="Close source">
+        <svg aria-hidden="true"><use href="/static/icons.svg#x"/></svg>
+      </button>
+    </header>
+    <div class="sp-body" id="sp-body"></div>
+  </aside>
+</div>
+
+<div class="dropzone" id="dropzone" hidden>
+  <div class="dropzone-inner">
+    <svg aria-hidden="true"><use href="/static/icons.svg#upload"/></svg>
+    <p>Drop to attach</p>
+  </div>
+</div>
+
+<div class="menu" id="engine-menu" role="menu" aria-label="Engine and model" hidden></div>
+<div class="menu" id="row-menu" role="menu" aria-label="Document actions" hidden></div>
+
+<dialog class="dialog" id="settings-dialog" aria-labelledby="settings-title">
+  <form method="dialog" class="dialog-inner" id="settings-form">
+    <header class="dialog-head">
+      <h2 id="settings-title">Settings</h2>
+      <button type="button" class="icon-btn" id="settings-close" aria-label="Close settings">
+        <svg aria-hidden="true"><use href="/static/icons.svg#x"/></svg>
+      </button>
+    </header>
+    <div class="dialog-body">
+      <section class="set-section">
+        <h3><label for="saved-instructions">Saved instructions</label></h3>
+        <p class="set-help">Sent with every document you read, before the message's own instructions. Example: Class 11 chemistry; keep question numbers; Hindi and English.</p>
+        <textarea id="saved-instructions" rows="4" maxlength="4000"></textarea>
+      </section>
+      <section class="set-section">
+        <h3 id="engine-heading">Engine</h3>
+        <div class="engine-list" id="engine-list" role="radiogroup" aria-labelledby="engine-heading"></div>
+        <button type="button" class="btn btn-quiet" id="engines-refresh">
+          <svg aria-hidden="true"><use href="/static/icons.svg#refresh-cw"/></svg><span>Check engines again</span>
+        </button>
+      </section>
+      <section class="set-section">
+        <h3>API keys</h3>
+        <p class="set-help" id="key-backend-note"></p>
+        <div class="key-row" data-provider="gemini">
+          <label for="key-gemini">Gemini API key</label>
+          <div class="key-input">
+            <input type="password" id="key-gemini" autocomplete="off" spellcheck="false" placeholder="Paste a key">
+            <button type="button" class="btn" data-key-save="gemini">Save key</button>
+            <button type="button" class="btn btn-quiet" data-key-remove="gemini">Remove</button>
+          </div>
+          <p class="key-status" id="key-status-gemini"></p>
+        </div>
+        <div class="key-row" data-provider="openrouter">
+          <label for="key-openrouter">OpenRouter key</label>
+          <div class="key-input">
+            <input type="password" id="key-openrouter" autocomplete="off" spellcheck="false" placeholder="Paste a key">
+            <button type="button" class="btn" data-key-save="openrouter">Save key</button>
+            <button type="button" class="btn btn-quiet" data-key-remove="openrouter">Remove</button>
+          </div>
+          <p class="key-status" id="key-status-openrouter"></p>
+        </div>
+      </section>
+      <section class="set-section set-grid">
+        <h3>Limits</h3>
+        <label>Largest file, MB <input type="number" id="max-file-mb" min="1" max="500" step="1"></label>
+        <label>Files per message <input type="number" id="max-files" min="1" max="200" step="1"></label>
+        <label>Pages per document <input type="number" id="max-pages" min="1" max="1000" step="1"></label>
+      </section>
+      <section class="set-section">
+        <h3 id="theme-heading">Theme</h3>
+        <div class="seg" role="radiogroup" aria-labelledby="theme-heading">
+          <label><input type="radio" name="theme" value="system"> System</label>
+          <label><input type="radio" name="theme" value="light"> Light</label>
+          <label><input type="radio" name="theme" value="dark"> Dark</label>
+        </div>
+      </section>
+      <p class="set-error" id="settings-error" role="alert" hidden></p>
+    </div>
+    <footer class="dialog-foot">
+      <span class="dialog-version" id="dialog-version"></span>
+      <button type="button" class="btn" id="settings-cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" id="settings-save">Save settings</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog class="dialog dialog-small" id="confirm-dialog" aria-labelledby="confirm-title">
+  <form method="dialog" class="dialog-inner">
+    <div class="dialog-body">
+      <h2 id="confirm-title">Delete this conversation?</h2>
+      <p id="confirm-text">Its messages are removed from this computer. Exported files you saved elsewhere stay.</p>
+    </div>
+    <footer class="dialog-foot">
+      <button type="submit" class="btn" value="cancel">Cancel</button>
+      <button type="submit" class="btn btn-danger" value="ok" id="confirm-ok">Delete</button>
+    </footer>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<input type="file" id="file-input" multiple hidden accept=".pdf,.png,.jpg,.jpeg,.webp,.tif,.tiff,.gif,.bmp,.docx,application/pdf,image/*,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+</body>
+</html>

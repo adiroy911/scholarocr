@@ -44,13 +44,19 @@ def _pid_alive(pid: int | None) -> bool:
         return False
 
 
+# Jobs running in this process, shared by every JobManager: several services can use one database in one
+# process (the web app keeps one per engine), and one must never mark another's running job as interrupted.
+_LOCAL_RUNNING: set[str] = set()
+_LOCAL_GUARD = threading.Lock()
+
+
 class JobManager:
     def __init__(self, repo: Repository, runner: Runner):
         self.repo = repo
         self.runner = runner
         self._threads: dict[str, threading.Thread] = {}
-        self._local_running: set[str] = set()
-        self._guard = threading.Lock()
+        self._local_running = _LOCAL_RUNNING
+        self._guard = _LOCAL_GUARD
 
     def recover_stale(self) -> list[str]:
         """Mark queued/running jobs whose process is gone as INTERRUPTED (resumable)."""

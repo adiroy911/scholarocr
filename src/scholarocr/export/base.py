@@ -212,6 +212,87 @@ def ce_to_math(latex: str) -> str:
     return "".join(out)
 
 
+# ------------------------------------------------------------------ questions and inline math
+def starts_with_question_number(number: str | None, text: str) -> bool:
+    """True when ``text`` already begins with the printed question number ("4. If", "Q4)", "(4)")."""
+    if not number:
+        return False
+    stripped = text.lstrip("*_ \\")
+    return re.match(rf"^(Q(uestion)?\.?\s*)?\(?{re.escape(number)}\b", stripped, re.I) is not None
+
+
+# $...$ not preceded by a backslash, not $$, no leading/trailing space inside (so "$5 and $10" stays text).
+INLINE_MATH = re.compile(r"(?<![\\$])\$(?!\$)(?=\S)([^$\n]+?)(?<=\S)(?<!\\)\$(?!\$)")
+
+
+def split_inline_math(text: str) -> list[tuple[str, bool]]:
+    """[(segment, is_math)] for a line of text with inline ``$...$`` math."""
+    out: list[tuple[str, bool]] = []
+    pos = 0
+    for m in INLINE_MATH.finditer(text):
+        if m.start() > pos:
+            out.append((text[pos:m.start()], False))
+        out.append((m.group(1), True))
+        pos = m.end()
+    if pos < len(text):
+        out.append((text[pos:], False))
+    return out
+
+
+_GREEK = {n: c for n, c in zip(
+    "alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa lambda mu nu xi pi varpi rho "
+    "sigma varsigma tau upsilon phi varphi chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi "
+    "Omega".split(), "αβγδεεζηθϑικλμνξπϖρσςτυφφχψωΓΔΘΛΞΠΣΥΦΨΩ")}
+_SYMBOLS = {"times": "×", "cdot": "·", "pm": "±", "mp": "∓", "div": "÷", "leq": "≤", "le": "≤", "geq": "≥",
+            "ge": "≥", "neq": "≠", "ne": "≠", "approx": "≈", "equiv": "≡", "sim": "∼", "propto": "∝",
+            "infty": "∞", "partial": "∂", "nabla": "∇", "int": "∫", "oint": "∮", "sum": "Σ", "prod": "Π",
+            "to": "→", "rightarrow": "→", "leftarrow": "←", "Rightarrow": "⇒", "leftrightarrow": "↔",
+            "rightleftharpoons": "⇌", "degree": "°", "circ": "°", "prime": "′", "in": "∈", "notin": "∉",
+            "subset": "⊂", "cup": "∪", "cap": "∩", "forall": "∀", "exists": "∃", "hbar": "ħ", "ell": "ℓ",
+            "angle": "∠", "perp": "⊥", "parallel": "∥", "cdots": "⋯", "ldots": "…", "dots": "…",
+            "langle": "⟨", "rangle": "⟩", ",": " ", ";": " ", "quad": " ", "qquad": "  ", "!": ""}
+_SUP = dict(zip("0123456789+-=()nix", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱˣ"))
+_SUB = dict(zip("0123456789+-=()aeoxijnmkt", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓᵢⱼₙₘₖₜ"))
+
+
+def _script(s: str, table: dict[str, str], mark: str) -> str:
+    s = s.strip()
+    if s and all(c in table for c in s):
+        return "".join(table[c] for c in s)
+    return f"{mark}({s})" if len(s) > 1 else f"{mark}{s}"
+
+
+def latex_to_readable(tex: str) -> str:
+    r"""Plain-text rendering of simple inline LaTeX for documents without native equations:
+    ``x^2`` -> ``x²``, ``\gamma_0`` -> ``γ₀``, ``\frac{a}{b}`` -> ``a/b``, ``\ce{SO4^2-}`` -> ``SO₄²⁻``.
+    Anything it does not know is kept as readable text (command names without backslashes)."""
+    s = tex
+    # \ce{...}: mhchem body -> subscripted formula with charges and arrows
+    def ce(m: re.Match) -> str:
+        body = m.group(1)
+        for arrow, repl in (("<=>", " ⇌ "), ("<->", " ↔ "), ("->", " → "), ("<-", " ← ")):
+            body = body.replace(arrow, repl)
+        body = re.sub(r"\^\{?([0-9]*[+-])\}?", lambda c: _script(c.group(1), _SUP, "^"), body)
+        body = re.sub(r"(?<=[A-Za-z)\]])(\d+)", lambda c: _script(c.group(1), _SUB, "_"), body)
+        return " ".join(body.split())
+    s = re.sub(r"\\ce\s*\{((?:[^{}]|\{[^{}]*\})*)\}", ce, s)
+    for _ in range(3):  # nested groups, innermost first
+        s = re.sub(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}",
+                   lambda m: (m.group(1) if len(m.group(1)) < 2 else f"({m.group(1)})") + "/"
+                   + (m.group(2) if len(m.group(2)) < 2 else f"({m.group(2)})"), s)
+        s = re.sub(r"\\sqrt\s*\{([^{}]*)\}", lambda m: "√" + (m.group(1) if len(m.group(1)) < 2 else f"({m.group(1)})"), s)
+        s = re.sub(r"\\(?:text|mathrm|mathbf|mathit|mathsf|mathcal|operatorname|boldsymbol|vec|bar|hat)\s*\{([^{}]*)\}",
+                   r"\1", s)
+    s = re.sub(r"\\([A-Za-z]+|[,;!])", lambda m: _GREEK.get(m.group(1)) or _SYMBOLS.get(m.group(1), m.group(1)), s)
+    for _ in range(3):
+        s = re.sub(r"\^\s*\{([^{}]*)\}", lambda m: _script(m.group(1), _SUP, "^"), s)
+        s = re.sub(r"_\s*\{([^{}]*)\}", lambda m: _script(m.group(1), _SUB, "_"), s)
+    s = re.sub(r"\^\s*(\\?[A-Za-z0-9+\-]|[α-ω])", lambda m: _script(m.group(1), _SUP, "^"), s)
+    s = re.sub(r"_\s*([A-Za-z0-9+\-]|[α-ω])", lambda m: _script(m.group(1), _SUB, "_"), s)
+    s = s.replace("\\left", "").replace("\\right", "").replace("{", "").replace("}", "")
+    return " ".join(s.split())
+
+
 # ------------------------------------------------------------------ tables
 @dataclass(frozen=True)
 class PlacedCell:

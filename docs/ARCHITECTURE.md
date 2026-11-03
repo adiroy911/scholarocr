@@ -1,6 +1,7 @@
 # Architecture
 
-ScholarOCR is one engine with three thin entry points (plus the hosted ChatGPT server). Agents never
+ScholarOCR is one engine with three thin entry points (plus the hosted ChatGPT server and the local web app,
+`scholarocr.webapp`, which drives Antigravity CLI headless as its host model; see WEB_APP.md). Agents never
 get their own OCR path. The vision model is either the MCP client's own model (**host mode**, the default,
 no API key) or a server-side key provider (Gemini or OpenRouter).
 

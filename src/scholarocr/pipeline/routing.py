@@ -17,7 +17,7 @@ def decide_route(entry: ManifestEntry, options: ProcessingOptions, media_type: s
     p = entry.profile
     if media_type.endswith("wordprocessingml.document"):
         return Route.DOCX_TEXT, "DOCX: deterministic text extraction"
-    if p.is_blank:
+    if p.is_blank and not options.force_visual:  # force_visual: the caller insists the page has content
         return Route.BLANK, "blank page"
     if not options.force_visual and p.has_text_layer and not p.is_scanned:
         reliable = (p.text_chars >= TEXT_MIN_CHARS and p.text_quality >= TEXT_MIN_QUALITY

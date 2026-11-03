@@ -16,8 +16,11 @@ description: >-
 3. Summarize findings by severity (`error`, `warning`, `info`) with page numbers and element ids.
    Errors must not be glossed over.
 4. For each element with uncertainty `high` or `unresolved` (at most 5; ask before doing more), call
-   `get_source_region` and compare the original crop with the extracted content. Never present
+   `get_source_region` and compare the original crop with the extracted content. Pass the `element_id`
+   from the finding or review candidate directly; use `get_page_content(compact=true)` only if you need
+   the page's other elements. Never present
    unresolved text as read by the engine; if you read it yourself from the crop, say so.
 5. End with a one-line verdict: is the extraction safe to rely on, and what should be re-checked.
 
-Uncertainty labels are ordinal, not probabilities. Do not turn them into percentages.
+Uncertainty labels are ordinal levels of doubt (`low` = reliable), not probabilities. Do not turn
+them into percentages. A `confirmed` review keeps its lowered label.

@@ -73,6 +73,7 @@ def user_settings(cfg: RemoteConfig, sandbox: UserSandbox, user_key: UserKey | N
         "max_file_mb": cfg.max_file_mb,
         "max_pages": cfg.max_pages,
         "retention_days": None,  # the remote janitor owns retention
+        "env_file": None,  # users cannot edit server settings: no env-file advice in errors
     })
 
 
@@ -121,7 +122,7 @@ class ServicePool:
             sandbox = self.sandbox(user_id)
             env = {k: v for k, v in self.environ.items() if k not in DROPPED_ENV_VARS}
             s = Settings.from_env(environ=env).model_copy(update={
-                "data_dir": sandbox.data_dir, "allowed_dirs": [sandbox.inbox], "retention_days": None,
+                "data_dir": sandbox.data_dir, "allowed_dirs": [sandbox.inbox], "retention_days": None, "env_file": None,
                 "max_file_mb": self.cfg.max_file_mb, "max_pages": self.cfg.max_pages})
             return ScholarOCR(s)
 

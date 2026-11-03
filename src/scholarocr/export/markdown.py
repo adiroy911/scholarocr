@@ -21,6 +21,7 @@ from .base import (
     ordered_pages,
     plain_text,
     region_image,
+    starts_with_question_number,
     unclear_text,
     write_text,
 )
@@ -74,8 +75,7 @@ def _question_wrap(el: Element, text: str) -> str:
     if q is None:
         return text
     prefix = f"**Q{q.number}** " if q.number else ""
-    stripped = text.lstrip("*_ \\")
-    if q.number and re.match(rf"^(Q(uestion)?\.?\s*)?\(?{re.escape(q.number)}\b", stripped, re.I):
+    if starts_with_question_number(q.number, text):
         prefix = ""  # the transcription already starts with the printed number
     suffix = f" *{marks_label(q.marks)}*" if q.marks and marks_label(q.marks) else ""
     if q.marks and re.search(rf"[\[(]\s*{re.escape(q.marks)}\s*(marks?|M)?\s*[\])]\s*$", text, re.I):

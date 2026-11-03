@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ExtractedType = Literal[
     "title", "heading", "subheading", "paragraph", "text", "handwriting", "equation", "chemical_equation",
@@ -68,7 +68,9 @@ class XElement(BaseModel):
     )
     uncertainty: UncertaintyLabel = Field(
         default="low",
-        description="low = clearly legible; medium = minor doubt; high = substantial doubt; unresolved = cannot be read.",
+        description="Doubt about THIS element's transcription. low = you would bet it is exact; medium = a "
+                    "specific character or word could differ; high = a guess among alternatives; unresolved = "
+                    "cannot be read.",
     )
     uncertainty_reasons: list[str] = Field(default_factory=list)
     handwritten: bool = False
@@ -82,8 +84,22 @@ class PageExtractionResponse(BaseModel):
     page_language: str | None = None
     page_label: str | None = Field(default=None, description="Printed page number, if visible.")
     rotation_detected: int = Field(default=0, description="Clockwise degrees (0/90/180/270) the image appears rotated.")
-    legibility: UncertaintyLabel = Field(default="low", description="Overall legibility of the page.")
+    page_doubt: UncertaintyLabel = Field(
+        default="low", description="Overall DOUBT about the page (not its quality): low = clean and readable, "
+                                   "high = mostly hard to read. Informational; element labels carry the doubt.")
     notes: list[str] = Field(default_factory=list, description="Problems such as cut-off text or missing regions.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_legibility(cls, data):
+        """``legibility`` is the pre-0.3 name of ``page_doubt`` (same scale: a level of doubt). It was misread
+        as "how legible", so it is accepted as an alias but no longer documented."""
+        if isinstance(data, dict) and "legibility" in data:
+            data = dict(data)
+            legacy = data.pop("legibility")
+            if data.get("page_doubt") is None and legacy is not None:
+                data["page_doubt"] = legacy
+        return data
 
 
 class ReviewResponse(BaseModel):

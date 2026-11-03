@@ -22,7 +22,7 @@ from ..exceptions import GeminiError, JobError, ScholarOCRError
 from ..ingestion.docx_input import read_docx_blocks
 from ..ingestion.loader import PageRenderer
 from ..intelligence import diagrams, reviewer
-from ..intelligence.extractor import VisualPageContext, convert_response, extract_page
+from ..intelligence.extractor import VisualPageContext, convert_response, extract_page, page_doubt_note
 from ..intelligence.gemini_client import GeminiClient
 from ..intelligence.prompts import PROMPT_VERSION
 from ..logging_config import get_logger
@@ -212,9 +212,22 @@ class Pipeline:
         page.original_image = self.store.rel(doc_id, orig_path)
 
         if route == Route.BLANK:
-            page.status = PageStatus.BLANK
-            page.quality = assess(original, dpi)
-            return self._finish(page, summary)
+            quality = assess(original, dpi)
+            if quality.is_blank:
+                page.status = PageStatus.BLANK
+                page.quality = quality
+                return self._finish(page, summary)
+            # The manifest's blank flag (low-resolution check, possibly from an older ingestion) disagrees with
+            # the full-resolution assessment: never skip a page that has ink.
+            unblanked = entry.model_copy(deep=True)
+            unblanked.profile.is_blank = False
+            media_type = renderer.manifest.sources[entry.source_file_index].media_type
+            route, reason = decide_route(unblanked, options, media_type)
+            page.route = route
+            page.warnings = [w for w in page.warnings if not w.startswith("route:") and w != "blank_page"]
+            page.warnings.insert(0, f"route: {reason}")
+            page.warnings.append(f"flagged blank at ingestion, but the full-resolution check found ink "
+                                 f"(ink_ratio {quality.ink_ratio}); processed instead of skipped")
 
         if route == Route.EMBEDDED_TEXT:
             pdf_page = renderer.pdf_page(entry)
@@ -295,6 +308,7 @@ class Pipeline:
         page.prompt_version = PROMPT_VERSION
         if resp.notes:
             page.warnings += [f"model note: {n}" for n in resp.notes]
+        page.warnings += page_doubt_note(resp)
         if info.repaired:
             page.warnings.append("extraction output required a repair request")
         structure.annotate(page.elements)

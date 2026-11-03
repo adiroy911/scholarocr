@@ -117,6 +117,14 @@ def convert_response(resp: PageExtractionResponse, ctx: VisualPageContext, *, mo
             el.parent_id = ids[ref]
         if etype == ElementType.TABLE and el.table and x.table and x.table.caption and not el.table.caption:
             el.table.caption = x.table.caption
-        apply_rules(el, quality=ctx.quality, page_legibility=resp.legibility)
+        apply_rules(el, quality=ctx.quality)
         elements.append(el)
     return elements
+
+
+def page_doubt_note(resp: PageExtractionResponse) -> list[str]:
+    """Page warnings for the model's overall page doubt. Recorded on the page only; it never raises the
+    labels of individual elements (see ``uncertainty``)."""
+    if resp.page_doubt in ("medium", "high", "unresolved"):
+        return [f"model note: overall page doubt reported as {resp.page_doubt}"]
+    return []

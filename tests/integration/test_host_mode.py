@@ -12,11 +12,11 @@ from mcp import Client
 from PIL import Image
 
 from scholarocr.config import Settings
-from scholarocr.exceptions import ModelUnavailableError, SubmissionRejected
+from scholarocr.exceptions import InputError, ModelUnavailableError, SubmissionRejected
 from scholarocr.mcp.server import build_server
 from scholarocr.pipeline import host
 from scholarocr.pipeline.checkpoints import load_page
-from scholarocr.schemas import PageStatus
+from scholarocr.schemas import PageStatus, ProcessingOptions
 from scholarocr.service import ScholarOCR
 from tests.fixtures.corpus import images_to_pdf, text_page_image
 from tests.fixtures.fake_gemini import FakeTransport, default_page
@@ -337,3 +337,108 @@ def test_user_env_file_is_lowest_precedence(tmp_path, monkeypatch):
     assert Settings.from_env().effective_provider == "host"
     monkeypatch.delenv("SCHOLAROCR_PROVIDER")  # unset = host by default, even with a key in the user file
     assert Settings.from_env().effective_provider == "host"
+
+
+# ---------------------------------------------------------------------------------------------- 0.3.0 regressions
+def _clean_page_png(path):
+    from tests.unit.test_regressions import clean_digital_page
+
+    clean_digital_page().save(path, dpi=(150, 150))
+    return path
+
+
+def test_clean_digital_page_image_is_not_routed_blank(svc, tmp_path):
+    r = svc.process(_clean_page_png(tmp_path / "arxiv_like.png"))
+    assert r["awaiting_transcription"] == [1] and "blank_pages" not in r
+    assert not any("skipped as blank" in w for w in r["warnings"])
+
+
+def test_blank_skip_is_warned_and_force_visual_reprocess_reads_it(svc, tmp_path):
+    from PIL import Image as PILImage
+
+    blank = tmp_path / "blank.png"
+    PILImage.new("RGB", (1200, 1600), "white").save(blank)
+    r = svc.process(blank)
+    assert r["blank_pages"] == [1] and any("skipped as blank" in w and "force_visual=true" in w for w in r["warnings"])
+    r2 = svc.process(blank, ProcessingOptions(force_visual=True, reprocess=True))
+    assert r2["awaiting_transcription"] == [1] and "blank_pages" not in r2
+
+
+def test_stale_blank_flag_is_rebuilt_on_reprocess_and_checked_at_full_resolution(svc, tmp_path):
+    src = _clean_page_png(tmp_path / "stale.png")
+    doc = svc.process(src)["document_id"]
+    mpath = svc.store.doc_dir(doc) / "manifest.json"
+    m = json.loads(mpath.read_text(encoding="utf-8"))
+    m["pages"][0]["profile"]["is_blank"] = True  # what the 0.2 detector stored for such pages
+    mpath.write_text(json.dumps(m), encoding="utf-8")
+    svc.delete(doc)  # forget the extracted page; keep the (stale) manifest
+    r = svc.process(src)
+    assert r["awaiting_transcription"] == [1]  # full-resolution check overrules the stale flag
+    page = load_page(svc.store, doc, 1)
+    assert any("full-resolution check found ink" in w for w in page.warnings)
+    r = svc.process(src, ProcessingOptions(reprocess=True))
+    assert not svc.load_manifest(doc).pages[0].profile.is_blank and r["awaiting_transcription"] == [1]
+
+
+def test_page_doubt_does_not_raise_element_labels(svc, corpus):
+    doc = svc.process(corpus["math_paper.pdf"])["document_id"]
+    page = valid_page()
+    page.pop("legibility", None)
+    out = svc.submit_page_content(doc, 1, {**page, "page_doubt": "high"})
+    assert out["uncertainty"].get("low", 0) >= 6  # clean elements stay clean
+    p = load_page(svc.store, doc, 1)
+    assert "model note: overall page doubt reported as high" in p.warnings
+    out = svc.submit_page_content(doc, 1, {**page, "legibility": "high"})  # deprecated name: same meaning
+    assert any("old name of page_doubt" in w for w in out["warnings"]) and out["uncertainty"].get("low", 0) >= 6
+
+
+def test_confirmed_review_is_not_re_raised_by_the_same_rule(svc, corpus):
+    doc = svc.process(corpus["math_paper.pdf"])["document_id"]
+    page = valid_page()
+    page["elements"].append({"type": "chemical_equation", "text": "CH4 + Cl2 CH3Cl",
+                             "latex": r"\ce{CH4 + Cl2 CH3Cl}", "box_2d": [800, 100, 830, 600]})
+    svc.submit_page_content(doc, 1, page)
+    el = next(e for e in load_page(svc.store, doc, 1).elements if e.type.value == "chemical_equation")
+    assert el.uncertainty.value == "medium" and "chemistry: reaction without an arrow" in el.uncertainty_reasons
+    res = svc.submit_review(doc, el.element_id, {"verdict": "confirmed", "uncertainty": "low"})
+    assert res["uncertainty"] == "low"
+    _, again = svc.find_element(doc, el.element_id)
+    assert again.uncertainty.value == "low"
+
+
+def test_verify_collapses_unselected_pages_and_compact_page_content(svc, corpus):
+    doc = svc.process(corpus["mixed.pdf"], ProcessingOptions(pages="1"))["document_id"]
+    report = svc.verify(doc)
+    not_processed = [f for f in report.findings if f.check == "completeness"]
+    assert len(not_processed) == 1 and not_processed[0].severity.value == "info"
+    assert "not selected" in not_processed[0].message and not_processed[0].data["pages"] == [2, 3]
+    full = svc.get_page(doc, 1)
+    compact = svc.get_page(doc, 1, compact=True)
+    assert len(json.dumps(compact)) < len(json.dumps(full)) / 2
+    el = compact["elements"][0]
+    assert set(el) <= {"element_id", *svc.COMPACT_FIELDS, "bbox"} and "source" not in el
+    only = svc.get_page(doc, 1, fields=["type"])
+    assert all(set(e) == {"element_id", "type"} for e in only["elements"])
+    with pytest.raises(InputError):
+        svc.get_page(doc, 1, fields=["nope"])
+
+
+async def test_malformed_elements_over_mcp_get_the_validator_answer(settings, corpus):
+    server = build_server(ScholarOCR(settings))
+    async with Client(server) as c:
+        doc = (await c.call_tool("ocr_document", {"file_path": str(corpus["math_paper.pdf"])})).structured_content[
+            "document_id"]
+        bad = await c.call_tool("submit_page_content", {"document_id": doc, "page_number": 1,
+                                                        "elements": [0, 1, 2]})
+        assert bad.is_error
+        text = bad.content[0].text
+        err = json.loads(text[text.index("{"):])
+        assert err["error"] == "submission_rejected" and "validation error" not in text
+        assert [e["path"] for e in err["details"]["errors"]] == ["elements[0]", "elements[1]", "elements[2]"]
+        page = valid_page()
+        ok = await c.call_tool("submit_page_content", {"document_id": doc, "page_number": 1,
+                                                       "elements": json.dumps(page["elements"]),
+                                                       "page_doubt": "low"})
+        assert not ok.is_error and ok.structured_content["accepted"]
+        compact = await c.call_tool("get_page_content", {"document_id": doc, "page_number": 1, "compact": True})
+        assert "source" not in compact.structured_content["elements"][0]

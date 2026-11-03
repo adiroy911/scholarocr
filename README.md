@@ -13,7 +13,7 @@ does every deterministic step and hands that model one page image at a time (**h
 OpenRouter key is optional and switches to ScholarOCR's dedicated server-side OCR pipeline.
 
 ```
-Antigravity CLI (plugin) · Claude Code · ChatGPT (hosted) · other MCP clients · scripts
+Antigravity CLI (plugin) · Claude Code · ChatGPT (hosted) · web app · other MCP clients · scripts
         │ MCP (stdio/HTTP)          │ CLI          │ Python
         └────────────► ScholarOCR service ◄────────┘
      ingestion → routing → text layer (no model)
@@ -70,6 +70,7 @@ been measured for either mode yet.
 | Local MCP server (14 tools) | implemented; tested in-process and over a real stdio subprocess |
 | Hosted ChatGPT app server (`scholarocr-remote`, OAuth, optional key) | implemented; tested in-process and over ASGI HTTP. **No live ChatGPT test yet**; the page-image widget path for host mode is unverified (docs/CHATGPT_APP.md) |
 | CLI | implemented; tested via subprocess |
+| Web app (`scholarocr-app`) | implemented; API, engine selection, agy runner (subprocess mocked) and key path (fake transport) tested; driven in a real browser; one live Antigravity run on a 2-page scan (161.8k tokens, 5 min 46 s, docs/WEB_APP.md) |
 | Claude Code skill | written; tested with headless Claude Code 2.1.316 (Linux) in key mode |
 | Windows | developed and tested on Windows 11; one known test failure (`test_path_policy_blocks_outside_and_traversal`) |
 | Accuracy on real scans | **not measured yet**; evaluation framework ready |
@@ -93,6 +94,20 @@ SCHOLAROCR_ALLOWED_DIRS=C:\Users\you\Documents;D:\Study
 Start `agy` and ask it to read a document ("extract the scanned exam in D:\Study\chem and list anything
 unreadable"). Keys are optional. Details, headless runs and the verified result:
 [docs/ANTIGRAVITY_PLUGIN.md](docs/ANTIGRAVITY_PLUGIN.md).
+
+## Quick start: web app (no key)
+
+```bash
+pip install -e ".[webapp]"      # from a checkout; see Quick start: CLI and Python
+scholarocr-app --open           # http://127.0.0.1:8765/ on this computer only
+```
+
+A chat-style page: attach PDFs, page photos or DOCX files, add instructions, and read the result page by page
+(math, chemistry, tables, question numbers and marks, doubtful parts highlighted, source crop on click),
+with verification, exports and follow-up questions answered from the extracted content. By default the pages are
+read by Antigravity CLI (`agy`) signed in with your Google account, one headless `agy -p` call per page; a Gemini
+or OpenRouter key saved in Settings switches to the server-side pipeline. Details and measured cost per page:
+[docs/WEB_APP.md](docs/WEB_APP.md).
 
 ## Quick start: CLI and Python
 
@@ -130,6 +145,7 @@ and the config snippet `examples/claude_code.mcp.json`.
 | [GEMINI_INTEGRATION](docs/GEMINI_INTEGRATION.md) | key mode: SDK usage, routing, prompts, retries, usage, verification status |
 | [ANTIGRAVITY_PLUGIN](docs/ANTIGRAVITY_PLUGIN.md) | the Antigravity CLI plugin: install, config, headless runs, layout, Marketplace |
 | [MCP_INTEGRATION](docs/MCP_INTEGRATION.md) | tools, host mode loop, client support, Antigravity, Claude Code, shared HTTP server |
+| [WEB_APP](docs/WEB_APP.md) | the local web app: engines, the Antigravity page loop, measured cost, security |
 | [CHATGPT_APP](docs/CHATGPT_APP.md) | hosted server for ChatGPT: OAuth, optional key, host mode in ChatGPT, deployment |
 | [CLAUDE_CODE_SKILL](docs/CLAUDE_CODE_SKILL.md) | skill content, install, test |
 | [CLI_REFERENCE](docs/CLI_REFERENCE.md) | commands and exit codes |

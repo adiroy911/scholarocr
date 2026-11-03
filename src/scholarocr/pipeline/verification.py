@@ -18,7 +18,8 @@ from ..schemas import (Document, ElementType, Finding, Manifest, PageStatus, Rol
                        VerificationReport)
 from ..schemas.elements import HEADING_TYPES, MATH_TYPES, VISUAL_TYPES
 from ..storage import ArtifactStore
-from ..utils import now_iso
+from ..exceptions import InputError
+from ..utils import compact_ranges, now_iso, parse_page_range
 
 ALL_SCOPES = ["completeness", "duplicates", "page_order", "content", "reading_order", "math", "tables", "structure",
               "uncertainty", "traceability", "exports"]
@@ -37,14 +38,28 @@ def verify(document: Document, manifest: Manifest, store: ArtifactStore, *, scop
         f.append(Finding(check=check, severity=sev, message=msg, page_number=page, element_id=el, data=data))
 
     if "completeness" in scopes:
+        # Pages outside the last run's page selection were simply not asked for: one info finding for all of
+        # them instead of a warning per page. A selected page that is still unprocessed is a warning.
+        last_pages = ((document.processing or {}).get("last_options") or {}).get("pages")
+        try:
+            wanted = set(parse_page_range(last_pages, len(manifest.pages))) if last_pages else None
+        except (ValueError, InputError):
+            wanted = None
+        unselected: list[int] = []
         for e in manifest.pages:
             p = pages.get(e.page_number)
             if p is None or p.status == PageStatus.PENDING:
-                add("completeness", Severity.WARNING, "page not processed", e.page_number)
+                if wanted is not None and e.page_number not in wanted:
+                    unselected.append(e.page_number)
+                else:
+                    add("completeness", Severity.WARNING, "page not processed", e.page_number)
             elif p.status == PageStatus.FAILED:
                 add("completeness", Severity.ERROR, f"page extraction failed: {p.error}", e.page_number)
             elif p.status == PageStatus.BLANK:
                 add("completeness", Severity.INFO, "blank page (no content expected)", e.page_number)
+        if unselected:
+            add("completeness", Severity.INFO, f"{len(unselected)} page(s) not processed because they were not "
+                f"selected (pages={last_pages!r}): {compact_ranges(unselected)}", pages=unselected)
 
     if "duplicates" in scopes:
         for e in manifest.pages:

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from .exceptions import AccessDeniedError, InputError, LimitExceededError
 
 
 class PathPolicy:
-    def __init__(self, allowed_dirs: list[Path], max_file_mb: float):
+    def __init__(self, allowed_dirs: list[Path], max_file_mb: float, *, env_file: Path | None = None):
         self.allowed = [Path(d).expanduser().resolve() for d in allowed_dirs]
         self.max_bytes = int(max_file_mb * 1024 * 1024)
+        self.env_file = env_file  # the settings file the user edits (SCHOLAROCR_ENV_FILE or the default)
 
     def check_file(self, raw: str | Path) -> Path:
         """Resolve ``raw`` (following symlinks) and ensure it lies inside an allowed dir."""
@@ -51,7 +53,16 @@ class PathPolicy:
         return any(p == root or p.is_relative_to(root) for root in self.allowed)
 
     def _deny_message(self, p: Path) -> str:
+        sep = os.pathsep
+        if self.env_file is None:  # remote server / web app: the user does not manage the setting
+            return (f"Access denied: {p} is outside the authorized directories. "
+                    "Add its folder to SCHOLAROCR_ALLOWED_DIRS to allow it.")
+        where = f"in {self.env_file}"
+        current = sep.join(str(d) for d in self.allowed)
+        folder = p.parent if p.suffix else p
         return (
-            f"Access denied: {p} is outside the authorized directories. "
-            "Add its folder to SCHOLAROCR_ALLOWED_DIRS to allow it."
+            f"Access denied: {p} is outside the authorized directories. To allow it, APPEND its folder to "
+            f"SCHOLAROCR_ALLOWED_DIRS {where}, separated by '{sep}' and keeping the existing entries "
+            f"(SCHOLAROCR_ALLOWED_DIRS={current}{sep}{folder}), then restart the client. Replacing the value "
+            "would revoke the folders already allowed."
         )

@@ -424,10 +424,17 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
                                                        fmt=format, max_chars=max_chars, cursor=cursor))
 
     @mcp.tool(annotations=_ann(True), meta=tool_meta())
-    def get_page_content(document_id: str, page_number: Annotated[int, Field(ge=1)]) -> CallToolResult:
-        """Full structured IR of one page: elements with type, content, LaTeX, tables, bounding boxes,
-        uncertainty, reading order and source references."""
-        return run(lambda uid: svc_ro(uid).get_page(document_id, page_number))
+    def get_page_content(
+        document_id: str,
+        page_number: Annotated[int, Field(ge=1)],
+        compact: Annotated[bool, Field(description="Only id, type, role, content, latex, uncertainty (+reasons), "
+                                       "question and bbox per element.")] = False,
+        fields: Annotated[list[str] | None, Field(description="Keep only these element fields; element_id is "
+                                                  "always kept.")] = None,
+    ) -> CallToolResult:
+        """Structured IR of one page: elements with type, content, LaTeX, tables, bounding boxes, uncertainty,
+        reading order and source references. Use compact=true or fields=[...] unless you need everything."""
+        return run(lambda uid: svc_ro(uid).get_page(document_id, page_number, compact=compact, fields=fields))
 
     @mcp.tool(annotations=_ann(True), meta=tool_meta())
     def get_source_region(
@@ -488,23 +495,31 @@ def build_remote_server(cfg: RemoteConfig, *, store: AuthStore, pool: ServicePoo
     def submit_page_content(
         document_id: str,
         page_number: Annotated[int, Field(ge=1)],
-        elements: Annotated[list[dict[str, Any]], Field(description=(
+        # Typed loosely on purpose: a malformed list (e.g. [0, 1, 2]) or a JSON string must reach
+        # validate_submission, which answers with path/problem/fix instead of a raw pydantic error.
+        elements: Annotated[list[Any] | str, Field(description=(
             "Elements in reading order. Each: {type, text, latex?, role?, level?, items?, table?, figure?, "
-            "question?, box_2d:[ymin,xmin,ymax,xmax] 0-1000, uncertainty: low|medium|high|unresolved, "
+            "question?, box_2d:[ymin,xmin,ymax,xmax] 0-1000, uncertainty (doubt): low|medium|high|unresolved, "
             "uncertainty_reasons?, handwritten?, language?, caption_of?, parent_index?}. "
             "See get_page_image(instructions='full') for examples."))],
         page_language: Annotated[str | None, Field(description="BCP-47 code, e.g. 'en'.")] = None,
         page_label: Annotated[str | None, Field(description="Printed page number, if visible.")] = None,
-        legibility: Annotated[str, Field(description="Overall doubt: low|medium|high|unresolved.")] = "low",
+        page_doubt: Annotated[str | None, Field(description="Overall DOUBT about the page (not quality): low "
+                                                "for a clean page | medium | high | unresolved.")] = None,
         rotation_detected: Annotated[int, Field(description="0, or 90/180/270 if the image is rotated clockwise.")] = 0,
         notes: Annotated[list[str] | None, Field(description="Problems such as cut-off text.")] = None,
+        legibility: Annotated[str | None, Field(description="Deprecated old name of page_doubt.")] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> CallToolResult:
         """HOST MODE: store your transcription of one page (from get_page_image). Strictly validated; on
         rejection every problem is listed with its path and a fix, nothing is stored, and you resubmit the
         complete page. Returns counts, review_suggested and the next waiting page."""
-        payload = {"elements": elements, "page_language": page_language, "page_label": page_label,
-                   "legibility": legibility, "rotation_detected": rotation_detected, "notes": notes or []}
+        payload: dict[str, Any] = {"elements": elements, "page_language": page_language, "page_label": page_label,
+                                   "rotation_detected": rotation_detected, "notes": notes or []}
+        if page_doubt is not None:
+            payload["page_doubt"] = page_doubt
+        if legibility is not None:
+            payload["legibility"] = legibility
         who = client_name(ctx)
         return run(lambda uid: pool.get(uid).submit_page_content(document_id, page_number, payload, transcriber=who))
 

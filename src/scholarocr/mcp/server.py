@@ -150,10 +150,18 @@ def build_server(service: ScholarOCR | None = None) -> MCPServer:
                      max_chars=max_chars, cursor=cursor)
 
     @mcp.tool(annotations=READ_ONLY)
-    def get_page_content(document_id: str, page_number: Annotated[int, Field(ge=1)]) -> dict[str, Any]:
-        """Full structured IR of one page: elements with type, content, LaTeX, tables, bounding boxes,
-        uncertainty, reading order, source references, quality metrics and preprocessing applied."""
-        return _call(svc().get_page, document_id, page_number)
+    def get_page_content(
+        document_id: str,
+        page_number: Annotated[int, Field(ge=1)],
+        compact: Annotated[bool, Field(description="Only id, type, role, content, latex, uncertainty (+reasons), "
+                                       "question and bbox per element: a fraction of the full size.")] = False,
+        fields: Annotated[list[str] | None, Field(description="Keep only these element fields, e.g. "
+                                                  "['type','latex','uncertainty']; element_id is always kept.")] = None,
+    ) -> dict[str, Any]:
+        """Structured IR of one page: elements with type, content, LaTeX, tables, bounding boxes, uncertainty,
+        reading order, source references, quality metrics and preprocessing. The full record is large; use
+        compact=true or fields=[...] unless you need everything."""
+        return _call(svc().get_page, document_id, page_number, compact=compact, fields=fields)
 
     @mcp.tool(annotations=READ_ONLY, structured_output=False)
     def get_source_region(
@@ -193,25 +201,33 @@ def build_server(service: ScholarOCR | None = None) -> MCPServer:
     def submit_page_content(
         document_id: str,
         page_number: Annotated[int, Field(ge=1)],
-        elements: Annotated[list[dict[str, Any]], Field(description=(
+        # Typed loosely on purpose: a malformed list (e.g. [0, 1, 2]) or a JSON string must reach
+        # validate_submission, which answers with path/problem/fix instead of a raw pydantic error.
+        elements: Annotated[list[Any] | str, Field(description=(
             "Elements in reading order. Each: {type, text, latex?, role?, level?, items?, table?, figure?, "
-            "question?, box_2d:[ymin,xmin,ymax,xmax] 0-1000, uncertainty: low|medium|high|unresolved, "
+            "question?, box_2d:[ymin,xmin,ymax,xmax] 0-1000, uncertainty (doubt): low|medium|high|unresolved, "
             "uncertainty_reasons?, handwritten?, language?, caption_of?, parent_index?}. "
             "See get_page_image(instructions='full') for examples."))],
         page_language: Annotated[str | None, Field(description="BCP-47 code, e.g. 'en'.")] = None,
         page_label: Annotated[str | None, Field(description="Printed page number, if visible.")] = None,
-        legibility: Annotated[str, Field(description="Overall doubt: low|medium|high|unresolved.")] = "low",
+        page_doubt: Annotated[str | None, Field(description="Overall DOUBT about the page (not quality): low "
+                                                "for a clean page | medium | high | unresolved.")] = None,
         rotation_detected: Annotated[int, Field(description="0, or 90/180/270 if the IMAGE is rotated clockwise "
                                                 "(the server re-orients it and asks you again).")] = 0,
         notes: Annotated[list[str] | None, Field(description="Problems such as cut-off text.")] = None,
+        legibility: Annotated[str | None, Field(description="Deprecated old name of page_doubt.")] = None,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> dict[str, Any]:
         """HOST MODE: store your transcription of one page (from get_page_image). Validated strictly against
         the document schema; on rejection you get every problem with its path and a fix, nothing is stored,
         and you resubmit the complete page. On success: element/uncertainty counts, review_suggested and the
         next page waiting."""
-        payload = {"elements": elements, "page_language": page_language, "page_label": page_label,
-                   "legibility": legibility, "rotation_detected": rotation_detected, "notes": notes or []}
+        payload: dict[str, Any] = {"elements": elements, "page_language": page_language, "page_label": page_label,
+                                   "rotation_detected": rotation_detected, "notes": notes or []}
+        if page_doubt is not None:
+            payload["page_doubt"] = page_doubt
+        if legibility is not None:
+            payload["legibility"] = legibility
         return _call(svc().submit_page_content, document_id, page_number, payload, transcriber=client_name(ctx))
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,

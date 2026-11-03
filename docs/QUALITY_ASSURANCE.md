@@ -16,17 +16,36 @@ percentage is derived from them. The rules are in `intelligence/uncertainty.py`:
    - LaTeX fails the syntax checks → at least `high`
    - chemistry checks fail → `medium` or `high`
    - table structure issues → at least `medium`
-   - the model reports page legibility `high` or `unresolved` → at least `medium`
    - page graded `poor` and the element is math, a table or handwriting → at least `medium`
-   - handwriting on a `fair` or `poor` page → at least `medium`
    - visual, math or table elements with no box get a "no bounding box" reason
+
+   The model's page-level `page_doubt` (called `legibility` before 0.3.0, still accepted) is recorded as a
+   page warning and does NOT raise element labels. In 0.2.0 it did, and a model that read "legibility:
+   high" as "very legible" put every element of a clean page at "some doubt". For the same reason a page
+   graded `fair` (a single minor issue such as small glyphs or skew) no longer raises every handwritten
+   element to `medium`; a `poor` page still does.
+   Host models are told what each element label means: `low` = they would bet the transcription is exact,
+   `medium` = a specific character or word could differ, `high` = a guess among alternatives,
+   `unresolved` = cannot read; and to judge every element on its own instead of labelling a whole page.
 3. **Targeted review** sends a crop of the original page to the review model:
-   - `confirmed` → one step lower (`unresolved` stays)
+   - `confirmed` → one step lower (`unresolved` stays). The deterministic rules are not re-run after a
+     confirmation, so the rule the reviewer just checked cannot raise the label again
    - `corrected` → content replaced and the old value kept in `revisions`; label becomes at least `medium`
    - `unreadable` → `unresolved`
 
 Reviews are selected per page: medium/high/unresolved elements that have a box, up to 8 per page.
 With `detail="high"`, every equation and table is reviewed as well.
+
+## Blank pages (`ingestion/loader.py`)
+
+A page is skipped as blank only when a 400 px thumbnail AND the page at its own resolution (for PDFs: a
+100 dpi render) both show no ink. Ink means pixels darker than the paper level (90th percentile) by 40
+grey levels; blank = ink below 0.04 % of the page or less than 30 grey levels between paper and the darkest
+marks. A fixed "darker than 128" count on the thumbnail (0.2.0) missed clean digital pages, whose thin
+strokes are anti-aliased to light grey when downscaled: a 150 dpi arXiv page measured ink 0.0002 and was
+skipped. As a further guard, a page flagged blank in the manifest is still assessed at full resolution
+before it is skipped. `ocr_document` warns about every page skipped as blank (`blank_pages`);
+`force_visual=true` never takes the blank route and `reprocess=true` re-measures the manifest.
 
 ## Page quality (OpenCV, `preprocessing/quality.py`)
 
@@ -112,6 +131,7 @@ Windows privilege the test account lacks (WinError 1314). The skips are pandoc/X
 | Integration | pipeline with a scripted fake model, MCP in-process + real stdio subprocess (including a host-mode page), CLI subprocess, end-to-end |
 | Host mode (`tests/integration/test_host_mode.py`) | provider precedence (10 cases) and the user env file; explicit host never touches an injected transport; text-layer PDFs need no submission; mixed PDFs; the full loop (image served, valid submission stored, boxes mapped into the page, crops, content/verify/export, zero model calls); multi-page one-image-per-call with full-then-short instructions and cache reuse; switching to a key re-extracts; every validation error reported in one round, nothing stored; lenient normalisation, resubmission and refused pages; reported rotation; host review and figure description; classify refused; the loop over MCP |
 | Remote (`tests/remote`) | sandbox, tool surface and widgets, optional key / host mode / operator key never used / link-unlink, limits and retention, round trip, OAuth over ASGI including consent without a key and the one-time key page |
+| Web app (`tests/webapp`) | localhost-only checks (Host, token, Origin, cross-site), CSP and no HTML sinks in the page script, upload sniffing, size and count limits, saved instructions across restarts, engine selection and model caching, key storage (file and keychain, never returned), the agy runner with a fake subprocess (command line, settings file, schema, stream parsing, error status, timeout and cancel kill), the read loop (instructions reach the prompt, rejection retried with the errors through the same agy conversation, two-retry limit, timeout, cancel), photos as one document, grounded chat, and the Gemini key path with a fake transport. 49 tests; the real `agy` is never started |
 | Antigravity plugin (`tests/unit/test_antigravity_plugin.py`) | manifest and versions agree (pyproject, `__version__`, `plugin.json`); root `skills/` holds only the plugin skills; `mcp_config.json` declares no variables; the staging script copies only plugin files |
 | Live (`tests/live`, opt-in) | not run by default |
 

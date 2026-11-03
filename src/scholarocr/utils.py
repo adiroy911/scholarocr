@@ -64,3 +64,17 @@ def parse_page_range(spec: str | None, total: int) -> list[int]:
 
 def natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def compact_ranges(numbers: list[int]) -> str:
+    """[1, 2, 3, 5, 7, 8] -> "1-3, 5, 7-8"."""
+    out: list[str] = []
+    nums = sorted(set(numbers))
+    i = 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if i == j else f"{nums[i]}-{nums[j]}")
+        i = j + 1
+    return ", ".join(out)

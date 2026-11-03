@@ -98,6 +98,7 @@ class Settings(BaseModel):
     pricing_file: Path | None = None
     retention_days: float | None = None  # delete generated artifacts of documents idle this long
     text_layer_font: Path | None = None
+    env_file: Path | None = None  # user-level settings file in effect (from_env); named in access_denied advice
 
     @field_validator("provider")
     @classmethod
@@ -247,6 +248,7 @@ class Settings(BaseModel):
         allowed = get("SCHOLAROCR_ALLOWED_DIRS")
         if allowed:
             kw["allowed_dirs"] = [Path(p).expanduser() for p in allowed.split(os.pathsep) if p.strip()]
+        kw["env_file"] = user_env_file(env)
         settings = cls(**kw)
         settings.data_dir = settings.data_dir.expanduser()
         return settings

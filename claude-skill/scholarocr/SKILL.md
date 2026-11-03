@@ -60,7 +60,8 @@ reliable text layer) and gives you page/element references.
   dedicated OCR prompt plus a second model. Say so when exactness matters.
 - `classify_document` needs a key; in host mode classify from the content yourself.
 - File access is limited to the server's authorized directories; on `access_denied`, tell the user
-  to add the folder to `SCHOLAROCR_ALLOWED_DIRS` rather than copying files around.
+  to append the folder to `SCHOLAROCR_ALLOWED_DIRS` in the settings file the error names (keeping the
+  existing entries) rather than copying files around.
 
 ## CLI fallback (no MCP available)
 

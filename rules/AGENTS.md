@@ -10,6 +10,14 @@ Always go through the server: it renders and cleans up pages, uses the PDF text 
 reliable, validates and stores what is read, and keeps every element traceable to its source region.
 Never guess unreadable content.
 
+**Never run shell commands** (`dir`, `ls`, `Get-ChildItem`, `type`, `cat`, scripts) and never list or
+read the plugin's, the server's or other documents' files to learn formats or to debug. In headless runs a
+denied command can end the whole turn with an empty answer. Everything you need is in the tool
+descriptions and in `get_page_image(instructions="full")`. If you are unsure how to encode something,
+call that, choose the closest element type and explain in `notes`. If a page comes back blank or empty
+but seems to have content, tell the user (`ocr_document(..., force_visual=true, reprocess=true)` re-reads
+it).
+
 ## Two modes
 
 `ocr_document` reports `"mode"`:
@@ -24,12 +32,21 @@ Never guess unreadable content.
 
 1. `get_page_image(document_id)` returns ONE page image plus the transcription rules and the exact
    element JSON shape (full rules the first time, a short reminder afterwards).
-2. Transcribe that image exactly, working only from what you see. Coordinates: `box_2d = [ymin, xmin,
+2. Transcribe that image exactly, working only from what you see. Use the returned image, not the
+   original file: the server may have cropped, rotated or deskewed it, and boxes refer to it. Do not search
+   the web or use what you know about the source to fill in or "correct" the page. Coordinates: `box_2d = [ymin, xmin,
    ymax, xmax]`, integers 0-1000 of that image, estimated by eye (approximate is fine; omit it if you
-   cannot place an element). Never run code, scripts or shell commands to measure or inspect the image:
-   ScholarOCR's tools are all you need. Math as LaTeX, chemistry as `\ce{...}`, tables as rows of cells, figures with a
-   description. Anything you cannot read: type `uncertain` with uncertainty `unresolved`. Do not guess.
-3. `submit_page_content(document_id, page_number, elements=[...], page_language=..., page_label=...)`.
+   cannot place an element). Never run code, scripts or shell commands to measure or inspect the image.
+   Math as LaTeX (inline math as `$...$`, never Unicode such as "γ0"), chemistry as `\ce{...}`, tables as
+   rows of cells, figures with a description. Anything you cannot read: type `uncertain` with uncertainty
+   `unresolved`. Do not guess.
+   Each element's `uncertainty` is your DOUBT about that element (not page quality): `low` = you would
+   bet the transcription is exact; `medium` = a specific character or word could differ; `high` = a guess
+   among alternatives; `unresolved` = cannot read. Judge every element on its own and give the reason in
+   `uncertainty_reasons`; never blanket-label a page (a clean print is mostly `low`).
+3. `submit_page_content(document_id, page_number, elements=[...], page_language=..., page_label=...,
+   page_doubt=...)`. `page_doubt` is the overall doubt (`low` for a clean page); it is informational and
+   does not change element labels. (`legibility` is its deprecated old name.)
    - Rejected (`submission_rejected`): the error lists every problem with its JSON path and a fix.
      Fix all of them and resubmit the whole page. Nothing was stored.
    - Accepted: it returns `next_waiting_page`. Continue with step 1 until none is left.
@@ -53,7 +70,7 @@ formulas). The user can switch to the dedicated pipeline by configuring a key
 | `submit_page_content` | Host mode: store your transcription of that page (strictly validated). |
 | `submit_review` | Second pass on one element after looking at its crop; also describes figures. |
 | `get_document_content` | Read extracted content, narrowed by `pages` and `element_types`. Markdown by default, paginated with `next_cursor`. |
-| `get_page_content` | Full structured record of one page: bounding boxes, uncertainty reasons, quality, transforms. |
+| `get_page_content` | Structured record of one page. Pass `compact=true` (or `fields=[...]`) unless you need everything: the full record (quality, transforms, sources, revisions) is large. |
 | `get_source_region` | Get the ORIGINAL image crop of an element (or a page region) to check uncertain content. |
 | `verify_document` | Quality checks: missing/duplicate/failed pages, page gaps, invalid LaTeX, table structure, question numbering, unresolved regions, traceability, stale exports. |
 | `export_document` | Write a file (json, markdown, searchable-pdf, docx, latex, csv, xlsx) from the stored extraction. No OCR is re-run. |
@@ -69,7 +86,9 @@ formulas). The user can switch to the dedicated pipeline by configuring a key
 3. In host mode, run the loop above for the pages in `awaiting_transcription`.
 4. `get_document_content(document_id, pages=..., element_types=[...])`. Ask only for what the task needs.
 5. For any element you rely on that is not `low` uncertainty, call
-   `get_source_region(document_id, element_id=...)` and read the original crop.
+   `get_source_region(document_id, element_id=...)` and read the original crop. The `element_id` in a
+   `verify_document` finding or review candidate can be passed to `get_source_region` directly; there is
+   no need to read the whole page first.
 6. `verify_document(document_id)` before high-stakes use (solutions, grading, conversions). Report
    `error` and `warning` findings that affect the user's task.
 7. `export_document(document_id, format)` only when the user wants a file. Tell them the output path.
@@ -78,8 +97,9 @@ formulas). The user can switch to the dedicated pipeline by configuring a key
 ## Uncertainty semantics
 
 - Markdown anchors look like `<!-- el:ID uncertainty=high -->`; `⟦unclear: …⟧` marks unreadable regions.
-- Labels `low`, `medium`, `high`, `unresolved` are ordinal judgements, not probabilities. Never quote a
-  percentage or treat them as confidence scores.
+- Labels `low`, `medium`, `high`, `unresolved` are ordinal levels of DOUBT, not probabilities: `low`
+  means clean and reliable, `high` means doubtful. Never quote a percentage or treat them as confidence
+  scores. The same holds for `page_doubt`.
 - Never present `medium`, `high` or `unresolved` content as certain. Say what is uncertain and, when it
   matters, check the source crop.
 - `unresolved` content was not guessed. Do not fill it in. Tell the user it was unreadable and where
@@ -100,11 +120,12 @@ formulas). The user can switch to the dedicated pipeline by configuring a key
 Tool errors carry JSON `{"error": "<code>", "message": "..."}`.
 
 - `submission_rejected`: fix every item in `details.errors` (path, problem, fix) and resubmit the page.
-- `access_denied`: the path is outside the server's authorized folders. Ask the user to add the folder
-  to `SCHOLAROCR_ALLOWED_DIRS` (`;`-separated on Windows, `:` elsewhere) and restart Antigravity CLI. By
-  default only the folder the server was started in (the plugin folder) is authorized; the setting
-  belongs in the user's `scholarocr.env`. Do not copy files around to work
-  around it.
+- `access_denied`: the path is outside the server's authorized folders. The message names the settings
+  file in use (`SCHOLAROCR_ENV_FILE`, or `%LOCALAPPDATA%\ScholarOCR\scholarocr.env` by default) and the
+  current value. Tell the user to APPEND the folder to `SCHOLAROCR_ALLOWED_DIRS` in that file, separated
+  by `;` on Windows (`:` elsewhere), keeping the existing entries (replacing the value revokes them), then
+  restart Antigravity CLI. By default only the folder the server was started in (the plugin folder) is
+  authorized. Do not copy files around to work around it.
 - `model_unavailable`: the tool needs a server-side model (classification). Do it yourself from the
   content, or suggest configuring a key.
 - `gemini_error`: API failure after retries (key mode). Wait, then `manage_job(job_id, "resume")`;

@@ -32,6 +32,11 @@ python -m pytest -q
 ```
 
 Optional tools: `winget install JohnMacFarlane.Pandoc` and MiKTeX or TeX Live (XeLaTeX).
+
+**pandoc is optional.** Native Word equations (Office Math) in the DOCX export need `pandoc` on the
+server's PATH. Without it the export still works: display equations are inserted as LaTeX source in a
+monospace run, inline `$...$` math becomes readable text (`x²`, `γ₀`, `SO₄²⁻`), and the export result
+carries a warning. Restart the MCP client (or the web app) after installing pandoc.
 `.env` is read from the current working directory; for the MCP server prefer setting variables in
 the MCP client configuration (see MCP_INTEGRATION.md).
 

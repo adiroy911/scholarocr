@@ -29,9 +29,15 @@ from .validation import DOCX_TYPE, IMAGE_TYPES, SUPPORTED_EXTENSIONS, detect_med
 log = get_logger("ingestion")
 
 HASH_DPI = 36
-# Conservative: a single short line of text must never be classed as blank.
-BLANK_INK_RATIO = 0.0004
-BLANK_STD = 6.0
+# Blank detection is deliberately conservative: a page wrongly classed as blank is silently skipped, while a
+# blank page sent to OCR only costs one empty transcription. "Ink" is measured relative to the paper level
+# (90th percentile), not against a fixed grey value: downscaling a clean digital page anti-aliases thin
+# strokes to light grey, so a fixed "< 128" count can see almost no ink on a full page of text. A page is
+# blank only when the cheap low-resolution check AND a higher-resolution check both find no ink.
+BLANK_INK_RATIO = 0.0004  # fraction of pixels darker than paper by BLANK_INK_DELTA
+BLANK_INK_DELTA = 40  # grey levels below the paper level that count as ink
+BLANK_MIN_CONTRAST = 30.0  # paper minus darkest ink below this: no visible marks at all
+BLANK_CONFIRM_DPI = 100  # PDF pages that look blank at HASH_DPI are re-checked at this resolution
 
 
 @dataclass
@@ -66,8 +72,31 @@ def compute_document_id(source_hashes: list[str]) -> str:
     return f"doc_{h[:16]}"
 
 
-def image_signature(img: Image.Image) -> tuple[str, str, bool, float]:
-    """(content hash, dhash hex, is_blank, ink_ratio) from a low-resolution greyscale render."""
+def ink_measure(gray: np.ndarray) -> tuple[bool, float]:
+    """(looks blank, ink ratio) for a greyscale array. Ink = pixels darker than the paper level by
+    ``BLANK_INK_DELTA``; light-on-dark pages (median below 110) are measured inverted."""
+    if gray.size == 0:
+        return True, 0.0
+    if float(np.median(gray)) < 110:
+        gray = 255 - gray
+    paper = float(np.percentile(gray, 90))
+    dark = gray < paper - BLANK_INK_DELTA
+    ink = float(dark.mean())
+    darkest = float(np.percentile(gray[dark], 10)) if dark.any() else float(gray.min())
+    return (ink < BLANK_INK_RATIO or paper - darkest < BLANK_MIN_CONTRAST), ink
+
+
+def is_blank_image(img: Image.Image) -> tuple[bool, float]:
+    """Full-resolution blank check (the confirmation step of ``image_signature``)."""
+    return ink_measure(np.asarray(img.convert("L"), dtype=np.uint8))
+
+
+def image_signature(img: Image.Image, *, confirm_full: bool = True) -> tuple[str, str, bool, float]:
+    """(content hash, dhash hex, is_blank, ink_ratio).
+
+    Hashes come from a 400 px greyscale thumbnail. ``is_blank`` needs the thumbnail AND (with
+    ``confirm_full``) the image at its own resolution to agree that there is no ink; ``ink_ratio`` is from
+    the higher-resolution measurement when it ran."""
     g = img.convert("L")
     small = g.copy()
     small.thumbnail((400, 400))
@@ -76,8 +105,9 @@ def image_signature(img: Image.Image) -> tuple[str, str, bool, float]:
     d = np.asarray(g.resize((9, 8), Image.Resampling.LANCZOS), dtype=np.int16)
     bits = (d[:, 1:] > d[:, :-1]).flatten()
     dhash = f"{int(''.join('1' if b else '0' for b in bits), 2):016x}"
-    ink = float((arr < 128).mean())
-    blank = ink < BLANK_INK_RATIO or float(arr.std()) < 1.5
+    blank, ink = ink_measure(arr)
+    if blank and confirm_full and g.size != small.size:
+        blank, ink = ink_measure(np.asarray(g, dtype=np.uint8))
     return content_hash, dhash, blank, ink
 
 
@@ -85,12 +115,16 @@ def hamming(a: str, b: str) -> int:
     return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 
-def build_manifest(raw_paths: list[str | Path], *, policy: PathPolicy, store: ArtifactStore, max_pages: int) -> Manifest:
+def build_manifest(raw_paths: list[str | Path], *, policy: PathPolicy, store: ArtifactStore, max_pages: int,
+                   rebuild: bool = False) -> Manifest:
+    """Ingest ``raw_paths`` as one document. An existing manifest is reused unless ``rebuild`` is set
+    (``reprocess=True``): then page profiles (blank flags, duplicates) are measured again. Page ids and
+    content hashes do not change, so the document id and cached pages stay valid."""
     inputs = expand_inputs(raw_paths, policy)
     hashes = [sha256_file(i.path) for i in inputs]
     document_id = compute_document_id(hashes)
     manifest_path = store.doc_dir(document_id) / "manifest.json"
-    if manifest_path.exists():
+    if manifest_path.exists() and not rebuild:
         log.info("document %s already ingested; reusing manifest", document_id)
         return Manifest.model_validate(store.read_json(manifest_path))
 
@@ -116,8 +150,11 @@ def build_manifest(raw_paths: list[str | Path], *, policy: PathPolicy, store: Ar
                     page = doc[i]
                     prof = profile_page(page)
                     small = render_page(page, HASH_DPI)
-                    chash, dh, blank_img, _ = image_signature(small)
+                    chash, dh, blank_img, _ = image_signature(small, confirm_full=False)
                     text = (page.get_text("text") or "").strip()
+                    if blank_img and prof.text_chars == 0:
+                        # Confirm at a resolution where thin strokes survive before skipping the page.
+                        blank_img, _ = is_blank_image(render_page(page, BLANK_CONFIRM_DPI))
                     prof.is_blank = prof.is_blank or (blank_img and prof.text_chars == 0)
                     entries.append(ManifestEntry(
                         page_number=page_no, page_id=page_id(document_id, page_no), source_file=inp.path.name,

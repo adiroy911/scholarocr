@@ -1,15 +1,18 @@
 """DOCX export: editable structure (headings, lists, native tables, region crops, native equations).
 
 Equations become native Office Math (OMML) by converting all of them with one ``pandoc``
-call and lifting the ``m:oMathPara``/``m:oMath`` elements out of pandoc's output. Without
-pandoc, or for an equation pandoc cannot parse, the LaTeX source is inserted verbatim in a
-monospace run and a warning is recorded.
+call and lifting the ``m:oMathPara``/``m:oMath`` elements out of pandoc's output. Inline
+``$...$`` math inside text goes through the same call and becomes inline OMML. pandoc is
+optional: without it (or for a formula pandoc cannot parse) display equations are inserted as
+LaTeX source in a monospace run, inline math as readable text (``x²``, ``γ₀``, ``SO₄²⁻``), and a
+warning is recorded.
 """
 
 from __future__ import annotations
 
 import copy
 import re
+from typing import Any
 import shutil
 import subprocess
 import tempfile
@@ -35,6 +38,7 @@ from .base import (
     ce_to_math,
     heading_level,
     is_unclear,
+    latex_to_readable,
     layout_table,
     marks_label,
     math_latex,
@@ -42,6 +46,8 @@ from .base import (
     ordered_pages,
     plain_text,
     region_image,
+    split_inline_math,
+    starts_with_question_number,
     unclear_text,
 )
 
@@ -53,20 +59,30 @@ MAX_IMAGE_WIDTH_PT = 432.0  # 6 inches
 FALLBACK_IMAGE_DPI = 150.0
 GREY = RGBColor(0x80, 0x80, 0x80)
 MONO = "Courier New"
+MATH_FONT = "Cambria Math"
 
 
 # ------------------------------------------------------------------ equations via pandoc
-def latex_to_omml(latexes: list[str], warnings: list[str]) -> list[etree._Element | None]:
-    """Convert LaTeX equations to OMML with a single pandoc run; None marks a failure."""
+def latex_to_omml(latexes: list[str], warnings: list[str], inline: list[bool] | None = None
+                  ) -> list[etree._Element | None]:
+    """Convert LaTeX to OMML with a single pandoc run; None marks a failure. ``inline[i]`` marks inline
+    math (``$...$``, becomes ``m:oMath``) instead of a display equation (``$$...$$``, ``m:oMathPara``)."""
     results: list[etree._Element | None] = [None] * len(latexes)
     if not latexes:
         return results
+    inline = inline or [False] * len(latexes)
     pandoc = shutil.which("pandoc")
     if pandoc is None:
-        warnings.append(f"pandoc not found: {len(latexes)} equation(s) inserted as LaTeX source, not native equations")
+        n_inline = sum(1 for x in inline if x)
+        n_display = len(latexes) - n_inline
+        what = ", ".join(x for x in (f"{n_display} equation(s) inserted as LaTeX source" if n_display else "",
+                                     f"{n_inline} inline formula(s) as plain text" if n_inline else "") if x)
+        warnings.append(f"pandoc not found: {what}, not native Word equations (install pandoc for native "
+                        "equations)")
         return results
     usable = [i for i, tex in enumerate(latexes) if "$" not in tex]
-    parts = [f"{EQ_MARKER}{i}\n\n$${' '.join(latexes[i].split())}$$" for i in usable]
+    parts = [f"{EQ_MARKER}{i}\n\n" + (f"${' '.join(latexes[i].split())}$" if inline[i]
+                                       else f"$${' '.join(latexes[i].split())}$$") for i in usable]
     with tempfile.TemporaryDirectory(prefix="scholarocr-eq-") as td:
         src, dst = Path(td) / "eq.md", Path(td) / "eq.docx"
         src.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
@@ -103,6 +119,8 @@ class _DocxBuilder:
         self.warnings = warnings
         self.doc = docx.Document()
         self.equations: list[tuple[Paragraph, str]] = []
+        self.inline_math: list[tuple[Any, str]] = []  # (placeholder run, LaTeX) for $...$ inside text
+        self.inline_native = 0
         self.images = 0
         self.include_furniture = ctx.flag("include_furniture", False)
 
@@ -141,7 +159,7 @@ class _DocxBuilder:
             if is_unclear(el):
                 self._unclear_run(h, text or unclear_text(el))
             else:
-                h.add_run(text)
+                self._rich(h, text)
         elif t in MATH_TYPES:
             self._equation(el)
         elif t == ElementType.TABLE:
@@ -169,21 +187,28 @@ class _DocxBuilder:
 
     def _text_runs(self, p: Paragraph, el: Element, *, italic: bool = False, size: float | None = None) -> None:
         q = el.question
-        if q and q.number:
-            p.add_run(f"Q{q.number} ").bold = True
         text = plain_text(el)
+        if q and q.number and not starts_with_question_number(q.number, text):
+            p.add_run(f"Q{q.number} ").bold = True
         if is_unclear(el):
             self._unclear_run(p, text or unclear_text(el))
         else:
             for i, line in enumerate(text.split("\n")):
                 if i:
                     p.add_run().add_break()
-                run = p.add_run(line)
-                run.italic = italic or None
-                if size:
-                    run.font.size = Pt(size)
+                self._rich(p, line, italic=italic, size=size)
         if q and q.marks and marks_label(q.marks):
             p.add_run(f"  {marks_label(q.marks)}").italic = True
+
+    def _rich(self, p: Paragraph, line: str, *, italic: bool = False, size: float | None = None) -> None:
+        """Runs for one line of text; inline $...$ math becomes a placeholder filled by insert_equations."""
+        for segment, is_math in split_inline_math(line):
+            run = p.add_run(segment)
+            run.italic = italic or None
+            if size:
+                run.font.size = Pt(size)
+            if is_math:
+                self.inline_math.append((run, segment))
 
     def _list(self, el: Element) -> None:
         items = [i for i in (el.items if el.items else plain_text(el).split("\n")) if i.strip()]
@@ -199,7 +224,7 @@ class _DocxBuilder:
             if is_unclear(el):
                 self._unclear_run(p, item)
             else:
-                p.add_run(" ".join(item.split()))
+                self._rich(p, " ".join(item.split()))
 
     def _equation(self, el: Element) -> None:
         self._note_if_unresolved(el)
@@ -280,7 +305,19 @@ class _DocxBuilder:
 
     # -- finish
     def insert_equations(self) -> tuple[int, int]:
-        omml = latex_to_omml([tex for _, tex in self.equations], self.warnings)
+        inline_tex = [ce_to_math(tex) if r"\ce" in tex else tex for _, tex in self.inline_math]
+        omml = latex_to_omml([tex for _, tex in self.equations] + inline_tex, self.warnings,
+                             inline=[False] * len(self.equations) + [True] * len(inline_tex))
+        inline_nodes = omml[len(self.equations):]
+        omml = omml[:len(self.equations)]
+        for (run, tex), node in zip(self.inline_math, inline_nodes):
+            if node is not None:
+                run._r.addprevious(copy.deepcopy(node))
+                run._r.getparent().remove(run._r)
+                self.inline_native += 1
+            else:  # readable fallback: x², γ₀, SO₄²⁻ instead of raw LaTeX with dollar signs
+                run.text = latex_to_readable(tex)
+                run.font.name = MATH_FONT
         native = failed = 0
         for (p, tex), node in zip(self.equations, omml):
             if node is not None:
@@ -321,8 +358,10 @@ def export_docx(ctx: ExportContext) -> ExportResult:
         "images": len(reopened.inline_shapes),
         "images_expected": builder.images,
         "equations_expected": len(builder.equations),
-        "native_equations": sum(1 for _ in body.iter(f"{{{M_NS}}}oMath")),
+        "native_equations": sum(1 for _ in body.iter(f"{{{M_NS}}}oMath")) - builder.inline_native,
         "equations_fallback_latex": fallback,
+        "inline_math": len(builder.inline_math),
+        "inline_math_native": builder.inline_native,
         "page_markers": markers,
     }
     if verification["native_equations"] != native:

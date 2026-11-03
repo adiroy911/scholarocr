@@ -110,49 +110,61 @@ def classify_prompt(context_hint: str | None, text_sample: str | None, page_coun
 # ---------------------------------------------------------------------------------------------- host mode
 # Instructions handed to the MCP client's own model (host mode). Versioned separately: part of the cache
 # key of host-transcribed pages.
-HOST_PROMPT_VERSION = "host-2026-11-03.2"
+HOST_PROMPT_VERSION = "host-2026-11-03.3"
 
 HOST_RULES = """Transcribe this page image for ScholarOCR. You transcribe; you never author.
-Work from what you see in the image. Do not run code, scripts or shell commands to inspect or measure it;
-the only tools you need are ScholarOCR's.
+Use only the image returned with these rules (not the original file: boxes refer to this processed image)
+and ScholarOCR's tools; no web search. Never run shell commands or code, and never list or read plugin,
+server or other documents' files to learn formats or debug (a denied command can end your turn with no
+answer). If unsure how to encode something, use these rules and examples (on later pages
+get_page_image(instructions="full") repeats them), pick the closest element type and explain in notes.
+If a page comes back blank or empty but seems to have content, tell the user.
 1. Exactly what is visible. Never complete, correct, summarise or improve content.
-2. Illegible: do NOT guess. Use an element of type "uncertain" (text like "[illegible: 2 words]",
-   uncertainty "unresolved"), or keep the element and set uncertainty "medium"/"high" when you read it but
-   are unsure. Labels are ordinal judgements, not probabilities.
+2. "uncertainty" is DOUBT about each element, not quality: low = you would bet the transcription is exact;
+   medium = a specific character or word could differ; high = a guess among alternatives; unresolved =
+   cannot read (use type "uncertain", text like "[illegible: 2 words]"; never guess). Judge every element
+   on its own and say why in uncertainty_reasons; do not blanket-label a page (clean print is mostly low).
 3. Elements in natural reading order (respect columns; header first, footer/page number last).
 4. box_2d = [ymin, xmin, ymax, xmax] as integers 0-1000, normalised to THIS image (origin top-left).
    Estimate it by eye: approximate boxes are fine. Give one per element when you can; if you cannot place
    an element, omit box_2d rather than measuring. The server maps boxes back to the original page.
 5. Math: LaTeX (amsmath) in "latex", a readable linear form in "text". Display equations are separate
-   "equation" elements; inline math stays in the paragraph text as $...$. Keep equation numbers.
+   "equation" elements; inline math stays in the paragraph text as $...$ LaTeX (e.g. $\\gamma_0$, never
+   Unicode like "γ0"). Keep equation numbers.
 6. Chemistry: type "chemical_equation" with mhchem LaTeX (\\ce{...}); keep charges, states, arrows and
-   coefficients exactly. Distinguish O/0, l/1, x/×, -/−.
+   coefficients exactly. Inline formulas in text as $\\ce{...}$. Distinguish O/0, l/1, x/×, -/−.
 7. Tables only for genuinely tabular content: rows of cells, header_rows, row_span/col_span for merged cells.
 8. Figures/diagrams/graphs: one element with box_2d tight around it and "figure": {description, labels,
    relationships, kind}. Captions are separate "caption" elements with caption_of = the figure's index.
 9. Structure: role (question, subquestion, definition, theorem, example, proof, solution, ...) and
-   "question": {number, marks} exactly as printed; subquestions set parent_index (0-based index).
+   "question": {number, marks} exactly as printed; subquestions set parent_index (0-based index). Text that
+   continues a question after an equation or figure sets parent_index to that question and carries no
+   question number; never repeat a number.
 10. Headers, footers and page numbers get their own types."""
 
 HOST_SHAPE = """Call submit_page_content(document_id, page_number, elements=[...], page_language="en",
-page_label=<printed page number or null>, legibility="low|medium|high|unresolved" (overall doubt),
-rotation_detected=0|90|180|270 (clockwise, only if the image itself is rotated), notes=[...]).
+page_label=<printed page number or null>, page_doubt="low|medium|high|unresolved" (overall DOUBT: low for a
+clean page), rotation_detected=0|90|180|270 (clockwise, only if the image itself is rotated), notes=[...]).
 Element fields: type (required), text, latex, role, level, items, table, figure, question, box_2d,
 uncertainty, uncertainty_reasons, handwritten, language, caption_of, parent_index. Examples:
 {"type":"heading","level":1,"text":"Chapter 2","box_2d":[40,90,80,600]}
 {"type":"paragraph","role":"question","text":"Q3. Solve $x^2=4$. [2]","question":{"number":"3","marks":"2"},"box_2d":[100,80,140,920]}
 {"type":"equation","text":"E = mc^2","latex":"E = mc^2","box_2d":[150,300,190,700]}
+{"type":"paragraph","role":"question","text":"1. Balance: $\\\\ce{H2 + O2 -> H2O}$ [2]","question":{"number":"1","marks":"2"}}
+{"type":"chemical_equation","text":"N2 + 3H2 <=> 2NH3","latex":"\\\\ce{N2 + 3H2 <=> 2NH3}"}
+{"type":"paragraph","text":"Name the ion $\\\\ce{SO4^2-}$.","uncertainty":"medium","uncertainty_reasons":["charge may be 3-"]}
 {"type":"table","table":{"header_rows":1,"rows":[[{"text":"x","is_header":true},{"text":"y","is_header":true}],[{"text":"1"},{"text":"2"}]]},"box_2d":[200,80,330,900]}
 {"type":"figure","figure":{"description":"Circuit with a battery and two resistors in series","labels":["R1","R2"],"kind":"circuit"},"box_2d":[340,150,600,850]}
-{"type":"caption","text":"Fig. 2: Series circuit","caption_of":4,"box_2d":[605,300,630,700]}
+{"type":"caption","text":"Fig. 2: Series circuit","caption_of":7,"box_2d":[605,300,630,700]}
 {"type":"uncertain","text":"[illegible: 3 words]","uncertainty":"unresolved","box_2d":[650,80,680,500]}
 Types: title heading subheading paragraph text handwriting equation chemical_equation table figure diagram
 image caption footnote header footer page_number list code bibliography_entry reference uncertain."""
 
-HOST_SHORT = """Same rules as before: transcribe exactly, never guess (use "uncertain"/unresolved), reading
-order, box_2d [ymin,xmin,ymax,xmax] 0-1000 of THIS image estimated by eye (never run code to measure),
-LaTeX for math, \\ce{} for chemistry. Submit with
-submit_page_content. Ask for instructions="full" to see the full rules and element examples again."""
+HOST_SHORT = """Same rules as before: transcribe exactly, never guess (use "uncertain"/unresolved), per-element
+uncertainty = doubt (low = you would bet it is exact; vary it per element), reading order, box_2d
+[ymin,xmin,ymax,xmax] 0-1000 of THIS image estimated by eye, LaTeX for math ($...$ inline), \\ce{} for
+chemistry. No shell commands or file reads. Submit with submit_page_content. Ask for instructions="full" to
+see the full rules and examples again."""
 
 
 def host_page_brief(route: Route, *, full: bool, document_type: str | None, language_hint: str | None,
@@ -173,7 +185,8 @@ def host_page_brief(route: Route, *, full: bool, document_type: str | None, lang
         parts.append("Caller-provided hints (may be wrong; trust the image): " + "; ".join(hints))
     if text_layer:
         parts.append("The PDF has an embedded text layer for this page (may be incomplete or wrong for math). "
-                     "Use it only to disambiguate characters; the image is authoritative:\n<<<\n" + text_layer
+                     "Use it only to disambiguate characters; the image is authoritative. Do not copy Unicode "
+                     "math from the text layer; write inline math as $...$ LaTeX:\n<<<\n" + text_layer
                      + "\n>>>")
     return "\n\n".join(parts)
 

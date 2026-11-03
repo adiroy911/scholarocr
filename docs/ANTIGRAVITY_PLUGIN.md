@@ -65,6 +65,7 @@ settings in the user-level file instead:
 
 ```
 # Folders the server may read (; on Windows, : elsewhere). Needed: the default is the plugin folder.
+# To allow another folder later, APPEND it after a ';' - replacing the value revokes the others.
 SCHOLAROCR_ALLOWED_DIRS=C:\Users\you\Documents;D:\Study
 
 # Optional: ScholarOCR's own OCR pipeline instead of Antigravity's model.
@@ -74,7 +75,8 @@ SCHOLAROCR_ALLOWED_DIRS=C:\Users\you\Documents;D:\Study
 
 Keys are optional. Without `SCHOLAROCR_PROVIDER` the server stays in host mode even when a key is set
 (see CONFIGURATION.md for `auto`, `openrouter` and every other variable). Restart Antigravity after
-editing the file.
+editing the file. An `access_denied` error names the settings file actually in use (it respects
+`SCHOLAROCR_ENV_FILE`) and shows the current `SCHOLAROCR_ALLOWED_DIRS` value with the new folder appended.
 
 `mcp_config.json` declares no variables on purpose: Antigravity keeps a plugin whose MCP server declares
 variables disabled until they are filled in, and the plugin should work at once in host mode.
@@ -102,35 +104,56 @@ about one page image plus the elements per page. With a key, model calls happen 
 
 Bundled MCP tools are namespaced `<plugin-name>_<server-name>`; for this plugin agy reported the server
 as `scholarocr_scholarocr`. Antigravity writes one descriptor file per tool, plus `instructions.md`, to
-`~/.gemini/antigravity-cli/mcp/scholarocr_scholarocr/`. The model reads those files (sometimes through
-a shell `dir` / `Get-ChildItem`) before it calls a tool through `call_mcp_tool`. In interactive use you
-approve those reads and the tool calls when prompted.
+`~/.gemini/antigravity-cli/mcp/scholarocr_scholarocr/`. The model reads those files before it calls a
+tool through `call_mcp_tool`. In interactive use you approve those reads and the tool calls when prompted.
+The rules tell the model never to run shell commands (`dir`, `Get-ChildItem`, ...) or to read the plugin's,
+the server's or other documents' files to learn formats; it should use `get_page_image(instructions="full")`
+and say in `notes` what it could not encode.
 
 ### Headless runs (`agy -p`)
 
-A print-mode run cannot ask for approval, so pass allow rules in a `--settings` file. With your home
-folder in place of `<home>` (forward slashes work on Windows):
+A print-mode run cannot ask for approval, so pass permission rules in a `--settings` file. The repository
+ships a recommended one, [`antigravity/headless-settings.example.json`](../antigravity/headless-settings.example.json)
+(outside `skills/` and `rules/`, so it is not part of the installed plugin). Replace `<you>` with your user
+name (forward slashes work on Windows):
 
 ```json
 {
   "permissions": {
     "allow": [
       "mcp(scholarocr_scholarocr/*)",
-      "read_file(<home>/.gemini/antigravity-cli/mcp)",
-      "read_file(<home>/.gemini/config/plugins/scholarocr)",
-      "command(regex:(dir|ls|Get-ChildItem|gci|Get-Content|gc|type|cat) .*antigravity-cli.mcp.*)"
+      "mcp(scholarocr/*)",
+      "read_file(C:/Users/<you>/.gemini/config/plugins/scholarocr)",
+      "read_file(C:/Users/<you>/.gemini/antigravity-cli/mcp)"
+    ],
+    "deny": [
+      "command(regex:.*)"
     ]
   }
 }
 ```
 
 ```bash
-agy -p "Extract D:/Study/page1.png with ScholarOCR and verify it" --settings agy-settings.json --output-format stream-json
+agy -p "Extract D:/Study/page1.png with ScholarOCR and verify it" --settings headless-settings.json --output-format stream-json
 ```
 
-Without the rules a headless run stops with "a tool required the ... permission that headless mode
-cannot prompt for". `--mode auto` may be unavailable on some accounts (agy then prints "--mode auto is
-not available for this account" and continues in the default mode).
+**Why the explicit `deny` rule matters** (agy 1.4.12, measured 2026-11-03). Precedence is deny > ask >
+allow. A command that matches no rule falls to "ask", which headless mode cannot show; agy refuses it,
+lists it in `denied_actions`, and the whole turn ends with an EMPTY `response`. That happened in 4 of 10
+test runs, each time after the model tried `dir` or `Get-ChildItem` on the plugin folder. A command that
+matches an explicit `deny` rule is different: agy returns an error to the model ("Permission denied for
+unsandboxed(dir ...). Matches user-configured deny rule."), `denied_actions` stays empty, and the model
+carries on. In the test run (prompt: run `dir` on the plugin folder, then call `list_documents`) the model
+reported the refusal and finished the ScholarOCR call: 40.6k tokens, 39 s.
+
+Pages are read from the image `get_page_image` returns. Agy's working folder is part of its workspace, so a
+model may open an input file in that folder directly; the rules tell it not to (the server's image is
+cropped and deskewed and the boxes refer to it). In one test the model read an original greyscale JPEG
+from the workspace and the model API answered `INVALID_ARGUMENT (code 400)`. Run headless jobs from a
+folder that does not contain the inputs.
+
+`--mode auto` may be unavailable on some accounts (agy then prints "--mode auto is not available for
+this account" and continues in the default mode).
 
 ## Verified (2026-11-03)
 
@@ -148,6 +171,25 @@ Not tested yet:
 - multi-page documents (the `next_waiting_page` loop over many pages);
 - a math page where a LaTeX error makes the server reject the submission and the model resubmits;
 - long documents and how much of the context window they use.
+
+## Re-verified after the 0.3.0 fixes (2026-11-03)
+
+Same setup (agy 1.4.12, `gemini-3.8-flash-medium`, no key), headless with the settings file above, one run
+per case. Logs: `agy-test-results/2026-11-03-fixes/` next to the checkout.
+
+| Case | Before (0.2.0) | After |
+|---|---|---|
+| Chemistry worksheet (`tests/fixtures` corpus `chemistry.png`) | 3 of 3 runs ended empty after the model went looking for docs with shell commands | Passed: 4 elements, mhchem stored exactly, no shell attempt, 128.5k tokens, 161 s |
+| arXiv page image (`arxiv_2205.00096_p3.png`, 150 dpi) | Routed as "blank", nothing to transcribe | Passed: `visual_general`, 21 elements, inline math as `$...$` LaTeX, 121.1k tokens, 168 s |
+| Handwritten manuscript (`majorana.jpg`) | 36 of 38 elements "medium": no signal | Model labels 26 low, 8 medium, 1 high, 1 unresolved, every non-low one with a reason; 212k tokens, 307 s |
+| Deny-rule experiment | (no deny rule: turn ended empty) | Error returned to the model, turn completed, 40.6k tokens, 39 s |
+
+In the handwriting run the server's "handwriting on a `fair` page" rule still raised 34 of the 36 stored labels
+to `medium` (the page was graded `fair` for 11.6 px glyphs). That rule was removed afterwards; replaying the
+same submission through the current rules stores the model's labels unchanged. The worksheet examples in the
+brief mirror the worksheet's own content, so that pass shows the model no longer went hunting; it is not an
+independent accuracy test. The model also ran three web searches about the manuscript before transcribing;
+the rules now forbid web searches.
 
 ## Plugin layout
 

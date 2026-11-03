@@ -24,10 +24,10 @@ from .pipeline.checkpoints import load_page, save_page
 from .pipeline.job_manager import JobManager
 from .pipeline.orchestrator import Pipeline, RunSummary
 from .pipeline.verification import verify as run_verification
-from .schemas import (Document, DocumentType, ElementType, FigureData, Job, Manifest, Page, PageStatus,
+from .schemas import (Document, DocumentType, Element, ElementType, FigureData, Job, Manifest, Page, PageStatus,
                       ProcessingOptions, Revision, VerificationReport)
 from .intelligence import prompts as host_prompts
-from .intelligence.extractor import VisualPageContext, convert_response
+from .intelligence.extractor import VisualPageContext, convert_response, page_doubt_note
 from .schemas.elements import MATH_TYPES as MATH_TYPES_SET
 from .schemas.elements import MODEL_METHODS, VISUAL_TYPES
 from .security import PathPolicy
@@ -44,7 +44,7 @@ class ScholarOCR:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.repo = Repository(self.settings.db_path)
         self.store = ArtifactStore(self.settings.documents_dir)
-        self.policy = PathPolicy(self.settings.allowed_dirs, self.settings.max_file_mb)
+        self.policy = PathPolicy(self.settings.allowed_dirs, self.settings.max_file_mb, env_file=self.settings.env_file)
         self.gemini = GeminiClient(self.settings, transport=transport, usage_sink=self.repo.record_call)
         self.pipeline = Pipeline(self.settings, self.repo, self.store, self.gemini)
         # Per-document model override for one synchronous run (MCP sampling): doc id -> (client, method, label).
@@ -86,7 +86,8 @@ class ScholarOCR:
         another model client (MCP sampling); it forces a synchronous run."""
         options = options or ProcessingOptions()
         path_list = [paths] if isinstance(paths, (str, Path)) else list(paths)
-        manifest = build_manifest(path_list, policy=self.policy, store=self.store, max_pages=self.settings.max_pages)
+        manifest = build_manifest(path_list, policy=self.policy, store=self.store, max_pages=self.settings.max_pages,
+                                  rebuild=options.reprocess)
         selected = parse_page_range(options.pages, len(manifest.pages))
         doc_id = manifest.document_id
         existing = self.repo.get_document(doc_id)
@@ -118,6 +119,13 @@ class ScholarOCR:
         }
         if self.settings.provider_note and mode == "host":
             result["warnings"] = list(result["warnings"]) + [self.settings.provider_note]
+        blank = self._blank_pages(manifest, selected, finished=bool(wait), force_visual=options.force_visual)
+        if blank:
+            result["blank_pages"] = blank
+            result["warnings"] = list(result["warnings"]) + [
+                f"page(s) {', '.join(map(str, blank))} skipped as blank (no ink found); nothing was extracted from "
+                "them. If a skipped page has content, call ocr_document again with force_visual=true and "
+                "reprocess=true, and tell the user."]
         if wait:
             result["summary"] = self.document_summary(doc_id)
             awaiting = result["summary"].get("awaiting_transcription") or []
@@ -131,6 +139,17 @@ class ScholarOCR:
             result["next_step"] = ("Poll get_document_status(job_id=...) until it is terminal. Pages that need "
                                    "vision then wait for you: get_page_image -> submit_page_content.")
         return result
+
+    def _blank_pages(self, manifest: Manifest, selected: list[int], *, finished: bool, force_visual: bool) -> list[int]:
+        """Selected pages skipped as blank: stored status after a finished run, else the manifest's flag."""
+        if finished:
+            out = []
+            for n in selected:
+                p = load_page(self.store, manifest.document_id, n)
+                if p is not None and p.status == PageStatus.BLANK:
+                    out.append(n)
+            return out
+        return [] if force_visual else [n for n in selected if manifest.pages[n - 1].profile.is_blank]
 
     def _run_job(self, document_id: str, options: ProcessingOptions, job_id: str, should_cancel, progress) -> RunSummary:
         manifest = self.load_manifest(document_id)
@@ -326,7 +345,14 @@ class ScholarOCR:
                              if not types or el.type in types)
         return md
 
-    def get_page(self, document_id: str, page_number: int) -> dict[str, Any]:
+    COMPACT_FIELDS = ("type", "role", "content", "latex", "uncertainty", "uncertainty_reasons", "question",
+                      "parent_id", "handwritten")
+
+    def get_page(self, document_id: str, page_number: int, *, compact: bool = False,
+                 fields: list[str] | None = None) -> dict[str, Any]:
+        """One page's IR. ``compact``: per element only id, type, role, content, LaTeX, uncertainty (+reasons),
+        question, parent and a rounded bbox; page-level images, transforms, sources and revisions are left
+        out. ``fields`` keeps exactly these element fields (``element_id`` is always kept)."""
         manifest = self.load_manifest(document_id)
         if not 1 <= page_number <= len(manifest.pages):
             raise InputError(f"page must be between 1 and {len(manifest.pages)}")
@@ -334,6 +360,30 @@ class ScholarOCR:
         if page is None:
             return {"document_id": document_id, "page_number": page_number, "status": "pending",
                     "message": "Page not processed yet. Run ocr_document with this page range."}
+        if compact or fields:
+            keep = list(fields) if fields else [*self.COMPACT_FIELDS, "bbox"]
+            unknown = sorted(set(keep) - set(Element.model_fields))
+            if unknown:
+                raise InputError(f"unknown element field(s) {unknown}; e.g. {list(self.COMPACT_FIELDS)}")
+            els = []
+            for el in page.elements:
+                e = el.model_dump(mode="json", exclude_none=True, include={"element_id", *keep})
+                if "bbox" in e:
+                    e["bbox"] = [round(v, 1) for v in (el.bbox.x0, el.bbox.y0, el.bbox.x1, el.bbox.y1)]
+                if not e.get("uncertainty_reasons", True):
+                    e.pop("uncertainty_reasons")
+                if e.get("role") == "none":
+                    e.pop("role")
+                if e.get("handwritten") is False:
+                    e.pop("handwritten")
+                els.append(e)
+            d = {"document_id": document_id, "page_number": page_number, "status": page.status.value,
+                 "route": page.route.value if page.route else None, "page_label": page.page_label,
+                 "language": page.language, "quality_grade": page.quality.grade, "warnings": page.warnings,
+                 "elements": els}
+            if page.status == PageStatus.AWAITING_TRANSCRIPTION:
+                d["message"] = "Awaiting transcription by the client's model: get_page_image -> submit_page_content."
+            return d
         d = page.model_dump(mode="json", exclude_none=True)
         if page.status == PageStatus.AWAITING_TRANSCRIPTION:
             d["message"] = "Awaiting transcription by the client's model: get_page_image -> submit_page_content."
@@ -522,7 +572,7 @@ class ScholarOCR:
                             transcriber: str | None = None) -> dict[str, Any]:
         """Validate and store a host-model transcription of one page (host mode).
 
-        ``payload`` has the PageExtractionResponse shape (elements, page_language, page_label, legibility,
+        ``payload`` has the PageExtractionResponse shape (elements, page_language, page_label, page_doubt,
         rotation_detected, notes). Raises ``SubmissionRejected`` with every problem; nothing is stored then."""
         page, task = self._host_page(document_id, page_number)
         resp, warnings = host.validate_submission(dict(payload))
@@ -555,7 +605,7 @@ class ScholarOCR:
         page.model, page.prompt_version = label, host_prompts.HOST_PROMPT_VERSION
         page.orientation = int(sum(t.params.get("degrees_ccw", 0) for t in page.transforms if t.step == "rotate")) % 360
         page.warnings = [w for w in page.warnings if not w.startswith("model note:")]
-        page.warnings += [f"model note: {n}" for n in resp.notes]
+        page.warnings += [f"model note: {n}" for n in resp.notes] + page_doubt_note(resp)
         structure.annotate(page.elements)
         self.pipeline._save_crops(page, original, task.dpi)
         page.status = PageStatus.DONE
@@ -626,7 +676,9 @@ class ScholarOCR:
             el.uncertainty_reasons.append("figure description written by the client model from the crop")
         else:
             reviewer.apply_review(el, resp, by=by)
-            if el.type in MATH_TYPES_SET or el.type == ElementType.TABLE:
+            # Only a correction can introduce new LaTeX/table problems. Re-running the rules after "confirmed"
+            # would re-raise the label for the very issue the reviewer just checked against the source.
+            if resp.verdict == "corrected" and (el.type in MATH_TYPES_SET or el.type == ElementType.TABLE):
                 from .intelligence.uncertainty import apply_rules
 
                 apply_rules(el, quality=page.quality)  # re-check corrected LaTeX / table structure

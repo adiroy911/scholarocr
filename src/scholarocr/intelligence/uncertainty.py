@@ -9,14 +9,18 @@ Labels are ordinal (low < medium < high < unresolved). They are NOT calibrated p
    - element type "uncertain"                                   -> unresolved
    - LaTeX fails syntax checks (math/chemistry)                 -> at least high
    - table structure issues (ragged rows, uncertain cells, ...) -> at least medium
-   - page legibility reported "high"/"unresolved" by the model  -> at least medium
    - page quality grade "poor" and the element is math, table,
      or handwriting                                             -> at least medium
-   - handwritten element on a page graded "fair"/"poor"         -> at least medium
    - visual element (figure/diagram/table/equation) with no
      usable bounding box                                        -> reason recorded (traceability)
    - text-layer characters that are not clean (U+FFFD, private
      use)                                                       -> at least medium
+   Page-level signals are not spread over every element any more. The model's ``page_doubt`` (formerly
+   ``legibility``) is recorded as a page warning, and a page graded "fair" (one minor issue such as small
+   glyphs or skew) no longer raises handwriting: both put nearly every element at "medium" and erased the
+   per-element signal (a clean page reported as "legibility: high"; 34 of 36 handwritten elements of a
+   readable manuscript graded "fair" for 11.6 px glyphs). A "poor" page still raises math, tables and
+   handwriting.
 3. Targeted review (second model pass on the source crop) may then change the label:
    - "confirmed": lowered by one step, but never below low; unresolved stays unresolved
    - "corrected": content replaced (previous value kept in ``revisions``); label becomes
@@ -39,7 +43,7 @@ def escalate(el: Element, level: Uncertainty, reason: str) -> None:
         el.uncertainty_reasons.append(reason)
 
 
-def apply_rules(el: Element, *, quality: QualityAssessment | None, page_legibility: str | None = None) -> None:
+def apply_rules(el: Element, *, quality: QualityAssessment | None) -> None:
     if el.type == ElementType.UNCERTAIN:
         escalate(el, Uncertainty.UNRESOLVED, "region could not be read")
     if el.type == ElementType.EQUATION:
@@ -54,13 +58,9 @@ def apply_rules(el: Element, *, quality: QualityAssessment | None, page_legibili
     if el.type == ElementType.TABLE:
         for issue in table_issues(el.table):
             escalate(el, Uncertainty.MEDIUM, f"table: {issue}")
-    if page_legibility in ("high", "unresolved"):
-        escalate(el, Uncertainty.MEDIUM, f"page legibility reported {page_legibility}")
     grade = quality.grade if quality else None
     if grade == "poor" and (el.type in MATH_TYPES or el.type == ElementType.TABLE or el.handwritten):
         escalate(el, Uncertainty.MEDIUM, "poor page quality")
-    if el.handwritten and grade in ("fair", "poor"):
-        escalate(el, Uncertainty.MEDIUM, "handwriting on degraded page")
     if el.bbox is None and (el.type in VISUAL_TYPES or el.type in MATH_TYPES or el.type == ElementType.TABLE):
         if "no bounding box" not in el.uncertainty_reasons:
             el.uncertainty_reasons.append("no bounding box")

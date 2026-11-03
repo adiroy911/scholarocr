@@ -21,10 +21,18 @@ Treat hints as hints, not facts.
    rules it returns -> `submit_page_content(document_id, page_number, elements=[...])`. If a
    submission is rejected, fix every listed problem and resubmit the page. Continue with
    `next_waiting_page` until none is left (for more than 10 pages, do 10 and ask before continuing).
+   Each element's `uncertainty` is your doubt about it: `low` = you would bet it is exact, `medium` =
+   a specific character or word could differ, `high` = a guess among alternatives, `unresolved` =
+   cannot read. Label every element on its own; a clean print is mostly `low`.
+   Never run shell commands or read the plugin's or server's files to learn the format: if unsure,
+   call `get_page_image(instructions="full")`, pick the closest element type and explain in `notes`.
+   If `ocr_document` warns that a page was skipped as blank but it has content, tell the user and
+   re-run with `force_visual=true, reprocess=true`.
 4. Report the document_id, mode, status, page count and uncertainty counts.
 5. Show a short preview with `get_document_content` (first page or the requested pages).
 6. List elements labelled `high` or `unresolved`, with page numbers and element ids. Do not guess
    unresolved text. Offer to check them against the source with `get_source_region`.
 
-On `access_denied`, tell the user which folder to add to `SCHOLAROCR_ALLOWED_DIRS`. Do not copy the
-file elsewhere.
+On `access_denied`, tell the user which folder to append to `SCHOLAROCR_ALLOWED_DIRS` in the settings
+file the error names (`;`-separated on Windows; keep the existing entries). Do not copy the file
+elsewhere.
