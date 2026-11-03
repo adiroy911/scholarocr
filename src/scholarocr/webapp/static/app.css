@@ -128,7 +128,7 @@ a { color: var(--accent); }
 .sb-new:hover, .sb-item:hover { background: var(--hover); }
 .sb-new:hover { background: var(--sheet); box-shadow: 0 0 0 1px var(--rule-strong); }
 .history { flex: 1; overflow-y: auto; overflow-x: hidden; margin: 0 -4px; padding: 0 4px; }
-.sb-heading { font-size: 0.875rem; font-weight: 550; color: var(--ink-2); margin: 10px 12px 6px; }
+.sb-heading { font-size: 1rem; font-weight: 600; letter-spacing: -0.005em; color: var(--ink); margin: 14px 12px 8px; }
 .history-list { list-style: none; margin: 0; padding: 0; }
 .history-item { position: relative; }
 .history-link {
@@ -227,6 +227,7 @@ a { color: var(--accent); }
 }
 .engine-btn:hover, .engine-btn[aria-expanded="true"] { background: var(--hover); color: var(--ink); }
 .engine-btn-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.engine-btn-short { display: none; white-space: nowrap; }
 .engine-btn svg { width: 16px; height: 16px; }
 .send-btn {
   display: grid; place-items: center; width: 42px; height: 42px; border-radius: 50%; border: 0;
@@ -368,7 +369,7 @@ button.fact:hover { color: var(--ink); background: var(--hover); }
 .figure-kind { font-weight: 600; }
 .figure-desc { color: var(--ink); margin: 2px 0 0; }
 .figure-labels { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
-.figure-labels span { font-size: 0.8125rem; padding: 1px 7px; border-radius: 6px; background: var(--hover); color: var(--ink-2); }
+.figure-labels > span { font-size: 0.8125rem; padding: 1px 7px; border-radius: 6px; background: var(--hover); color: var(--ink-2); }
 .tbl-wrap { overflow-x: auto; margin: 4px 0; }
 .tbl { border-collapse: collapse; font-size: 0.97rem; min-width: 50%; }
 .tbl caption { caption-side: top; text-align: left; font-style: italic; color: var(--ink-2); padding-bottom: 4px; }
@@ -525,7 +526,9 @@ button.fact:hover { color: var(--ink); background: var(--hover); }
   .set-grid { grid-template-columns: 1fr; }
   .key-input { flex-wrap: wrap; }
   .key-input input { flex-basis: 100%; }
-  .engine-btn { max-width: 48vw; }
+  .engine-btn { max-width: 56vw; }
+  .engine-btn-label { display: none; }
+  .engine-btn-short { display: inline; }
 }
 
 @media (prefers-reduced-motion: reduce) {

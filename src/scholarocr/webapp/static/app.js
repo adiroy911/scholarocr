@@ -147,8 +147,35 @@
     return el;
   }
 
-  // Inline content of a transcription: plain text with $...$ math.
+  // Text that is LaTeX without $ delimiters ("\theta_1", "\log \frac{a}{b}"): a command and no prose words.
+  function bareLatex(text) {
+    const t = String(text || "").trim();
+    if (!t || t.includes("$") || !/\\[a-zA-Z]+/.test(t)) return false;
+    const rest = t.replace(/\\[a-zA-Z]+/g, " ").replace(/[_^]\{[^}]*\}|[_^]\w/g, " ");
+    return !/[A-Za-z]{3,}\s+[A-Za-z]{3,}/.test(rest);
+  }
+
+  // A figure label: short, often a symbol with a plain subscript ("T_A", "x_0", "T_x - dT_x") -> math.
+  function labelMath(text) {
+    const t = String(text || "").trim();
+    if (/[_^]/.test(t) && t.length <= 40 && !t.includes("$") && !/[A-Za-z]{3,}\s+[A-Za-z]{3,}/.test(t)) return [mathNode(t, false)];
+    return inlineMath(t);
+  }
+
+  // Inline content of a transcription: plain text with $...$ math (bare LaTeX is rendered as math).
   function inlineMath(text) {
+    if (bareLatex(text)) return [mathNode(String(text).trim(), false)];
+    if (/~~[\s\S]+?~~/.test(text)) {  // ~~crossed out~~ in the writer's hand, as in the layout PDF
+      const parts = [];
+      let last = 0;
+      for (const m of text.matchAll(/~~([\s\S]+?)~~/g)) {
+        if (m.index > last) parts.push(...inlineMath(text.slice(last, m.index)));
+        parts.push(h("s", { title: "Crossed out in the original" }, inlineMath(m[1])));
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) parts.push(...inlineMath(text.slice(last)));
+      return parts;
+    }
     const out = [];
     const re = /\$\$([^$]+?)\$\$|\$((?:\\\$|[^$\n])+?)\$|\\\((.+?)\\\)/g;
     let last = 0, m;
@@ -296,7 +323,7 @@
     let fid = f.svg_fidelity || null;  // the redraw's fidelity check: { score, passed, ... }
     const kind = [f.figure_label, f.kind ? f.kind.replace(/_/g, " ") : TYPE_LABEL[t]].filter(Boolean).join(", ") || TYPE_LABEL[t];
     const desc = f.description || text || "No description.";
-    const labels = f.labels && f.labels.length ? h("div", { class: "figure-labels" }, f.labels.slice(0, 24).map((l) => h("span", { text: l }))) : null;
+    const labels = f.labels && f.labels.length ? h("div", { class: "figure-labels" }, f.labels.slice(0, 24).map((l) => h("span", null, labelMath(l)))) : null;
     if (!docId || (!imgs.clean && !imgs.original)) {
       return h("div", { class: "figure" }, icon("image"),
         h("div", null, h("div", { class: "figure-kind", text: kind }), h("p", { class: "figure-desc", text: desc }), labels));
@@ -1015,12 +1042,21 @@
     S.model = eng ? eng.default_model : null;
     updateEngineButton();
   }
+  // Phone label: "Gemini 3.8 Flash (Medium)" -> "Flash · Medium"; "vendor/model-name:free" -> "model-name".
+  function shortModelLabel(text) {
+    const t = String(text || "");
+    const m = t.match(/^(?:\S+\s+)?(?:[\d.]+\s+)?(.+?)\s*\((.+)\)$/);
+    if (m) return `${m[1].split(/\s+/).pop()} · ${m[2]}`;
+    return t.replace(/^.*\//, "").replace(/:.*$/, "");
+  }
   function modelLabel(eng, id) { const m = eng && eng.models.find((x) => x.id === id); return m ? m.label : id; }
   function updateEngineButton() {
     const eng = currentEngine();
     const label = $("engine-btn-label");
-    if (!eng) { label.textContent = "No engine"; $("engine-btn").title = "Set up an engine in Settings"; return; }
+    const short = $("engine-btn-short");
+    if (!eng) { label.textContent = short.textContent = "No engine"; $("engine-btn").title = "Set up an engine in Settings"; return; }
     label.textContent = eng.id === "antigravity" ? modelLabel(eng, S.model) : `${eng.id === "gemini" ? "Gemini key" : "OpenRouter key"}, ${S.model}`;
+    short.textContent = shortModelLabel(eng.id === "antigravity" ? modelLabel(eng, S.model) : S.model);
     $("engine-btn").title = `${eng.label}: ${modelLabel(eng, S.model)}`;
     $("engine-btn").setAttribute("aria-label", `Engine: ${eng.label}, model ${modelLabel(eng, S.model)}. Change`);
   }

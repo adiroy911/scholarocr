@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Web app: the model picker shows a short name on phones ("Flash · Low") instead of a cut-off one; the sidebar's
+  "Recent" heading is larger. Figure labels and text written as LaTeX without `$` (`\theta_1`, `T_A`, `x_0`)
+  render as math, label chips no longer style the math inside them, and `~~crossed out~~` text is struck through
+  (as in the layout PDF) instead of showing the tildes. Prose lines were re-measured at 71 characters at most; the
+  "90 characters" finding was a raw LaTeX line.
+
 ## 0.4.0 (2026-11-03)
 
 - **Reading with Antigravity is about 7 times faster** (web app). Measured on pages 1-4 of a real handwritten
