@@ -191,7 +191,9 @@
         <p class="set-help">Pages read at the same time (one Antigravity process each, shared by all documents). Fewer is gentler on your quota; the app slows down by itself if Antigravity reports rate limiting. Effort is the model's reasoning effort; a level the model does not offer is ignored.</p>
         <label>Pages at once <select id="read-concurrency"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option></select></label>
         <label>Effort for reading pages <select id="read-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Max</option></select></label>
-        <label>Effort for questions and Redraw <select id="chat-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Max</option></select></label>
+        <label>Effort for questions, Redraw and the second look <select id="chat-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Max</option></select></label>
+        <label class="set-check"><input type="checkbox" id="review-flagged"> Second look at doubtful elements</label>
+        <p class="set-help" id="review-help">After a page is accepted, its doubtful elements (at most 8) are checked against their crops in one more Antigravity call. A page with doubtful elements then costs more than twice the tokens and about two more minutes; pages with nothing doubtful cost nothing extra. The original reading is kept and a change can be undone from the element.</p>
       </section>
       <section class="set-section">
         <h3 id="textvar-heading">Text shown and exported</h3>

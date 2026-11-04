@@ -117,7 +117,15 @@ def heading_level(el: Element) -> int:
 
 def marks_label(marks: str) -> str:
     inner = marks.strip().strip("[]()").strip()
-    return f"[{inner} marks]" if inner else ""
+    if not inner:
+        return ""
+    return f"[{inner}]" if re.search(r"\b(marks?|M)$", inner, re.I) else f"[{inner} marks]"
+
+
+def marks_in_text(marks: str, text: str) -> bool:
+    """True when ``text`` already ends with the marks as printed ("... [2 Marks]", "... (3)")."""
+    inner = re.sub(r"\s*\b(marks?|M)$", "", marks.strip().strip("[]()").strip(), flags=re.I)
+    return bool(inner) and re.search(rf"[\[(]\s*{re.escape(inner)}\s*(marks?|M)?\s*[\])]\s*$", text, re.I) is not None
 
 
 def plain_text(el: Element) -> str:
@@ -151,8 +159,12 @@ def math_latex(el: Element) -> str | None:
 
 
 # ------------------------------------------------------------------ chemistry (\ce)
-_ARROWS = (("<=>", r" \rightleftharpoons "), ("<->", r" \leftrightarrow "), ("->", r" \rightarrow "),
-           ("<-", r" \leftarrow "))
+_ARROWS = {"<=>>": r"\rightleftharpoons", "<<=>": r"\rightleftharpoons", "<=>": r"\rightleftharpoons",
+           "<-->": r"\leftrightarrow", "<->": r"\leftrightarrow", "->": r"\rightarrow", "<-": r"\leftarrow"}
+_CE_ARROW = re.compile(r"(<=>>|<<=>|<=>|<-->|<->|->|<-)(?:\[([^\]]*)\])?(?:\[([^\]]*)\])?")
+_CE_SYMBOLS = {"^": r"\uparrow", "v": r"\downarrow"}  # gas given off, precipitate
+_CE_ADDUCT = re.compile(r"(?<=[A-Za-z)\]\d])[*.](?=\d*[A-Z(\[])")  # CuSO4*5H2O, CuSO4.5H2O
+_CE_STATE = re.compile(r"^(.+?)(\(\.?(?:s|l|g|aq)\))$")
 
 
 def _balanced_group(s: str, start: int) -> int:
@@ -171,6 +183,15 @@ def _balanced_group(s: str, start: int) -> int:
 def _ce_token(tok: str) -> str:
     if tok in ("+", "=") or tok.startswith("\\"):
         return tok
+    if tok in _CE_SYMBOLS:
+        return _CE_SYMBOLS[tok]
+    parts = _CE_ADDUCT.split(tok)
+    if len(parts) > 1 and re.search("[A-Za-z]", parts[0]):  # not a decimal coefficient (0.5H2O)
+        return r" \cdot ".join(_ce_token(p) for p in parts)
+    state = ""
+    sm = _CE_STATE.match(tok)
+    if sm:
+        tok, state = sm.group(1), sm.group(2)
     m = re.match(r"^(\d+(?:/\d+)?)(.*)$", tok)  # stoichiometric coefficient
     coeff, body = (m.group(1), m.group(2)) if m and m.group(2) else ("", tok)
     charge = ""
@@ -178,15 +199,32 @@ def _ce_token(tok: str) -> str:
     cm = re.match(r"^(.*?[A-Za-z0-9)\]])(?:\^(\{[^}]*\}|[^{}\s]+)|([+-]))$", body)
     if cm:
         body, charge = cm.group(1), (cm.group(2) or cm.group(3)).strip("{}")
-    body = re.sub(r"(?<=[A-Za-z)\]])(\d+)", r"_{\1}", body)
-    return coeff + body + (f"^{{{charge}}}" if charge else "")
+    body = re.sub(r"(?<=[A-Za-z)\]])(\d+)", r"_{\1}", body).replace("#", r"\equiv ")
+    return coeff + body + (f"^{{{charge}}}" if charge else "") + state
+
+
+def _ce_arrow(m: re.Match) -> str:
+    arrow = _ARROWS[m.group(1)]
+    above, below = (r"\ ".join(_ce_token(t) for t in (g or "").split()) for g in m.groups()[1:])
+    if not above and not below:
+        return arrow
+    if arrow == r"\rightarrow":
+        return rf"\xrightarrow[{below}]{{{above}}}" if below else rf"\xrightarrow{{{above}}}"
+    over = rf"\overset{{{above}}}{{{arrow}}}"
+    return rf"\underset{{{below}}}{{{over}}}" if below else over
 
 
 def ce_body_to_math(body: str) -> str:
-    """Approximate mhchem syntax with plain math (subscripts, charges, arrows)."""
-    for arrow, repl in _ARROWS:
-        body = body.replace(arrow, repl)
-    return " ".join(_ce_token(t) for t in body.split())
+    """Approximate mhchem syntax with plain math (subscripts, charges, arrows with labels, gas and precipitate
+    marks, adduct dots, triple bonds)."""
+    parts: list[str] = []
+    pos = 0
+    for m in _CE_ARROW.finditer(body):
+        parts.extend(_ce_token(t) for t in body[pos:m.start()].split())
+        parts.append(_ce_arrow(m))
+        pos = m.end()
+    parts.extend(_ce_token(t) for t in body[pos:].split())
+    return " ".join(parts)
 
 
 def ce_to_math(latex: str) -> str:
@@ -213,12 +251,65 @@ def ce_to_math(latex: str) -> str:
 
 
 # ------------------------------------------------------------------ questions and inline math
-def starts_with_question_number(number: str | None, text: str) -> bool:
-    """True when ``text`` already begins with the printed question number ("4. If", "Q4)", "(4)")."""
-    if not number:
+_DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+_QUESTION_WORD = re.compile(r"^(?:Q(?:ue(?:s(?:tion)?)?)?\.?|प्रश्न(?:\s*सं(?:ख्या)?\.?)?)\s*", re.I)
+
+
+def _question_parts(number: str) -> list[str]:
+    """"23.(a)" -> ["23", "a"], "Q.१२" -> ["12"], "(क)" -> ["क"]."""
+    return re.findall(r"\w+", _QUESTION_WORD.sub("", number.translate(_DEVANAGARI_DIGITS).strip()))
+
+
+def _text_starts_with(parts: list[str], text: str) -> bool:
+    if not parts:
         return False
-    stripped = text.lstrip("*_ \\")
-    return re.match(rf"^(Q(uestion)?\.?\s*)?\(?{re.escape(number)}\b", stripped, re.I) is not None
+    stripped = text.translate(_DEVANAGARI_DIGITS).lstrip("*_ \\")
+    pattern = r"\W*" + r"\W*".join(re.escape(x) for x in parts)
+    # A number ends where the word ends; a letter ("a", "क") also needs punctuation, or "A person" would match "a".
+    end = r"(?!\w)" if any(c.isdigit() for c in parts[-1]) else r"(?=[.):\]]|$)"
+    return any(re.match(pattern + end, candidate) for candidate in (_QUESTION_WORD.sub("", stripped), stripped))
+
+
+def starts_with_question_number(number: str | None, text: str) -> bool:
+    """True when ``text`` already begins with the printed question number, whatever punctuation joins its parts:
+    "4. If", "Q4)", "(4)", "Q.23. (a)" for 23.(a), "(क)", "प्रश्न 7." and "१२." for 12."""
+    return bool(number) and _text_starts_with(_question_parts(number), text)
+
+
+def question_lead(number: str | None, text: str) -> str:
+    """The part of the question number still to print before ``text``. Empty when the text starts with all of it;
+    "17" for number "17 a." and text "a. Nitrogen ..."; otherwise the whole number."""
+    if not number or starts_with_question_number(number, text):
+        return ""
+    parts = _question_parts(number)
+    # a part named a few words in ("Find a) the total ..."): the text already prints it
+    if len(parts) == 1 and re.search(rf"(?:^|[\s(]){re.escape(parts[0])}[.)]", text[:24]):
+        return ""
+    if len(parts) > 1 and _text_starts_with(parts[-1:], text):
+        return number[:number.rfind(parts[-1])].rstrip(" (.,") or number
+    return number.strip()
+
+
+def question_label(lead: str) -> str:
+    """"Q12" for a number; a part without a question number ("(i)", "b)") or "Q13" as it is."""
+    return f"Q{lead}" if lead[:1].isdigit() else lead
+
+
+_EMPHASIS = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*|(?<![\w*])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![\w*])")
+
+
+def split_emphasis(text: str) -> list[tuple[str, str | None]]:
+    """[(segment, None | "bold" | "italic")]: models sometimes mark printed bold or italic with ``**`` and ``*``."""
+    out: list[tuple[str, str | None]] = []
+    pos = 0
+    for m in _EMPHASIS.finditer(text):
+        if m.start() > pos:
+            out.append((text[pos:m.start()], None))
+        out.append((m.group(1), "bold") if m.group(1) is not None else (m.group(2), "italic"))
+        pos = m.end()
+    if pos < len(text):
+        out.append((text[pos:], None))
+    return out
 
 
 # $...$ not preceded by a backslash, not $$, no leading/trailing space inside (so "$5 and $10" stays text).

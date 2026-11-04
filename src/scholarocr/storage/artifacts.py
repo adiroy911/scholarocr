@@ -68,6 +68,18 @@ class ArtifactStore:
                 pass
         return dest
 
+    def restore_source(self, document_id: str, rel: str, src: Path) -> None:
+        """Put a preserved source back at its recorded path (the same file was attached again)."""
+        dest = self.resolve(document_id, rel)
+        if dest.exists():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        try:
+            os.chmod(dest, 0o444)
+        except OSError:
+            pass
+
     def delete_generated(self, document_id: str) -> list[str]:
         """Delete everything except the preserved sources and manifest."""
         d = self.doc_dir(document_id)

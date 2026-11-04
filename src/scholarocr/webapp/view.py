@@ -13,6 +13,7 @@ from typing import Any
 from ..export.base import document_is_handwritten, resolve_text_variant
 from ..schemas import ElementType, PageStatus
 from ..service import ScholarOCR
+from .review import NOTE_PREFIX, page_note, review_view, shown_uncertainty
 
 MAX_ELEMENTS_PER_PAGE = 400
 MAX_TEXT = 20000
@@ -28,7 +29,10 @@ def _cut(s: str | None, n: int = MAX_TEXT) -> str | None:
 def element_view(el) -> dict[str, Any]:
     d: dict[str, Any] = {"id": el.element_id, "type": el.type.value, "role": el.role.value,
                          "text": _cut(el.content) or "", "uncertainty": el.uncertainty.value,
-                         "has_source": True}
+                         "mark": shown_uncertainty(el), "has_source": True}
+    review = review_view(el)
+    if review is not None:
+        d["review"] = review
     if el.latex:
         d["latex"] = _cut(el.latex, 4000)
     if el.level is not None:
@@ -56,8 +60,9 @@ def element_view(el) -> dict[str, Any]:
                                            "labels_missing": (fid.get("labels_missing") or [])[:10]}
     if el.question is not None and (el.question.number or el.question.marks):
         d["question"] = {"number": el.question.number, "marks": el.question.marks}
-    if el.uncertainty_reasons:
-        d["reasons"] = [_cut(r, 300) for r in el.uncertainty_reasons[:4]]
+    reasons = [r for r in el.uncertainty_reasons if not r.startswith("reviewed: ")]  # the review field says it
+    if reasons:
+        d["reasons"] = [_cut(r, 300) for r in reasons[:4]]
     if el.handwritten:
         d["handwritten"] = True
     if el.parent_id:
@@ -70,13 +75,15 @@ def element_view(el) -> dict[str, Any]:
 def document_view(svc: ScholarOCR, document_id: str, text_pref: str = "auto") -> dict[str, Any]:
     """``text_pref`` is the saved setting (auto | clean | faithful); the view says which variant to show."""
     doc = svc.get_document(document_id)
-    counts = {"low": 0, "medium": 0, "high": 0, "unresolved": 0}
+    counts = {"low": 0, "medium": 0, "high": 0, "unresolved": 0}  # as marked on the sheet
+    reviews = {"confirmed": 0, "corrected": 0, "unreadable": 0, "rejected": 0, "undone": 0}
     pages = []
     has_tables = False
     for p in sorted(doc.pages, key=lambda x: x.page_number):
         els = sorted(p.elements, key=lambda e: e.reading_order)
         for e in els:
-            counts[e.uncertainty.value] = counts.get(e.uncertainty.value, 0) + 1
+            shown = shown_uncertainty(e)
+            counts[shown] = counts.get(shown, 0) + 1
             has_tables = has_tables or e.type in SPREADSHEET_TYPES
         entry: dict[str, Any] = {"page_number": p.page_number, "status": p.status.value,
                                  "route": p.route.value if p.route else None, "label": p.page_label,
@@ -85,7 +92,13 @@ def document_view(svc: ScholarOCR, document_id: str, text_pref: str = "auto") ->
             entry["truncated"] = len(els) - MAX_ELEMENTS_PER_PAGE
         if p.error:
             entry["error"] = str(p.error)[:400]
-        warnings = [w for w in p.warnings if not w.startswith("model note:")][:5]
+        for ev in entry["elements"]:
+            if "review" in ev:
+                reviews[ev["review"]["state"]] = reviews.get(ev["review"]["state"], 0) + 1
+        note = page_note(p.warnings)
+        if note:
+            entry["review_note"] = note
+        warnings = [w for w in p.warnings if not w.startswith(("model note:", NOTE_PREFIX))][:5]
         notes = [w[len("model note: "):] for w in p.warnings if w.startswith("model note:")][:5]
         if warnings:
             entry["warnings"] = warnings
@@ -94,14 +107,17 @@ def document_view(svc: ScholarOCR, document_id: str, text_pref: str = "auto") ->
         pages.append(entry)
     done = sum(1 for p in doc.pages if p.status in (PageStatus.DONE, PageStatus.BLANK))
     formats = ["markdown", "docx", "latex", "searchable-pdf", "layout-pdf", "json"] + (["csv", "xlsx"] if has_tables else [])
+    plan = svc.resume_plan(document_id, doc)
     return {"document_id": document_id, "title": doc.title, "filenames": doc.original_filenames,
             "page_count": doc.page_count, "pages_done": done, "status": doc.status, "pages": pages,
-            "uncertainty": counts, "export_formats": formats if done else [],
+            "uncertainty": counts, "reviews": reviews, "export_formats": formats if done else [],
             "native_equations": shutil.which("pandoc") is not None,  # Word export: OMML needs pandoc
             "handwritten": document_is_handwritten(doc),
             "text_variant": resolve_text_variant(doc, text_pref),
             # read before box refinement, figure crops or cleaned text existed: offer "Update layout"
-            "layout_update": svc.layout_outdated(document_id, doc)}
+            "layout_update": svc.layout_outdated(document_id, doc),
+            # pages not accepted yet: offer "Resume reading", or say that the stored source is gone
+            "resume": {"unread": plan["unread"], "source_missing": plan["source_missing"]} if plan["unread"] else None}
 
 
 def verification_view(report) -> dict[str, Any]:

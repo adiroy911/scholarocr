@@ -15,6 +15,7 @@ Nothing here calls a model or re-reads the page: only the IR, the stored crops a
 from __future__ import annotations
 
 import html
+import json
 import re
 import tempfile
 from collections import Counter
@@ -46,7 +47,7 @@ from .base import (
     ordered_elements,
     ordered_pages,
     split_inline_math,
-    starts_with_question_number,
+    question_lead,
     unclear_text,
 )
 
@@ -149,6 +150,7 @@ def is_handwritten_document(document: Document) -> bool:
 
 def parse_options(ctx: ExportContext) -> LayoutOptions:
     default_variant = "clean" if is_handwritten_document(ctx.document) else "faithful"
+    variant = _choice(ctx, "text_variant", (*TEXT_VARIANTS, "auto"), default_variant)  # auto: the app's saved choice
     pages = ctx.option("pages")
     selected = None
     if pages not in (None, "", "all"):
@@ -156,7 +158,7 @@ def parse_options(ctx: ExportContext) -> LayoutOptions:
         if not selected:
             raise ExportError(f"Option 'pages' selects no pages: {pages!r}")
     return LayoutOptions(
-        text_variant=_choice(ctx, "text_variant", TEXT_VARIANTS, default_variant),
+        text_variant=default_variant if variant == "auto" else variant,
         figures=_choice(ctx, "figures", FIGURE_MODES, "clean"),
         background=_choice(ctx, "background", BACKGROUNDS, "blank"),
         show_boxes=ctx.flag("show_boxes", False),
@@ -225,6 +227,7 @@ class Item:
     fit: float | None = None
     target: float | None = None
     tex_errors: int = 0
+    ink: Box | None = None  # where the text really is after layout (Chromium renderer)
 
     @property
     def has_text(self) -> bool:
@@ -251,6 +254,13 @@ _BULLET = re.compile(r"^\s*(?:[•●▪◦‣∙·\-–*]|\(?\d{1,3}[.)]|\(?[a-
 
 
 _LEAD_BULLET = re.compile(r"^(\s*[•●▪◦‣∙·])\s+")
+# A word the writer crossed out that the reader could not make out: a short struck gap, not the words "crossed out".
+_CROSSED_BARE = re.compile(r"\[(?:crossed[ -]out|struck(?: through)?|strikethrough)\s*\]", re.I)
+_GAP = "\ue000"  # private-use mark for that gap, so line handling does not take it for white space
+_STRUCK_GAP = f"~~{_GAP}~~"
+_LATEX_COMMAND = re.compile(r"\\[a-zA-Z]{2,}")
+_DELIMITED = re.compile(r"\\(left|right|begin|end)(?![a-zA-Z])")
+_RELATION = re.compile(r"\\Rightarrow(?![a-zA-Z])|\\approx(?![a-zA-Z])|\\quad(?![a-zA-Z])|=")
 
 
 def _rich_segment(text: str) -> str:
@@ -263,7 +273,7 @@ def _rich_segment(text: str) -> str:
 
 def _plain_segment(text: str) -> str:
     text = _CROSSED.sub(lambda m: m.group(1), text)
-    return _BOLD.sub(lambda m: m.group(1), text.replace("~~", ""))
+    return _BOLD.sub(lambda m: m.group(1), text.replace("~~", "").replace(_GAP, ""))
 
 
 def _tex_attr(tex: str) -> str:
@@ -300,7 +310,8 @@ def rich_line(line: str) -> tuple[str, str, str]:
             span = f'<span class="im" data-tex="{_tex_attr(seg)}" data-alt="{_tex_attr(alt)}"></span>'
             if before or after:  # punctuation touching the math stays on its line: "(dx)", "T_B."
                 span = f'<span class="nw">{_rich_segment(before)}{span}{_rich_segment(after)}</span>'
-            parts_html.append(span)
+            # a strike-through does not reach into a formula's boxes: draw the line over it
+            parts_html.append(f'<span class="sm">{span}</span>' if struck else span)
             parts_plain.append(_plain_segment(before) + alt + _plain_segment(after))
             if before or after:
                 parts_words.append(_plain_segment(before + " " + after))
@@ -310,6 +321,9 @@ def rich_line(line: str) -> tuple[str, str, str]:
             if i:
                 parts_html.append("</s>" if struck else "<s>")
                 struck = not struck
+            if struck and piece == _GAP:
+                parts_html.append('<span class="sm sgap"></span>')
+                continue
             parts_html.append(_rich_segment(piece))
         parts_plain.append(_plain_segment(seg))
         parts_words.append(_plain_segment(seg))
@@ -325,8 +339,14 @@ def _close_strikes_per_line(text: str) -> str:
     return re.sub(r"~~(.+?)~~", per_line, text, flags=re.S)
 
 
+def _normalise_strikes(text: str) -> str:
+    """Every way a reading marks crossed-out writing becomes ``~~...~~``, which may enclose inline math."""
+    text = _CROSSED.sub(lambda m: f"~~{m.group(1).strip()}~~", text)
+    return _CROSSED_BARE.sub(_STRUCK_GAP, text)
+
+
 def rich_text(text: str) -> tuple[str, str, str]:
-    lines = [ln.strip() for ln in _close_strikes_per_line(text).splitlines()]
+    lines = [ln.strip() for ln in _close_strikes_per_line(_normalise_strikes(text)).splitlines()]
     lines = [ln for ln in lines if ln]
     done = [rich_line(ln) for ln in lines]
     return "<br>".join(d[0] for d in done), "\n".join(d[1] for d in done), " ".join(d[2] for d in done)
@@ -334,9 +354,10 @@ def rich_text(text: str) -> tuple[str, str, str]:
 
 def _question_prefix(el: Element, text: str) -> tuple[str, str]:
     q = el.question
-    if q is None or not q.number or starts_with_question_number(q.number, text):
+    lead = question_lead(q.number, text) if q else ""
+    if not lead:
         return "", ""
-    num = q.number if q.number.endswith((".", ")")) else q.number + "."
+    num = lead if lead.endswith((".", ")")) else lead + "."
     return f'<span class="qn">{html.escape(num)}</span>', num + " "
 
 
@@ -400,13 +421,55 @@ def _text_item(el: Element, box: Box, variant: str) -> Item:
                 expected=qp + words + mp, spread=kind in ("text", "small"), scale=scale, floor=floor)
 
 
-def _math_item(el: Element, box: Box) -> Item:
-    tex = math_latex(el)
+def is_bare_latex(text: str) -> bool:
+    """A whole text that is LaTeX written without ``$``. Prose with a command in it is not."""
+    t = text.strip()
+    if not t or "$" in t or "~~" in t or not _LATEX_COMMAND.search(t):
+        return False
+    rest = re.sub(r"[_^]\{[^}]*\}|[_^]\w", " ", re.sub(r"\\[a-zA-Z]+", " ", t))
+    return not re.search(r"[A-Za-z]{3,}\s+[A-Za-z]{3,}", rest)
+
+
+def split_at_relations(tex: str) -> list[str]:
+    """Break an equation before its top-level ``=``, ``\\Rightarrow``, ``\\approx`` and ``\\quad``, so a line too long
+    for the page can wrap there. Fractions, brackets and environments stay whole. [] when there is nowhere to break."""
+    parts: list[str] = []
+    start = depth = i = 0
+    while i < len(tex):
+        c = tex[i]
+        if c == "\\":
+            m = _DELIMITED.match(tex, i)
+            if m:
+                depth += 1 if m.group(1) in ("left", "begin") else -1
+                i = m.end()
+                continue
+            if depth == 0 and i > start and _RELATION.match(tex, i):
+                parts.append(tex[start:i])
+                start = i
+            i += 2 if i + 1 < len(tex) and not tex[i + 1].isalpha() else 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        elif c == "=" and depth == 0 and i > start:
+            parts.append(tex[start:i])
+            start = i
+        i += 1
+    parts.append(tex[start:])
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts if len(parts) > 1 else []
+
+
+def _math_item(el: Element, box: Box, tex: str | None = None) -> Item:
+    tex = tex or math_latex(el)
     if tex is None:  # only a linearised reading exists
         h, p, w = rich_text(el.content)
         return Item(el, "text", "body", box, box.copy(), html=f"<i>{h}</i>" if h else "", plain=p, expected=w)
     alt = el.content.strip() or latex_to_readable(tex)
-    body = f'<div class="dm" data-tex="{_tex_attr(tex)}" data-alt="{_tex_attr(alt)}"></div>'
+    parts = split_at_relations(tex)
+    wrap = f' data-parts="{_tex_attr(json.dumps(parts))}"' if parts else ""
+    body = f'<div class="dm" data-tex="{_tex_attr(tex)}" data-alt="{_tex_attr(alt)}"{wrap}></div>'
     return Item(el, "math", "math", box, box.copy(), min_size=MATH_MIN, max_size=MATH_MAX, html=body,
                 plain=latex_to_readable(tex), expected="", scale=SCALES["math"][0], floor=SCALES["math"][1])
 
@@ -546,6 +609,14 @@ def _figure_kind(el: Element, path: Path, doc_dir: Path) -> str:
     return "svg" if path.suffix.lower() == ".svg" else "original"
 
 
+def _exact_placement(el: Element, kind: str | None) -> Box | None:
+    """The page rectangle stored with a cleaned crop."""
+    placed = el.figure.image_clean_box if el.figure else None
+    if kind != "clean" or not placed or len(placed) != 4:
+        return None
+    return Box(*placed)
+
+
 def _figure_item(ctx: ExportContext, page: Page, el: Element, box: Box, mode: str, assets: Path) -> Item:
     path = figure_image_path(ctx.doc_dir, el, mode)
     whole_pages = {(Path(ctx.doc_dir) / rel).resolve()
@@ -563,7 +634,8 @@ def _figure_item(ctx: ExportContext, page: Page, el: Element, box: Box, mode: st
             if out is not None:
                 path, whitened = out, True
         return Item(el, "figure", "", box, box.copy(), image=path, image_kind=kind, status="image",
-                    image_box=image_placement(ctx, page, box, path), whitened=whitened)
+                    image_box=_exact_placement(el, kind) or image_placement(ctx, page, box, path),
+                    whitened=whitened)
     fig = el.figure
     label = (fig.figure_label if fig else None) or "Figure"
     desc = ((fig.description if fig else "") or el.content or "figure (no image stored)").strip()
@@ -599,6 +671,8 @@ def plan_page(ctx: ExportContext, page: Page, opts: LayoutOptions, assets: Path)
             item = _math_item(el, box)
         elif el.type == ElementType.TABLE and el.table is not None and el.table.rows:
             item = _table_item(el, box)
+        elif is_bare_latex(element_text(el, opts.text_variant)) and not (el.items or is_unclear(el)):
+            item = _math_item(el, box, _base.clean_latex(element_text(el, opts.text_variant)))
         else:
             item = _text_item(el, box, opts.text_variant)
             if not item.html.strip():
@@ -660,6 +734,24 @@ def _split(a: Item, b: Item, inter: Box) -> None:
             left.adjusted = right.adjusted = True
 
 
+def _pen_under(fig: Item, region: Box) -> bool:
+    """Whether a figure has strokes in this part of the page. Only a cleaned crop can tell (white is paper there);
+    any other image counts as covering its whole box."""
+    if fig.image_kind != "clean" or fig.image is None or fig.image_box is None:
+        return True
+    ib = fig.image_box
+    try:
+        with Image.open(fig.image) as im:
+            grey = np.asarray(im.convert("L"))
+    except OSError:
+        return True
+    sx, sy = grey.shape[1] / max(ib.w, 0.01), grey.shape[0] / max(ib.h, 0.01)
+    x0, x1 = max(0, int((region.x0 - ib.x0) * sx)), max(0, int((region.x1 - ib.x0) * sx) + 1)
+    y0, y1 = max(0, int((region.y0 - ib.y0) * sy)), max(0, int((region.y1 - ib.y0) * sy) + 1)
+    part = grey[y0:y1, x0:x1]
+    return bool(part.size) and bool((part < 200).any())
+
+
 def resolve_overlaps(plan: PagePlan) -> None:
     """Keep boxes from overprinting: text boxes that overlap share the overlap band; a text box overlapping a
     figure is trimmed out of it (figures keep their size). A text box nested in another text box is cut out of
@@ -676,6 +768,8 @@ def resolve_overlaps(plan: PagePlan) -> None:
                 continue
             if fa or fb:
                 t, f = (b, a) if fa else (a, b)
+                if not _pen_under(f, inter):
+                    continue  # an empty corner of the figure's rectangle: nothing to avoid
                 if inter.area >= IN_FIGURE * t.box.area:
                     t.over_figure = True
                 elif not _trim_out(t, f.box):
@@ -752,6 +846,11 @@ def render_chromium(plans: list[PagePlan], browser: layout_html.Browser, work: P
                     pass
             it.tex_errors = int(r.get("texerr") or 0)
             it.grew = r.get("grew", "")
+            if r.get("ink"):
+                try:
+                    it.ink = Box(*(float(v) for v in r["ink"].split(",")))
+                except (TypeError, ValueError):
+                    pass
             if r.get("box"):
                 try:
                     x0, y0, x1, y1 = (float(v) for v in r["box"].split(","))
@@ -979,8 +1078,112 @@ def _finalise(raw_pdf: Path, plans: list[PagePlan], out_path: Path, title: str, 
         doc.save(out_path, garbage=3, deflate=True)
 
 
+def _glyphs(page: pymupdf.Page) -> list[tuple[float, float, float, float]]:
+    """Each printed character's box, narrowed to the middle of its height: a font's line box is far taller than the
+    glyph, and a fraction's numerator would otherwise touch its denominator."""
+    out = []
+    for block in page.get_text("rawdict")["blocks"]:
+        for line in block.get("lines", []):
+            for span in line["spans"]:
+                for ch in span["chars"]:
+                    if not ch["c"].strip():
+                        continue
+                    x0, y0, x1, y1 = ch["bbox"]
+                    mid, half = (y0 + y1) / 2, (y1 - y0) * 0.2
+                    if x1 - x0 > 0.2 and half > 0:
+                        out.append((x0, mid - half, x1, mid + half))
+    return out
+
+
+def _holders(items: list[Item], cx: float, cy: float) -> list[Item]:
+    """The text elements whose laid-out text holds this point, smallest first."""
+    found = []
+    for it in items:
+        b = it.ink or it.box
+        if b.x0 - 1 <= cx <= b.x1 + 1 and b.y0 - 1 <= cy <= b.y1 + 1:
+            found.append(it)
+    return sorted(found, key=lambda it: (it.ink or it.box).area)
+
+
+def _owner(items: list[Item], cx: float, cy: float) -> Item | None:
+    """The smallest text element whose laid-out text holds this point."""
+    found = _holders(items, cx, cy)
+    return found[0] if found else None
+
+
+def _overprinted(page: pymupdf.Page, plan: PagePlan) -> list[str]:
+    """Pairs of elements whose printed characters land on each other, or on the pen strokes of a cropped figure."""
+    texts = [it for it in plan.items if it.has_text]  # with text set over a figure: its backing hides nothing fully
+    glyphs = _glyphs(page)
+    if not glyphs:
+        return []
+    arr = np.asarray(glyphs)
+    holders = [_holders(texts, (g[0] + g[2]) / 2, (g[1] + g[3]) / 2) for g in glyphs]
+    owners = [h[0] if h else None for h in holders]
+    hits: Counter[tuple[str, str]] = Counter()
+    areas = (arr[:, 2] - arr[:, 0]) * (arr[:, 3] - arr[:, 1])
+    for i in range(len(glyphs) - 1):
+        ix = np.minimum(arr[i, 2], arr[i + 1:, 2]) - np.maximum(arr[i, 0], arr[i + 1:, 0])
+        iy = np.minimum(arr[i, 3], arr[i + 1:, 3]) - np.maximum(arr[i, 1], arr[i + 1:, 1])
+        shared = np.where((ix > 0) & (iy > 0), ix * iy, 0.0)
+        for off in np.flatnonzero(shared >= 0.35 * np.minimum(areas[i], areas[i + 1:])):
+            # Characters landing on each other where two elements' text overlap: both may sit in the area of the
+            # same smaller element, so it takes every element there to name the pair. Within one element they do not
+            # count (a formula's accents).
+            there = {it.el.element_id for it in holders[i]} | {it.el.element_id for it in holders[i + 1 + int(off)]}
+            if len(there) >= 2:
+                hits[tuple(sorted(there)[:2])] += 1  # type: ignore[arg-type]
+    for fig in plan.items:
+        if fig.kind != "figure" or fig.image is None or fig.image.suffix.lower() == ".svg":
+            continue
+        ib = fig.image_box or fig.box
+        try:
+            with Image.open(fig.image) as im:
+                grey = np.asarray(im.convert("L"))
+        except OSError:
+            continue
+        sx, sy = grey.shape[1] / max(ib.w, 0.01), grey.shape[0] / max(ib.h, 0.01)
+        for g, own in zip(glyphs, owners):
+            if own is None:
+                continue
+            x0, y0 = int((g[0] - ib.x0) * sx), int((g[1] - ib.y0) * sy)
+            x1, y1 = int((g[2] - ib.x0) * sx) + 1, int((g[3] - ib.y0) * sy) + 1
+            if x1 <= 0 or y1 <= 0 or x0 >= grey.shape[1] or y0 >= grey.shape[0]:
+                continue
+            region = grey[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
+            if region.size and float((region < 170).mean()) >= 0.12:
+                hits[tuple(sorted((own.el.element_id, fig.el.element_id)))] += 1  # type: ignore[arg-type]
+    return sorted("~".join(k) for k in hits)
+
+
+def _clipped(plan: PagePlan) -> list[str]:
+    """Elements whose laid-out text passes the edge of the page, where the page cuts it off."""
+    out = []
+    for it in plan.items:
+        b = it.ink
+        if b is not None and it.has_text and (b.x0 < -0.5 or b.y0 < -0.5 or b.x1 > plan.width + 0.5
+                                              or b.y1 > plan.height + 0.5):
+            out.append(it.el.element_id)
+    return out
+
+
+def _raw_latex(page: pymupdf.Page, plan: PagePlan) -> list[str]:
+    """Elements that printed LaTeX source as text."""
+    out = []
+    for w in page.get_text("words"):
+        if _LATEX_COMMAND.search(w[4]):
+            it = _owner(plan.items, (w[0] + w[2]) / 2, (w[1] + w[3]) / 2)
+            eid = it.el.element_id if it else f"page {plan.page.page_number}"
+            if eid not in out:
+                out.append(eid)
+    return out
+
+
 def _verify(out_path: Path, plans: list[PagePlan], renderer: str, warnings: list[str]) -> dict[str, Any]:
     per_page: list[dict[str, Any]] = []
+    overprinted: list[str] = []
+    raw_latex: list[str] = []
+    clipped: list[str] = []
     sizes_ok = True
     with pymupdf.open(out_path) as doc:
         count_ok = doc.page_count == len(plans)
@@ -1017,6 +1220,9 @@ def _verify(out_path: Path, plans: list[PagePlan], renderer: str, warnings: list
                 if m / total < RECALL_OK:
                     outside.append(it.el.element_id)
             row["text_in_box_recall"] = round(m_page / t_page, 4) if t_page else None
+            overprinted += _overprinted(page, plan)
+            raw_latex += _raw_latex(page, plan)
+            clipped += _clipped(plan)
             matched_all += m_page
             total_all += t_page
             per_page.append(row)
@@ -1050,6 +1256,10 @@ def _verify(out_path: Path, plans: list[PagePlan], renderer: str, warnings: list
         "shrunk_detail": [{"element_id": it.el.element_id, "size": it.size, "target": it.target}
                           for it in texty if it.status == "shrunk"],
         "overflowed": overflowed,
+        # what a reader would see as broken, measured on the finished PDF
+        "clipped_by_page": clipped,  # text that passes the page edge and is cut off (Chromium renderer only)
+        "overprinted": overprinted,  # "a~b": printed characters of a land on b's characters or pen strokes
+        "raw_latex": raw_latex,  # LaTeX source printed as text
         "fitted_to_box": [it.el.element_id for it in own],
         "boxes_adjusted": [it.el.element_id for it in items if it.adjusted],
         "overlaps_unresolved": [o for plan in plans for o in plan.overlaps],
@@ -1063,6 +1273,15 @@ def _verify(out_path: Path, plans: list[PagePlan], renderer: str, warnings: list
     if outside:
         warnings.append(f"Layout PDF: text of {len(outside)} element(s) was not found inside its box: "
                         + ", ".join(outside[:12]))
+    if clipped:
+        warnings.append(f"Layout PDF: {len(clipped)} element(s) run past the page edge and are cut off: "
+                        + ", ".join(clipped[:12]))
+    if overprinted:
+        warnings.append(f"Layout PDF: {len(overprinted)} pair(s) of elements print over each other: "
+                        + ", ".join(overprinted[:12]))
+    if raw_latex:
+        warnings.append(f"Layout PDF: {len(raw_latex)} element(s) print LaTeX source as text: "
+                        + ", ".join(raw_latex[:12]))
     return {
         "renderer": renderer,
         "page_count": len(plans),

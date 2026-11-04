@@ -63,11 +63,19 @@ def wer(reference: str, hypothesis: str) -> float | None:
     return levenshtein(ref, hyp) / len(ref)
 
 
+# Different spellings of the same symbol; the name must end there (\\geq, not \\geqslant).
+_LATEX_SAME = {"dfrac": r"\frac", "tfrac": r"\frac", "geq": r"\ge", "leq": r"\le", "ne": r"\neq",
+               "imath": "i", "jmath": "j", "overrightarrow": r"\vec", "rightarrow": r"\to"}
+_LATEX_SAME_RE = re.compile(r"\\(" + "|".join(_LATEX_SAME) + r")(?![a-zA-Z])")
+_INLINE_MATH = re.compile(r"(?<![\\$])\$(?!\$)(?=\S)([^$\n]+?)(?<=\S)(?<!\\)\$(?!\$)")
+
+
 def normalize_latex(s: str) -> str:
-    s = re.sub(r"\\(left|right|displaystyle|,|;|!|:|quad|qquad)(?![a-zA-Z])", "", s)
+    s = re.sub(r"\\(left|right|displaystyle|,|;|!|:|quad|qquad)(?![a-zA-Z])", "", s).replace("~", "")
     s = re.sub(r"\\(mathrm|text|operatorname)\{([^{}]*)\}", r"\2", s)
-    s = s.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
-    return re.sub(r"\s+", "", s)
+    s = _LATEX_SAME_RE.sub(lambda m: _LATEX_SAME[m.group(1)], s)
+    s = re.sub(r"\s+", "", s)
+    return re.sub(r"([_^])\{(\\?[^{}\\])\}", r"\1\2", s)  # x_{0} is x_0
 
 
 def similarity(a: str, b: str) -> float:
@@ -84,7 +92,10 @@ def page_text(doc: Document, page_number: int) -> str:
     for el in sorted(page.elements, key=lambda e: e.reading_order):
         if el.type in FURNITURE_TYPES or el.type == ElementType.UNCERTAIN:
             continue
-        parts.append(el.text_for_search() if el.type == ElementType.TABLE else (el.content or el.latex or ""))
+        if el.type == ElementType.TABLE and el.table:
+            parts.append(" ".join(c for row in el.table.as_grid() for c in row if c))
+        else:
+            parts.append(el.content or el.latex or "")
     return "\n".join(p for p in parts if p)
 
 
@@ -117,6 +128,10 @@ def evaluate_document(doc: Document, gt: dict, doc_dir: Path | None = None) -> d
         elements = page.elements if page else []
         preds_math = [normalize_latex(e.latex or e.content) for e in elements
                       if e.type in (ElementType.EQUATION, ElementType.CHEMICAL_EQUATION)]
+        # A reference equation may have been read as inline $...$ math inside a paragraph.
+        preds_math += [normalize_latex(m) for e in elements
+                       if e.type not in (ElementType.EQUATION, ElementType.CHEMICAL_EQUATION)
+                       for m in _INLINE_MATH.findall(e.content or "")]
         for eq in gp.get("equations", []):
             eq_total += 1
             target = normalize_latex(eq)

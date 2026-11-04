@@ -61,39 +61,51 @@ like the original page. Each element is placed at its `bbox` (page points, refin
   `renderer="chromium"` turns the missing browser into an error instead. PyMuPDF alone is not the main renderer
   because it cannot typeset LaTeX (matplotlib's mathtext is not a dependency and has no mhchem or `aligned`).
 - **Text.** `element_text(el, variant)`: `clean` uses `clean_content` when present, else `content`. Inline
-  `$...$` math is typeset, `~~struck~~` and `[crossed out: …]` are drawn struck through, list items keep their
-  bullets, question numbers are added when the text lacks them and marks sit at the right. Fonts: Source Serif 4
+  `$...$` math is typeset, `~~struck~~` and `[crossed out: …]` are drawn struck through (a line is drawn over a
+  formula, too), `[crossed out]` with no reading is a short struck gap, a text that is only LaTeX written without `$`
+  is typeset as math, list items keep their bullets, question numbers are added when the text lacks them and marks
+  sit at the right. Fonts: Source Serif 4
   (Latin), Noto Serif Devanagari (Hindi), Anek (page numbers, headers, figure placeholders).
 - **Font sizes: one body size.** Handwritten boxes differ in height, so fitting each paragraph to its own box
   gave every paragraph a different size. Instead one body size is chosen: for each page, the largest size at
   which each paragraph fits its box is measured, and the page's size is the one at which three in four
   paragraphs fit (the 25th percentile of those sizes; the refined boxes carry the written line count and ink
-  height, so this follows the handwriting's own scale). The document size is the median of the page sizes;
-  every page within 20 % of it uses it, and a page that differs clearly (a landscape page in large writing)
-  keeps its own (`body_size`, `body_size_scope` per page). The size is between 7 and 20 pt. Every paragraph is
+  height, so this follows the handwriting's own scale). The document size is the median of the page sizes among
+  pages of the same shape. Every page of that shape uses it, also one in larger writing, so the size does not jump
+  from page to page; a page more than 20 % denser than that size, and a page of another shape (landscape), keep
+  their own (`body_size`, `body_size_scope` per page). The size is between 7 and 20 pt. Every paragraph is
   set at it; titles at 1.5×, headings 1.3×, subheadings 1.15×, captions and footnotes 0.88×, page numbers and
   headers 0.85×, equations 1.05×.
 - **When text does not fit** its box at that size: a one-line box (a heading, a short label, an equation) first
-  extends to the right into free paper, then any box grows down into free paper as far as the text needs,
+  extends to the right into free paper, an equation still too wide breaks before its top-level `=`, `\Rightarrow`,
+  `\approx` or `\quad` (fractions and brackets stay whole), then any box grows down into free paper as far as the text needs,
   stopping 2 pt before the next element below (or 6 pt before the page edge); such elements are listed in
   `moved` with the new box. A short text that would wrap only because its box is narrow ("• T ≡ T(x, t)") is kept
   on one line the same way. Only when there is no free space is the text shrunk, down to a floor (0.75× the body
   for text, 0.9× for equations, the body size for headings), with a warning and the element in `shrunk`; below
   2 % smaller it still counts as the shared size. Text that does not fit even at the floor overflows downward,
-  is listed in `overflowed` and named in a warning. Tables, figure placeholders and labels over a figure are
+  is listed in `overflowed` and named in a warning. Nothing is cut off by the page edge: text that would pass it
+  first slides into free space on its left, then shrinks below the floor as far as it takes (not below 5 pt).
+  Tables, figure placeholders and labels over a figure are
   still fitted to their own box (never above the body size; `fitted_to_box`). Punctuation touching inline math
   ("(dx)", "T_B.") and a leading bullet stay on the math's line. Multi-line text in a taller box has its leading
   opened so the lines span the box like the written lines did.
 - **Overlaps.** Text boxes that overlap share the overlap band (stacked boxes split it vertically, side-by-side
   ones horizontally); a text box overlapping a figure is trimmed out of it if it keeps at least half its size.
   Nested boxes are not split: text inside a figure gets a light backing, nested text boxes are listed in
-  `overlaps_unresolved`.
+  `overlaps_unresolved`. An empty corner of a cleaned figure's rectangle is not an overlap.
 - **Figures.** `clean` uses `figure.image_clean`, falling back to the original crop (`source.region_image`);
   that crop is a photo of the paper, so it is whitened by a conservative flat-field correction (ruled lines stay,
   faintly; counted as `whitened_here`). `original` uses the crop as stored; `svg` uses `figure.svg`, falling back
   to the crops. Without any stored image the region is cut from `pages/NNNN/original.png` (or `processed.png`) at
-  the box; without a page image either, a dashed box shows the figure label, description and labels. A crop cut
-  at the page's resolution with a small margin is drawn at its natural size, centred on its box.
+  the box; without a page image either, a dashed box shows the figure label, description and labels. A cleaned
+  crop is drawn exactly where it was cut from (`figure.image_clean_box`), so a stroke split between two figures
+  lines up; another crop cut at the page's resolution with a small margin is drawn at its natural size, centred on
+  its box. On a page whose pen colour differs from its rules, a cleaned crop follows strokes back along a removed
+  rule (a wire drawn on a ruled line) and drops stretches of rule the tracing missed.
+- **What verification checks on the finished PDF** (`layout_fidelity`, each with a warning): `clipped_by_page` (text
+  past the page edge), `overprinted` (`a~b`: printed characters of `a` on the characters or pen strokes of `b`),
+  `raw_latex` (LaTeX source printed as text). The first needs the Chromium renderer.
 
 ## Fonts and limitations
 
@@ -108,5 +120,11 @@ like the original page. Each element is placed at its `bbox` (page points, refin
 - Layout PDF needs a Chromium-family browser for typeset math (see above). With model-estimated boxes the
   positions are only as good as the estimates; refined boxes give a closer layout. Text extracted from the
   layout PDF's equations is KaTeX output (spacing characters, split glyphs), not LaTeX.
+- DOCX equations: pandoc's math reader has no mhchem, so `\ce{}` is first rewritten as plain math: subscripts,
+  charges, arrows with labels (`->[a][b]`), `^` and `v` as gas and precipitate arrows, `*` and a hydrate `.` as a dot,
+  `#` as a triple bond. Other mhchem syntax may not convert. A formula pandoc still cannot parse stays in the document as
+  its LaTeX source in Courier New, as written (`\ce{...}` included), and is counted in `equations_fallback_latex` with a
+  warning. Inline `$...$` in text, table cells and table captions also becomes native math. Pandoc drops `\tag{1}`, so
+  it is written as `(1)` after the formula.
 - DOCX sources produce no page images, so they cannot be included in searchable PDFs.
 - CSV/XLSX raise an error when the document has no tables.

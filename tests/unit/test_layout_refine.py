@@ -251,3 +251,89 @@ def test_words_under_an_arrow_stay_with_their_text_not_the_equation_above():
     lp.resolve_overlaps(plan)
     text_item = plan.items[1]
     assert text_item.box.y0 <= 880 * K and text_item.box.y1 >= 900 * K
+
+
+# ------------------------------------------------------------------- pen on rules, and whose ink is whose
+def _notebook():
+    img = Image.new("RGB", (W, H), (233, 237, 243))
+    d = ImageDraw.Draw(img)
+    rules = [70 + 62 * i for i in range(20)]
+    for y in rules:
+        d.line([(0, y), (W, y)], fill=(160, 172, 195), width=2)
+    return img, d, rules
+
+
+def test_cleaned_crop_keeps_a_wire_drawn_on_a_rule_and_drops_the_rule():
+    img, d, rules = _notebook()
+    y = rules[8]
+    d.rectangle([500, y - 120, 800, y - 20], outline=PEN, width=4)  # a box above, so the page has plenty of pen ink
+    d.line([(800, y - 20), (900, y)], fill=PEN, width=3)
+    d.line([(900, y), (1200, y)], fill=PEN, width=3)  # the wire runs exactly along the rule
+    d.line([(1200, y), (1260, y + 80)], fill=PEN, width=3)
+    els = [_el(1, ElementType.FIGURE, (480, y - 140, 1280, y + 100), figure=FigureData(description="circuit"))]
+    ink = layout_refine.refine_page(els, img, DPI, W * K, H * K)
+    assert ink is not None and ink.rule_coloured is not None
+    box = figures.crop_box_px(els[0], DPI, img.size)
+    placed = figures.clean_figure_placed(img, ink, box, ink.components_of(els[0].element_id) or None)
+    assert placed is not None
+    grey = np.asarray(placed[0].convert("L"))
+    ox, oy = placed[1][0], placed[1][1]
+    # the wire is still there along its whole length
+    wire = grey[max(0, y - oy - 4):y - oy + 5, 920 - ox:1180 - ox]
+    assert (wire.min(axis=0) < 170).mean() > 0.9
+    # the rule beside the drawing is not
+    if 480 - ox >= 0:
+        assert (grey[max(0, y - oy - 4):y - oy + 5, :max(1, 495 - ox)] > 200).all()
+
+
+def test_placement_of_the_cleaned_crop_is_stored(tmp_path):
+    img, d, rules = _notebook()
+    y = rules[6]
+    d.rectangle([500, y - 120, 800, y - 20], outline=PEN, width=4)
+    els = [_el(1, ElementType.FIGURE, (480, y - 140, 820, y), figure=FigureData(description="box"))]
+    ink = layout_refine.refine_page(els, img, DPI, W * K, H * K)
+    store = ArtifactStore(tmp_path)
+    page = Page(page_id=f"{DOC}-p0001", document_id=DOC, page_number=1, width_pt=W * K, height_pt=H * K,
+                status=PageStatus.DONE, elements=els)
+    figures.save_figure_images(store, page, img, DPI, ink)
+    placed = els[0].figure.image_clean_box
+    assert placed is not None and len(placed) == 4
+    # the box covers the drawing, in points
+    assert placed[0] <= 500 * K <= placed[2] and placed[1] <= (y - 120) * K <= placed[3]
+
+
+def test_end_of_a_written_line_stays_with_the_text_not_the_figure():
+    img, d, rules = _notebook()
+    pen = PEN
+    # a written line whose end reaches into the rectangle of the drawing below and to its right
+    for x in (200, 250, 300):
+        d.line([(x, 300), (x + 30, 335)], fill=pen, width=4)
+    for x in (480, 530, 580):
+        d.line([(x, 300), (x + 30, 335)], fill=pen, width=4)
+    # the drawing, whose model box starts at x=420, y=280
+    d.rectangle([700, 420, 1100, 620], outline=pen, width=4)
+    d.line([(700, 500), (450, 500)], fill=pen, width=4)
+    els = [_el(1, ElementType.EQUATION, (190, 290, 640, 345), content="R = 2R", latex="R = 2R"),
+           _el(2, ElementType.FIGURE, (420, 280, 1120, 640), figure=FigureData(description="circuit"))]
+    ink = layout_refine.refine_page(els, img, DPI, W * K, H * K)
+    assert ink is not None
+    x0, _, x1, _ = _px(els[0].bbox)
+    assert x0 < 210 and x1 > 595, (x0, x1)  # the text owns its whole line
+    figure_comps = ink.components_of(els[1].element_id)
+    stats = ink.stats[figure_comps]
+    assert not ((stats[:, 1] < 345) & (stats[:, 0] < 620)).any()
+
+
+def test_a_label_under_a_text_line_stays_with_the_figure():
+    img, d, rules = _notebook()
+    for x in range(200, 1000, 60):
+        d.line([(x, 326), (x + 30, 372)], fill=PEN, width=4)  # a long line of text, between two rules
+    d.line([(600, 386), (630, 432)], fill=PEN, width=4)  # a label right under it
+    d.line([(630, 386), (600, 432)], fill=PEN, width=4)
+    d.rectangle([500, 490, 900, 680], outline=PEN, width=4)
+    els = [_el(1, ElementType.PARAGRAPH, (190, 316, 1010, 440), content="a long line of text"),
+           _el(2, ElementType.FIGURE, (480, 380, 920, 700), figure=FigureData(description="box"))]
+    ink = layout_refine.refine_page(els, img, DPI, W * K, H * K)
+    assert ink is not None
+    stats = ink.stats[ink.components_of(els[1].element_id)]
+    assert ((stats[:, 1] >= 380) & (stats[:, 1] + stats[:, 3] <= 440)).any()  # the label is in the figure

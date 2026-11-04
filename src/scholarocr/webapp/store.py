@@ -116,6 +116,15 @@ class AppStore:
         with self._lock:
             self._db.execute(f"UPDATE messages SET {', '.join(sets)} WHERE id=?", (*args, mid))
 
+    def get_message(self, mid: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+        if row is None:
+            raise NotFoundError(f"No message {mid}")
+        d = dict(row)
+        d["data"] = json.loads(d["data"] or "{}")
+        return d
+
     def messages(self, cid: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at, rowid",

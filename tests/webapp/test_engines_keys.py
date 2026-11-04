@@ -121,6 +121,49 @@ def test_keychain_backend(tmp_path):
     assert ks.get("openrouter") is None
 
 
+class WindowsVaultLike:
+    """What keyring's Windows backend does: one generic credential per target. Saving copies whatever occupies the
+    service target to ``<user>@<service>`` first (measured on Windows Credential Manager, 2026-11-04)."""
+
+    def __init__(self):
+        self.creds: dict[str, tuple[str, str]] = {}
+
+    def get_password(self, service, user):
+        cred = self.creds.get(service)
+        if not cred or cred[0] != user:
+            cred = self.creds.get(f"{user}@{service}")
+        return cred[1] if cred else None
+
+    def set_password(self, service, user, value):
+        if service in self.creds:
+            old_user, old_value = self.creds[service]
+            self.creds[f"{old_user}@{service}"] = (old_user, old_value)
+        self.creds[service] = (user, value)
+
+    def delete_password(self, service, user):
+        found = False
+        for target in (service, f"{user}@{service}"):
+            if target in self.creds and self.creds[target][0] == user:
+                del self.creds[target]
+                found = True
+        if not found:
+            raise RuntimeError("not found")
+
+
+def test_replacing_a_key_leaves_no_old_copy_in_the_vault(tmp_path):
+    vault = WindowsVaultLike()
+    ks = KeyStore(tmp_path / "none.env", keyring_loader=lambda: vault)
+    old, new, other = "old-key-0000000000000000", "new-key-0000000000000000", "other-key-000000000000000"
+    ks.set("gemini", old)
+    ks.set("openrouter", other)
+    ks.set("gemini", new)
+    assert ks.get("gemini") == new and ks.get("openrouter") == other
+    assert old not in [v for _, v in vault.creds.values()]
+    ks.delete("gemini")
+    ks.delete("openrouter")
+    assert vault.creds == {}
+
+
 def test_key_validation(keys):
     from scholarocr.exceptions import InputError
 

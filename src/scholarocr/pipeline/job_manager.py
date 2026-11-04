@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import uuid
 from typing import Callable
 
@@ -69,6 +70,7 @@ class JobManager:
             if job.pid != os.getpid() and _pid_alive(job.pid):
                 continue
             self.repo.update_job(job.job_id, status=JobStatus.INTERRUPTED, stage="interrupted (process ended)")
+            self.repo.release_lock(f"doc:{job.document_id}", job.job_id)  # its owner is gone; do not wait for the timeout
             recovered.append(job.job_id)
         return recovered
 
@@ -98,6 +100,22 @@ class JobManager:
             return job
         self.repo.update_job(job_id, cancel_requested=1, stage="cancellation requested")
         return self.get(job_id)
+
+    def stop_local_jobs(self, document_id: str, timeout: float = 30.0) -> bool:
+        """Cancel the jobs of this document still running in this process and wait for them to end (a stopped job
+        finishes the page it is preparing, and holds the document's lock until then). False if one is still going."""
+        deadline = time.monotonic() + timeout
+        while True:
+            jobs = self.repo.jobs_for_document(document_id)
+            with self._guard:
+                active = [j.job_id for j in jobs if j.job_id in self._local_running]
+            if not active:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            for job_id in active:
+                self.cancel(job_id)
+            time.sleep(0.1)
 
     def get(self, job_id: str) -> Job:
         job = self.repo.get_job(job_id)

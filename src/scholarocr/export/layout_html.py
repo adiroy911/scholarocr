@@ -292,11 +292,17 @@ body.measuring .el>.c{width:calc(100% - 2px)}
 .k-math>.c{text-align:left;white-space:nowrap}
 .k-math .katex-display{margin:0;text-align:left}
 .k-math .katex-display>.katex{text-align:left}
+.k-math .katex-display.fleqn>.katex{padding-left:0}
 .c .katex{font-size:1.08em;white-space:nowrap}
 .c .nw{white-space:nowrap}
 .k-math .katex{font-size:1em}
+.k-math .dmw{display:flex;flex-wrap:wrap;align-items:center;column-gap:.28em;row-gap:.25em}
+.k-math .dmp{flex:none}
 .c .tex-err{font-style:italic}
 .c s{text-decoration-thickness:.06em}
+.c .sm{position:relative;display:inline-block}
+.c .sm::after{content:"";position:absolute;left:-.1em;right:-.1em;top:50%;border-top:.07em solid currentColor}
+.c .sgap{width:2.4em;height:1em;vertical-align:baseline}
 .c .qn{font-weight:600;margin-right:.3em}
 .c .marks{float:right;margin-left:.6em;font-size:.85em;color:#333}
 .c ul,.c ol{margin:0;padding-left:1.15em}
@@ -338,8 +344,21 @@ FIT_JS = r"""
       }
     }
   }
-  function fits(b){ var c = b.firstElementChild;
-    return c.scrollWidth <= b.clientWidth + 0.75 && c.offsetHeight <= b.clientHeight + 0.75; }
+  function inkPx(c){
+    // what is really printed: an element's own box says nothing about the formula overflowing it
+    var q = null, range = document.createRange(), walker = document.createTreeWalker(c, NodeFilter.SHOW_TEXT), n;
+    function add(r){ if (!r.width && !r.height) return;
+      if (!q) q = {left: r.left, top: r.top, right: r.right, bottom: r.bottom};
+      else { q.left = Math.min(q.left, r.left); q.top = Math.min(q.top, r.top);
+             q.right = Math.max(q.right, r.right); q.bottom = Math.max(q.bottom, r.bottom); } }
+    while ((n = walker.nextNode())) { if (!n.nodeValue.trim() && n.nodeValue.indexOf('\u00a0') < 0) continue;
+      range.selectNodeContents(n); add(range.getBoundingClientRect()); }
+    Array.prototype.forEach.call(c.querySelectorAll('svg,img'), function(s){ add(s.getBoundingClientRect()); });
+    return q || c.getBoundingClientRect(); }
+  function widthFits(b){ var c = b.firstElementChild;
+    if (c.scrollWidth > b.clientWidth + 0.75) return false;
+    return !c.querySelector('.katex') || inkPx(c).right <= b.getBoundingClientRect().right + 0.75; }
+  function fits(b){ return widthFits(b) && b.firstElementChild.offsetHeight <= b.clientHeight + 0.75; }
   function setSize(b, s){ b.style.fontSize = s + 'pt'; }
   function search(b, lo, hi){
     if (hi < lo) hi = lo;
@@ -361,8 +380,37 @@ FIT_JS = r"""
   function freeRight(r, others, W){ var lim = W - P.margin;
     others.forEach(function(o){ if (o.y1 > r.y0 + 1 && o.y0 < r.y1 - 1 && o.x0 >= r.x1 - 0.5) lim = Math.min(lim, o.x0 - P.gap); });
     return Math.max(lim, r.x1); }
+  function freeLeft(r, others){ var lim = P.margin;
+    others.forEach(function(o){ if (o.y1 > r.y0 + 1 && o.y0 < r.y1 - 1 && o.x1 <= r.x0 + 0.5) lim = Math.max(lim, o.x1 + P.gap); });
+    return Math.min(lim, r.x0); }
+  function inkRect(b){ var pg = b.closest('.pg').getBoundingClientRect(), q = inkPx(b.firstElementChild);
+    return {x0: (q.left - pg.left) / PX, y0: (q.top - pg.top) / PX, x1: (q.right - pg.left) / PX, y1: (q.bottom - pg.top) / PX}; }
+  function wrapMath(b){
+    // a long equation breaks before its top-level relations; each part stays whole
+    var dm = b.querySelector('.dm[data-parts]'); if (!dm || dm.classList.contains('dmw')) return false;
+    var parts = JSON.parse(dm.getAttribute('data-parts')), holder = document.createElement('div');
+    try { parts.forEach(function(p){ var s = document.createElement('span'); s.className = 'dmp';
+        katex.render(p, s, {displayMode: true, throwOnError: true, strict: 'ignore', trust: false, fleqn: true,
+                            output: 'html', maxExpand: 500}); holder.appendChild(s); }); }
+    catch (e) { return false; }
+    dm.innerHTML = ''; while (holder.firstChild) dm.appendChild(holder.firstChild);
+    dm.classList.add('dmw'); return true; }
+  function keepOnPage(b, others, W, H){
+    // nothing is cut off by the page edge: slide into free space, then reduce the size as far as it takes
+    var r = rectOf(b), q = inkRect(b), over = q.x1 - (W - 1), moved = false;
+    if (over > 0) { var dx = Math.min(over, r.x0 - freeLeft(r, others));
+      if (dx > 0.25) { r = {x0: r.x0 - dx, y0: r.y0, x1: r.x1 - dx, y1: r.y1}; setRect(b, r); moved = true; } }
+    var size = parseFloat(b.style.fontSize), shrunk = false;
+    for (var i = 0; i < 40 && size > P.absoluteMin; i++){ q = inkRect(b);
+      if (q.x1 <= W - 1 && q.y1 <= H - 1) break;
+      size = Math.max(P.absoluteMin, size * 0.97); setSize(b, size); shrunk = true; }
+    if (moved) b.setAttribute('data-box', [r.x0, r.y0, r.x1, r.y1].map(function(v){ return v.toFixed(2); }).join(','));
+    if (shrunk) { b.setAttribute('data-size', size.toFixed(2)); b.setAttribute('data-status', 'shrunk'); }
+    return r; }
   function naturalWidth(b){ var c = b.firstElementChild, ws = c.style.whiteSpace; c.style.whiteSpace = 'nowrap';
-    var w = c.scrollWidth; c.style.whiteSpace = ws; return w / PX; }
+    var w = c.scrollWidth;
+    if (c.querySelector('.katex')) w = Math.max(w, inkPx(c).right - b.getBoundingClientRect().left);
+    c.style.whiteSpace = ws; return w / PX; }
   function spread(b, size){
     // multi-line text in a taller box: open the leading so the lines span the box like the original lines
     var c = b.firstElementChild, px = size * PX, h0 = c.offsetHeight, lines = Math.round(h0 / (px * P.leading));
@@ -387,7 +435,7 @@ FIT_JS = r"""
       var s0 = search(b, mn, Math.max(mn, target));
       size = s0.ok ? s0.fit : mn; setSize(b, size);
       status = !s0.ok ? 'overflow' : (size < target - 0.05 ? 'shrunk' : 'fit');
-      mark(b, status, size, target); return;
+      mark(b, status, size, target); finishOnPage(b, all, rects, W, H); return;
     }
     setSize(b, target);
     var r0 = rects.get(b), r = {x0: r0.x0, y0: r0.y0, x1: r0.x1, y1: r0.y1}, grew = [];
@@ -401,16 +449,17 @@ FIT_JS = r"""
           && r.x0 + nat + 1 <= freeRight(r, others, W)) {
         r.x1 = r.x0 + nat + 1; setRect(b, r); rects.set(b, r); b.setAttribute('data-grew', 'right');
         b.setAttribute('data-box', [r.x0, r.y0, r.x1, r.y1].map(function(v){ return v.toFixed(2); }).join(','));
-        mark(b, 'moved', target, target); return;
+        mark(b, 'moved', target, target); finishOnPage(b, all, rects, W, H); return;
       }
       if (b.hasAttribute('data-spread')) spread(b, target);
-      mark(b, 'fit', target, target); return;
+      mark(b, 'fit', target, target); finishOnPage(b, all, rects, W, H); return;
     }
     var oneLine = g === 'math' || b.classList.contains('one-line') || (r.y1 - r.y0) < target * P.leading * 1.8;
     if (oneLine) {  // keep it on one line: extend to the right into free space
       var right = Math.min(freeRight(r, others, W), r.x0 + naturalWidth(b) + 1);
       if (right > r.x1 + 0.5) { r.x1 = right; setRect(b, r); grew.push('right'); }
     }
+    if (g === 'math' && !widthFits(b)) wrapMath(b);
     if (!fits(b)) {  // then down into free space, as far as the text needs
       var c = b.firstElementChild, need = r.y0 + c.offsetHeight / PX + 1, below = freeBelow(r, others, H);
       var bottom = Math.min(below, Math.max(need, r.y1));
@@ -426,6 +475,12 @@ FIT_JS = r"""
       status = !s.ok ? 'overflow' : size >= target * P.sameSize ? (grew.length ? 'moved' : 'fit') : 'shrunk';
     }
     mark(b, status, size, target);
+    finishOnPage(b, all, rects, W, H);
+  }
+  function finishOnPage(b, all, rects, W, H){
+    var r0 = rects.get(b), others = [];
+    all.forEach(function(o){ if (o !== b && !meets(rects.get(o), r0)) others.push(rects.get(o)); });
+    rects.set(b, keepOnPage(b, others, W, H));
   }
   function layout(){
     // measure with 2 px less width than the printed box: the print pass lays the text out again and a line that
@@ -443,31 +498,44 @@ FIT_JS = r"""
       });
       return {pg: pg, items: items, fits: fitsBody, body: fitsBody.length ? quantile(fitsBody, P.bodyQuantile) : 0};
     });
-    // the document's size: the median of the pages' own sizes; pages within pageTolerance of it share it, a page
-    // that differs clearly (a landscape page in large writing) keeps its own
-    var own = info.filter(function(i){ return i.body; }).map(function(i){ return i.body; });
-    var docBody = own.length ? quantile(own, 0.5) : P.defaultBody;
-    docBody = Math.max(P.bodyMin, Math.min(docBody, P.bodyMax));
-    var shared = true;
+    // The document's size: per page shape, the median of the pages' own sizes. Larger writing on a page of the same
+    // shape does not make its text larger, or the size jumps from page to page. A page much denser than the rest
+    // (more than pageTolerance under the median) and a page of another shape (landscape) keep their own.
+    var shapes = {}, main = null;
+    info.forEach(function(i){ var key = i.pg.style.width + 'x' + i.pg.style.height; i.shape = key;
+      var s = shapes[key] = shapes[key] || {own: [], pages: 0}; s.pages++; if (i.body) s.own.push(i.body);
+      if (!main || s.pages > shapes[main].pages) main = key; });
+    Object.keys(shapes).forEach(function(k){ var s = shapes[k];
+      s.body = Math.max(P.bodyMin, Math.min(s.own.length ? quantile(s.own, 0.5) : P.defaultBody, P.bodyMax)); });
+    var docBody = shapes[main].body, shared = true;
     info.forEach(function(i){
-      var near = !i.body || Math.abs(i.body - docBody) <= P.pageTolerance * docBody;
-      if (!near) shared = false;
-      var body = near ? docBody : Math.max(P.bodyMin, Math.min(i.body, P.bodyMax));
+      var near = !i.body || i.body >= shapes[i.shape].body * (1 - P.pageTolerance);
+      var inMain = near && i.shape === main;
+      if (!inMain) shared = false;
+      var body = near ? shapes[i.shape].body : Math.max(P.bodyMin, Math.min(i.body, P.bodyMax));
       i.pg.setAttribute('data-body', body.toFixed(2));
-      i.pg.setAttribute('data-body-scope', near ? 'document' : 'page');
+      i.pg.setAttribute('data-body-scope', inMain ? 'document' : 'page');
       var W = parseFloat(i.pg.style.width), H = parseFloat(i.pg.style.height);
       var els = Array.prototype.slice.call(i.pg.querySelectorAll('.el'));
       var rects = new Map(); els.forEach(function(b){ rects.set(b, rectOf(b)); });
       i.items.slice().sort(function(a, b){ var ra = rects.get(a), rb = rects.get(b); return ra.y0 - rb.y0 || ra.x0 - rb.x0; })
         .forEach(function(b){ place(b, body, rects, els, W, H); });
     });
+    // measured with the printed width, once every size is final
     document.body.classList.remove('measuring');
+    Array.prototype.forEach.call(document.querySelectorAll('.el[data-min]'), function(b){ var q = inkRect(b);
+      b.setAttribute('data-ink', [q.x0, q.y0, q.x1, q.y1].map(function(v){ return v.toFixed(2); }).join(',')); });
     document.body.setAttribute('data-body', docBody.toFixed(2));
     document.body.setAttribute('data-body-scope', shared ? 'document' : 'mixed');
     document.body.setAttribute('data-socr-done', '1');
   }
   function start(){ try { layout(); } catch (e) { document.body.setAttribute('data-socr-error', String(e)); document.body.setAttribute('data-socr-done', '1'); } }
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(start, start); else start();
+  // Every face before measuring: a browser loads a font only when something uses it, so KaTeX's fonts would still
+  // be missing when the formulas are measured, and they print wider than the fallback they are measured in.
+  if (document.fonts && document.fonts.ready) {
+    var faces = []; document.fonts.forEach(function(f){ faces.push(f.load()); });
+    Promise.all(faces).then(function(){ return document.fonts.ready; }).then(start, start);
+  } else start();
 })();
 """
 
@@ -475,7 +543,7 @@ FIT_JS = r"""
 # largest fitting size (0.25: three in four paragraphs fit their box at it). pageTolerance: pages whose own size is
 # within this share of the document's size (the median of the pages' sizes) share it. floor: smallest size as a share of the body (an item's
 # data-floor overrides it). margin / gap: free space kept at the page edge and between grown boxes, in points.
-FIT_PARAMS = {"leading": 1.22, "maxLeading": 2.4, "defaultBody": 11.0, "bodyMin": 7.0, "bodyMax": 20.0,
+FIT_PARAMS = {"leading": 1.22, "maxLeading": 1.6, "absoluteMin": 5.0, "defaultBody": 11.0, "bodyMin": 7.0, "bodyMax": 20.0,
               "bodyQuantile": 0.25, "pageTolerance": 0.2, "floor": 0.75, "margin": 6.0, "gap": 2.0,
               "unwrapRatio": 1.6, "sameSize": 0.98}
 

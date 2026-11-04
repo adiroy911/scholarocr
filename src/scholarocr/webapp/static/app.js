@@ -7,9 +7,11 @@
   const VERSION = document.querySelector('meta[name="scholarocr-version"]').content;
   const SPRITE = "/static/icons.svg#";
   const $ = (id) => document.getElementById(id);
-  const LIVE_PAGE = new Set(["reading", "retrying", "rotated", "waiting"]);
+  const LIVE_PAGE = new Set(["reading", "retrying", "rotated", "waiting", "reviewing"]);
   const EVENT_TYPES = ["stage", "job", "document_started", "page", "usage", "verification", "document", "delta", "error", "done"];
   const UNC_LABEL = { low: "Clear", medium: "Some doubt", high: "Doubtful", unresolved: "Unreadable" };
+  const REVIEW_LABEL = { confirmed: "Confirmed by a second look", corrected: "Changed by a second look", unreadable: "A second look could not read it",
+    rejected: "A second look did not settle this", undone: "A second look's change was undone" };
   const TYPE_LABEL = {
     title: "Title", heading: "Heading", subheading: "Subheading", paragraph: "Paragraph", text: "Text", handwriting: "Handwriting",
     equation: "Equation", chemical_equation: "Chemical equation", table: "Table", figure: "Figure", diagram: "Diagram", image: "Image",
@@ -428,17 +430,30 @@
     return "el-text";
   }
 
+  // Text and icon, so the state does not depend on colour. Only the two states the sheet needs at a glance.
+  function reviewChip(state) {
+    if (state === "confirmed") return h("span", { class: "rv-flag" }, icon("check"), "confirmed");
+    if (state === "corrected") return h("span", { class: "rv-flag rv-changed" }, icon("pencil"), "changed");
+    return null;
+  }
+
   function elementRow(docId, el, variant) {
     const q = el.question;
     const sub = el.role === "subquestion";
     const base = { ...el, text: shownText(el, variant) };
     const shown = q ? { ...base, text: stripQuestion(base.text, q) } : base;
+    const mark = el.mark || el.uncertainty;
+    const reviewState = el.review ? el.review.state : null;
+    const reviewed = reviewState && REVIEW_LABEL[reviewState] ? `, ${REVIEW_LABEL[reviewState].toLowerCase()}` : "";
+    const body = elementBody(shown, docId);
     const node = h("div", {
-      class: `el ${typeClass(el.type)} u-${el.uncertainty}${sub ? " sub" : ""}`, tabindex: "0", role: "button",
-      "aria-label": `${TYPE_LABEL[el.type] || el.type}${el.uncertainty !== "low" ? `, ${UNC_LABEL[el.uncertainty].toLowerCase()}` : ""}. Show source`,
+      class: `el ${typeClass(el.type)} u-${mark}${sub ? " sub" : ""}`, tabindex: "0", role: "button",
+      "aria-label": `${TYPE_LABEL[el.type] || el.type}${mark !== "low" ? `, ${UNC_LABEL[mark].toLowerCase()}` : ""}${reviewed}. Show source`,
       dataset: { eid: el.id },
-    }, elementBody(shown, docId));
-    if (el.uncertainty === "unresolved" && el.type !== "uncertain") node.append(h("span", { class: "u-flag", text: "unreadable" }));
+    }, body);
+    if (mark === "unresolved" && el.type !== "uncertain") node.append(h("span", { class: "u-flag", text: "unreadable" }));
+    const chip = reviewChip(reviewState);
+    if (chip) (body.tagName === "P" ? body : node).append(chip);
     const open = () => openSource(docId, el, node);
     node.addEventListener("click", open);
     node.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
@@ -461,6 +476,7 @@
     const docId = view.document_id;
     const variant = variantOverride || view.text_variant || "faithful";
     const card = h("article", { class: "doc", dataset: { doc: docId } });
+    card.rerender = (v) => { const fresh = renderDoc(v, entry, pageStats, variantOverride); card.replaceWith(fresh); return fresh; };
     const name = view.title || (view.filenames || [])[0] || "Document";
     const facts = h("div", { class: "doc-facts" });
     const ver = entry && entry.verification;
@@ -482,11 +498,19 @@
       const n = (view.uncertainty || {})[u] || 0;
       if (n) facts.append(h("span", { class: "fact" }, h("span", { class: `swatch sw-${u}` }), `${n} ${UNC_LABEL[u].toLowerCase()}`));
     }
+    const rv = view.reviews || {};
+    if (rv.confirmed) facts.append(h("span", { class: "fact ok", title: "A second look against the crop found no difference" }, icon("check"), `${rv.confirmed} confirmed`));
+    if (rv.corrected) facts.append(h("span", { class: "fact ok", title: "A second look changed the reading; open the element to see the original or undo" }, icon("pencil"), `${rv.corrected} changed`));
+    if (rv.rejected) facts.append(h("span", { class: "fact", title: "A proposed change failed a check, or the model doubted its own answer. The reading was kept and stays marked." }, icon("info"), `${rv.rejected} not settled`));
+    const unreviewed = view.pages.filter((p) => p.review_note).map((p) => p.page_number);
+    if (unreviewed.length) facts.append(h("span", { class: "fact" }, icon("info"), `Not reviewed: ${pagesText(unreviewed)}`));
     const head = h("div", { class: "doc-head" },
       h("h3", { class: "doc-title", text: name }),
       h("p", { class: "doc-files", text: `${(view.filenames || []).join(", ")}, ${plural(view.page_count, "page", "pages")}` }),
       facts, findings);
     card.append(head);
+    const resume = resumeRow(view, entry);
+    if (resume) card.append(resume);
     if (view.pages.some((p) => p.elements.some((e) => e.clean_text))) {
       const sw = h("div", { class: "seg seg-small", role: "group", "aria-label": "Text shown and exported" },
         [["clean", "Cleaned"], ["faithful", "As written"]].map(([v, label]) => {
@@ -527,6 +551,7 @@
     }
     for (const p of view.pages) {
       const stats = pageStats && pageStats[`${docId}:${p.page_number}`];
+      const failure = lastFailure(stats);
       const sub = [pageStatusText(p), p.label ? `printed ${p.label}` : "",
         stats && stats.usage && stats.usage.total_tokens ? fmtTokens(stats.usage.total_tokens) : "",
         stats && stats.seconds ? fmtSecs(stats.seconds) : ""].filter(Boolean);
@@ -539,15 +564,82 @@
       const sheet = h("div", { class: "sheet" });
       if (p.elements.length) p.elements.forEach((el) => sheet.append(elementRow(docId, el, variant)));
       else if (p.status === "failed") sheet.append(h("p", { class: "page-error", text: p.error || "This page could not be read." }));
-      else if (p.status === "awaiting_transcription") sheet.append(h("p", { class: "page-empty", text: "This page has not been read yet." }));
+      else if (p.status === "awaiting_transcription") sheet.append(failure ? h("p", { class: "page-error", text: `Last attempt failed: ${failure}` }) : h("p", { class: "page-empty", text: "This page has not been read yet." }));
       else if (p.status === "blank") sheet.append(h("p", { class: "page-empty", text: "Blank page." }));
       else sheet.append(h("p", { class: "page-empty", text: "No content found on this page." }));
       if (p.truncated) sheet.append(h("p", { class: "page-notes", text: `${p.truncated} more elements are in the exports.` }));
       if (p.notes && p.notes.length) sheet.append(h("p", { class: "page-notes", text: `Reader notes: ${p.notes.join("; ")}` }));
+      if (p.review_note) sheet.append(h("p", { class: "page-notes", text: `Not reviewed: ${p.review_note}. The page is kept as read; doubtful elements stay marked.` }));
       section.append(sheet);
       card.append(section);
     }
     return card;
+  }
+
+  function lastFailure(stats) {
+    if (!stats || !["error", "timeout", "rejected"].includes(stats.status)) return "";
+    const first = stats.errors && stats.errors[0];
+    return stats.error || (first ? `${first.path}: ${first.problem}` : "the page was rejected");
+  }
+
+  // "pages 4–6", or "37 pages" when the list would run on
+  function unreadText(list) {
+    const contiguous = list.every((n, i) => !i || n === list[i - 1] + 1);
+    return list.length > 8 && !contiguous ? `${list.length} pages` : pagesText(list);
+  }
+
+  // A document that did not finish: continue it here, or say plainly why that is not possible.
+  function resumeRow(view, entry) {
+    const plan = view.resume;
+    if (!plan || !entry || !entry.message_id) return null;
+    const left = unreadText(plan.unread);
+    let note, btn;
+    if (plan.source_missing.length) {
+      note = `The stored copy of ${plan.source_missing.join(", ")} is gone, so ${left} cannot be read from here. Attach the file again; pages already read are kept.`;
+      btn = h("button", { type: "button", class: "btn btn-primary btn-small", onclick: () => attachAgain(entry.message_id) }, icon("upload"), "Attach file");
+    } else {
+      const verb = plan.unread.length === 1 ? "is" : "are";
+      note = `${left[0].toUpperCase()}${left.slice(1)} ${verb} not read yet. Pages already read stay as they are.`;
+      btn = h("button", { type: "button", class: "btn btn-primary btn-small", disabled: !!S.run, title: S.run ? "Wait for the current run, or stop it" : null },
+        icon("refresh-cw"), "Resume reading");
+      btn.addEventListener("click", () => resumeDoc(view.document_id, entry.message_id, btn));
+    }
+    return h("div", { class: "doc-tools" }, h("span", { class: "doc-tools-label", text: "Not finished" }),
+      h("span", { class: "doc-tools-note", text: note }), btn);
+  }
+
+  async function resumeDoc(docId, messageId, btn) {
+    btn.disabled = true;
+    btn.lastChild.textContent = "Starting";
+    try {
+      const r = await api("POST", `/api/documents/${encodeURIComponent(docId)}/resume`, { message_id: messageId });
+      if (r.conversation_id !== S.convId) {
+        toast("This document is being read in another conversation");
+        btn.disabled = false; btn.lastChild.textContent = "Resume reading";
+        return;
+      }
+      delete S.docViews[docId];
+      const m = S.messages.find((x) => x.id === r.message_id);
+      if (m) m.state = "running";
+      if (!S.run || S.run.id !== r.run_id) followRun(r.run_id, r.message_id, "read");
+      renderMessages();
+      const body = $(`body-${r.message_id}`);
+      if (body) body.scrollIntoView({ block: "nearest" });
+      refreshHistory();
+    } catch (e) {
+      toast(e.message);
+      delete S.docViews[docId]; // what was refused may have changed (the stored file is gone): show what is true now
+      if (S.convId) loadConversation(S.convId, { keepScroll: true });
+    }
+  }
+
+  // The same instructions as the read that stopped, so that pages already read count as read.
+  function attachAgain(messageId) {
+    const at = S.messages.findIndex((m) => m.id === messageId);
+    const asked = at > 0 && S.messages[at - 1].role === "user" ? S.messages[at - 1].text : "";
+    const box = $("composer-input");
+    if (asked && !box.value) { box.value = asked; autosize(); updateComposer(); }
+    $("file-input").click();
   }
 
   function jumpToPage(n) {
@@ -575,14 +667,44 @@
     img.addEventListener("error", () => { img.replaceWith(h("p", { class: "page-error", text: "The source image could not be loaded." })); });
     return img;
   }
+  function reviewBlock(docId, el, node) {
+    const r = el.review;
+    if (!r) return el.uncertainty !== "low" ? h("div", { class: "sp-facts" }, h("span", { class: "fact", text: "Not reviewed" })) : null;
+    const before = (o, label) => o ? [
+      o.text ? [h("p", { class: "sp-label", text: label }), h("pre", { class: "sp-raw", text: o.text })] : null,
+      o.table ? [h("p", { class: "sp-label", text: label }), h("pre", { class: "sp-raw", text: o.table })] : null,
+      o.latex ? [h("p", { class: "sp-label", text: `${label}, LaTeX` }), h("pre", { class: "sp-raw", text: o.latex })] : null] : null;
+    const undo = r.can_undo ? h("button", { type: "button", class: "btn btn-small", onclick: (e) => undoReview(docId, el, node, e.currentTarget) }, icon("history"), "Undo this change") : null;
+    return h("div", { class: "sp-review" },
+      h("div", { class: "sp-facts" }, h("span", { class: `fact${r.state === "confirmed" || r.state === "corrected" ? " ok" : ""}` },
+        icon(r.state === "confirmed" ? "check" : r.state === "corrected" ? "pencil" : "info"), REVIEW_LABEL[r.state] || r.state)),
+      r.reason ? h("p", { class: "sp-note", text: `Why: ${r.reason}. The reading was kept.` }) : null,
+      r.notes ? h("p", { class: "sp-note", text: `Model's note: ${r.notes}` }) : null,
+      before(r.original, "Before the second look"),
+      before(r.proposed, "Proposed"),
+      before(r.undone, "The change that was undone"),
+      undo ? h("div", { class: "sp-actions" }, undo) : null);
+  }
+  async function undoReview(docId, el, node, btn) {
+    btn.disabled = true;
+    try {
+      const r = await api("POST", `/api/documents/${encodeURIComponent(docId)}/elements/${encodeURIComponent(el.id)}/undo-review`);
+      S.docViews[docId] = r.view;
+      const fresh = node.closest(".doc").rerender(r.view);
+      toast("Change undone");
+      const again = fresh.querySelector(`[data-eid="${CSS.escape(el.id)}"]`);
+      if (again) again.click(); else closePanel();
+    } catch (e) { toast(e.message); btn.disabled = false; }
+  }
   function openSource(docId, el, node) {
     if (S.selectedEl) S.selectedEl.classList.remove("selected");
     S.selectedEl = node; node.classList.add("selected");
     const page = parseInt((el.id.match(/-p(\d+)-e/) || [])[1] || "0", 10);
     $("sp-title").textContent = `${TYPE_LABEL[el.type] || el.type}${page ? `, page ${page}` : ""}`;
     const body = $("sp-body");
+    const mark = el.mark || el.uncertainty;
     const facts = h("div", { class: "sp-facts" },
-      h("span", { class: "fact" }, h("span", { class: `swatch sw-${el.uncertainty === "low" ? "none" : el.uncertainty}` }), UNC_LABEL[el.uncertainty]),
+      h("span", { class: "fact" }, h("span", { class: `swatch sw-${mark === "low" ? "none" : mark}` }), UNC_LABEL[mark]),
       el.handwritten ? h("span", { class: "fact", text: "Handwritten" }) : null,
       el.question && el.question.number ? h("span", { class: "fact", text: `Question ${el.question.number}` }) : null,
       el.question && el.question.marks ? h("span", { class: "fact", text: `Marks ${el.question.marks}` }) : null);
@@ -594,6 +716,7 @@
     setKids(body, 
       cropImg(tokenUrl(`/api/documents/${encodeURIComponent(docId)}/elements/${encodeURIComponent(el.id)}/source.png`), "Source region of this element"),
       facts,
+      reviewBlock(docId, el, node),
       el.reasons && el.reasons.length ? h("ul", { class: "sp-reasons" }, el.reasons.map((r) => h("li", { text: r }))) : null,
       h("p", { class: "sp-label", text: el.clean_text ? "As written" : "Text" }), h("pre", { class: "sp-raw", text: raw || "(empty)" }),
       el.clean_text ? [h("p", { class: "sp-label", text: "Cleaned" }), h("pre", { class: "sp-raw", text: el.clean_text })] : null,
@@ -653,15 +776,30 @@
     return v;
   }
 
-  function stateBanner(state, data) {
-    if (state === "cancelled") return banner("info", "Stopped. Pages read before stopping are kept; attach the file again to read the rest.");
-    if (state === "interrupted") return banner("warn", "The app closed while this was running. Attach the file again to finish reading it.");
-    if (state === "error") return banner("error", (data.error && data.error.message) || "Reading failed.");
+  // Files of a message whose reading never began have no document to resume, and their upload is gone.
+  function notStartedText(data) {
+    const started = new Set((data.documents || []).flatMap((d) => d.files || []));
+    const names = (data.files || []).flat().filter((n) => !started.has(n));
+    if (!names.length) return "";
+    const one = names.length === 1;
+    return ` ${names.join(", ")} ${one ? "was" : "were"} not started; attach ${one ? "it" : "them"} again to read ${one ? "it" : "them"}.`;
+  }
+
+  function stateBanner(state, data, chat) {
+    if (chat && state === "cancelled") return banner("info", "Stopped.");
+    if (chat && state === "interrupted") return banner("warn", "The app closed before this answer finished. Ask again.");
+    const docs = data.documents || [];
+    const rest = notStartedText(data);
+    if (state === "cancelled") return banner("info", `Stopped. Pages read before stopping are kept.${rest}`);
+    if (state === "interrupted") return banner("warn", docs.length ? `The app closed while this was reading. Pages already read are kept.${rest}` : `The app closed before reading started.${rest || " Attach the file again."}`);
+    if (state === "error") return banner("error", `${(data.error && data.error.message) || "Reading failed."}${rest}`);
     if (state === "partial") {
-      const pages = (data.documents || []).flatMap((d) => d.unread_pages || []);
-      return banner("warn", `Some pages were not read${pages.length ? ` (page ${pages.join(", ")})` : ""}. Read pages are shown below; attach the file again to retry the rest.`);
+      const pages = docs.flatMap((d) => d.unread_pages || []);
+      const list = pages.length ? ` (page ${pages.join(", ")})` : "";
+      const again = docs.some((d) => d.resumed && (d.unread_pages || []).length);
+      return banner("warn", `${again ? `Resumed, but some pages still could not be read${list}` : `Some pages were not read${list}`}. Read pages are shown below.${rest}`);
     }
-    return null;
+    return rest ? banner("info", rest.trim()) : null;
   }
 
   function renderReadDone(body, m) {
@@ -670,7 +808,7 @@
     for (const d of data.documents || []) {
       const slot = h("div", { class: "doc-slot" }, h("div", { class: "progress" }, h("div", { class: "progress-head" }, h("span", { class: "spinner" }), h("span", { class: "progress-title", text: "Loading document" }))));
       body.append(slot);
-      docView(d.document_id).then((v) => slot.replaceChildren(renderDoc(v, d, data.pages)))
+      docView(d.document_id).then((v) => slot.replaceChildren(renderDoc(v, { ...d, message_id: m.id }, data.pages)))
         .catch((e) => slot.replaceChildren(banner("error", e.message)));
     }
   }
@@ -679,7 +817,7 @@
     const data = m.data || {};
     setKids(body, 
       m.text ? renderMarkdown(m.text) : null,
-      stateBanner(m.state === "partial" ? "done" : m.state, data),
+      stateBanner(m.state === "partial" ? "done" : m.state, data, true),
       h("p", { class: "usage" }, [engineText(data).model, data.seconds ? fmtSecs(data.seconds) : "", data.usage && data.usage.total_tokens ? fmtTokens(data.usage.total_tokens) : "",
         data.truncated ? "document trimmed to fit" : ""].filter(Boolean).join(", ")));
   }
@@ -716,7 +854,7 @@
         if (ev.stage === "cancelling") L.cancelling = true;
         break;
       case "document_started":
-        L.docs.push({ id: ev.document_id, files: ev.files, pageCount: ev.page_count, job: null, pages: {}, view: null, verification: null });
+        L.docs.push({ id: ev.document_id, files: ev.files, pageCount: ev.page_count, job: null, pages: {}, view: null, verification: null, resumed: !!ev.resumed, alreadyRead: ev.already_read || 0 });
         break;
       case "job": { const d = doc(ev.document_id); if (d) d.job = ev; L.stage = "preparing"; break; }
       case "page": {
@@ -725,7 +863,7 @@
         const prev = d.pages[ev.page] || { started: Date.now(), usage: {} };
         const restarted = ev.status === "reading" && prev.finished;
         d.pages[ev.page] = { ...prev, ...ev, usage: prev.usage, started: restarted ? Date.now() : prev.started };
-        if (restarted) delete d.pages[ev.page].finished;
+        if (restarted || ev.status === "reviewing") delete d.pages[ev.page].finished;
         if (!LIVE_PAGE.has(ev.status)) d.pages[ev.page].finished = Date.now();
         if (Array.isArray(ev.reading)) { d.reading = ev.reading; d.read = ev.read; d.total = ev.total; d.concurrency = ev.concurrency; }
         L.stage = "reading";
@@ -772,17 +910,30 @@
     return `pages ${ns.slice(0, -1).join(", ")} and ${ns[ns.length - 1]}`;
   }
 
+  function reviewSummary(p) {
+    const r = p.review || {};
+    const parts = [plural(p.elements || 0, "element", "elements")];
+    if (r.confirmed) parts.push(`${r.confirmed} confirmed`);
+    if (r.corrected) parts.push(`${r.corrected} changed`);
+    if (r.unreadable) parts.push(`${r.unreadable} unreadable`);
+    if (r.rejected) parts.push(`${r.rejected} not settled`);
+    if (r.state && r.state !== "done") parts.push("not reviewed");
+    return parts.join(", ");
+  }
+
   function pageRow(n, p, total) {
     const live = LIVE_PAGE.has(p.status);
     const statusText = {
       reading: "Reading", retrying: p.message || "Asking again", rotated: "Re-oriented, reading again", waiting: "Waiting to try again", done: `${plural(p.elements || 0, "element", "elements")}`,
       rejected: p.message || "Rejected by the validator", timeout: p.message || "Timed out", error: p.message || "Failed",
+      reviewing: `Checking ${plural(p.flagged || 0, "doubtful element", "doubtful elements")}`, reviewed: reviewSummary(p),
     }[p.status] || p.status;
     const secs = ((p.finished || Date.now()) - p.started) / 1000;
     const meta = [p.usage && p.usage.total_tokens ? fmtTokens(p.usage.total_tokens) : "", fmtSecs(secs)].filter(Boolean).join(", ");
     const bad = ["rejected", "timeout", "error"].includes(p.status);
-    return h("li", { class: `prow${p.status === "done" ? " done" : ""}${bad ? " bad" : ""}` },
-      live ? h("span", { class: "spinner", role: "img", "aria-label": "working" }) : icon(p.status === "done" ? "check" : bad ? "triangle-alert" : "info"),
+    const done = p.status === "done" || p.status === "reviewed";
+    return h("li", { class: `prow${done ? " done" : ""}${bad ? " bad" : ""}` },
+      live ? h("span", { class: "spinner", role: "img", "aria-label": "working" }) : icon(done ? "check" : bad ? "triangle-alert" : "info"),
       h("span", null, h("strong", { text: `Page ${n}` }), total ? h("span", { class: "prow-status", text: ` of ${total}` }) : null, h("span", { class: "prow-status", text: `  ${statusText}` })),
       h("span", { class: "prow-meta", dataset: live ? { live: "1", page: String(n) } : {}, text: meta }),
       p.errors && p.errors.length && p.status !== "done" ? h("ul", { class: "prow-errors" }, p.errors.slice(0, 4).map((e) => h("li", { text: `${e.path}: ${e.problem}` }))) : null);
@@ -805,14 +956,17 @@
       const name = d.files.length === 1 ? d.files[0] : `${d.files[0]} and ${d.files.length - 1} more`;
       let title = "Preparing pages", sub = name;
       const total = d.total || d.pageCount;
+      const reviewing = pages.filter((n) => d.pages[n].status === "reviewing");
       if (d.reading && d.reading.length) title = `Reading ${pagesText(d.reading)} of ${total}`;
+      else if (reviewing.length) title = `Checking doubtful elements on ${pagesText(reviewing)}`;
       else if (pages.length && pages.some((n) => LIVE_PAGE.has(d.pages[n].status))) title = `Reading ${pagesText(pages.filter((n) => LIVE_PAGE.has(d.pages[n].status)))} of ${total}`;
       else if (L.stage === "verifying" || d.verification) title = "Checking the result";
-      else if (pages.length) title = `Read ${pages.filter((n) => d.pages[n].status === "done").length} of ${plural(total, "page", "pages")}`;
+      else if (pages.length) title = `Read ${pages.filter((n) => ["done", "reviewed"].includes(d.pages[n].status)).length + d.alreadyRead} of ${plural(total, "page", "pages")}`;
       const job = d.job;
       const prog = h("div", { class: "progress" },
         h("div", { class: "progress-head" }, h("span", { class: "spinner" }), h("span", { class: "progress-title", text: L.cancelling ? "Stopping" : title }), stopButton()),
-        h("p", { class: "progress-sub" }, h("span", { text: sub }), et.model ? h("span", { text: `, ${et.model}` }) : null),
+        h("p", { class: "progress-sub" }, h("span", { text: sub }), et.model ? h("span", { text: `, ${et.model}` }) : null,
+          d.resumed && d.alreadyRead ? h("span", { text: `, ${plural(d.alreadyRead, "page", "pages")} already read` }) : null),
         d.note ? h("p", { class: "progress-note", role: "status", text: d.note }) : null,
         !pages.length && job && job.total ? h("div", { class: "bar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": String(job.total), "aria-valuenow": String(job.completed) },
           h("i", { style: `transform:scaleX(${(job.completed / job.total).toFixed(3)})` })) : null,
@@ -823,6 +977,14 @@
       nodes.push(h("div", { class: "progress" }, h("div", { class: "progress-head" }, h("span", { class: "spinner" }),
         h("span", { class: "progress-title", text: L.cancelling ? "Stopping" : (L.message || "Starting") }), stopButton()),
         h("p", { class: "progress-sub", text: et.model || et.engine })));
+    }
+    if (L.docs.some((d) => d.resumed)) { // the message's other documents stay on the page while one is resumed
+      const msg = S.messages.find((m) => m.id === S.run.messageId);
+      const data = (msg && msg.data) || {};
+      for (const d of data.documents || []) {
+        const v = S.docViews[d.document_id];
+        if (v && !L.docs.some((x) => x.id === d.document_id)) nodes.push(renderDoc(v, { ...d, message_id: msg.id }, data.pages));
+      }
     }
     if (L.error) nodes.push(banner("error", L.error.message));
     setKids(body, ...nodes);
@@ -868,6 +1030,7 @@
     run.es.close();
     S.run = null;
     updateComposer();
+    for (const d of run.live.docs) if (!d.view) delete S.docViews[d.id]; // stopped or failed: no fresh view arrived
     if (ev.state === "done" && run.kind === "read") toast("Document read");
     if (ev.state === "error") toast("Reading failed; the reason is shown in the conversation");
     await loadConversation(S.convId, { keepScroll: true });
@@ -1242,6 +1405,7 @@
     $("saved-instructions").value = p.saved_instructions || "";
     $("max-file-mb").value = p.max_file_mb; $("max-files").value = p.max_files; $("max-pages").value = p.max_pages;
     $("read-concurrency").value = String(p.read_concurrency || 3); $("read-effort").value = p.read_effort || "low"; $("chat-effort").value = p.chat_effort || "medium";
+    $("review-flagged").checked = !!p.review_flagged;
     for (const r of document.querySelectorAll('input[name="theme"]')) r.checked = r.value === (store.get("scholarocr.theme") || p.theme || "system");
     for (const r of document.querySelectorAll('input[name="text-variant"]')) r.checked = r.value === (p.text_variant || "auto");
     $("settings-error").hidden = true;
@@ -1257,7 +1421,7 @@
     const textVariant = (document.querySelector('input[name="text-variant"]:checked') || {}).value || "auto";
     const changes = { saved_instructions: $("saved-instructions").value, engine, theme, text_variant: textVariant,
       max_file_mb: Number($("max-file-mb").value), max_files: Number($("max-files").value), max_pages: Number($("max-pages").value),
-      read_concurrency: Number($("read-concurrency").value), read_effort: $("read-effort").value, chat_effort: $("chat-effort").value };
+      read_concurrency: Number($("read-concurrency").value), read_effort: $("read-effort").value, chat_effort: $("chat-effort").value, review_flagged: $("review-flagged").checked };
     try {
       const r = await api("PUT", "/api/prefs", changes);
       S.prefs = r.prefs;

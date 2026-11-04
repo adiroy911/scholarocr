@@ -15,10 +15,11 @@ exactly how labels are assigned.
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ElementType(str, Enum):
@@ -129,6 +130,12 @@ class TableCell(BaseModel):
     is_header: bool = False
     uncertain: bool = False
 
+    @field_validator("text")
+    @classmethod
+    def _no_escaped_line_breaks(cls, v: str) -> str:
+        """Models sometimes send a line break in a cell as the two characters backslash and n."""
+        return re.sub(r"\\n(?![A-Za-z])", " ", v)
+
 
 class TableData(BaseModel):
     """Rows of cells using the HTML convention for spans: a cell with ``row_span=n`` / ``col_span=m``
@@ -182,6 +189,9 @@ class FigureData(BaseModel):
     kind: str | None = None  # graph, circuit, geometry, chemical_structure, photo, ...
     # Paths relative to the document dir. The full-resolution crop itself is ``Element.source.region_image``.
     image_clean: str | None = None  # cleaned crop: paper/shadows whitened, ruled lines removed, trimmed
+    # Where the cleaned crop sits on the page [x0, y0, x1, y1] in points, so exports can place it exactly: a stroke
+    # split between two figures lines up again.
+    image_clean_box: list[float] | None = None
     svg: str | None = None  # optional vector redraw (opt-in, model-made, sanitised); never replaces the crop
     # Deterministic check of ``svg`` against the crop it was drawn from (``pipeline/svg_fidelity.py``): score,
     # recall (crop ink the redraw covers), precision (redraw ink the crop supports), missing labels, passed.
@@ -254,10 +264,14 @@ class Element(BaseModel):
         parts = [self.content]
         if self.latex and self.latex not in self.content:
             parts.append(self.latex)
-        if self.items:
+        # content usually repeats the list items and table cells already: adding them would double the text
+        shown = " ".join(self.content.split())
+        if self.items and not all(" ".join(i.split()) in shown for i in self.items):
             parts.extend(self.items)
         if self.table:
-            parts.extend(" ".join(r) for r in self.table.as_grid())
+            grid = self.table.as_grid()
+            if not all(" ".join(c.split()) in shown for r in grid for c in r):
+                parts.extend(" ".join(r) for r in grid)
         if self.figure:
             parts.extend(self.figure.labels)
         return "\n".join(p for p in parts if p)

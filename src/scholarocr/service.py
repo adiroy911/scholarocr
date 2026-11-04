@@ -14,7 +14,7 @@ from PIL import Image
 
 from . import EXTRACTION_VERSION, SCHEMA_VERSION, __version__
 from .config import Settings
-from .exceptions import ExportError, InputError, ModelUnavailableError, NotFoundError
+from .exceptions import ExportError, InputError, JobError, ModelUnavailableError, NotFoundError
 from .ingestion.loader import PageRenderer, build_manifest
 from .intelligence import classifier, reviewer
 from .intelligence.gemini_client import GeminiClient, Transport
@@ -199,6 +199,66 @@ class ScholarOCR:
 
     def resume_job(self, job_id: str, *, wait: bool = False) -> dict[str, Any]:
         return self._job_dict(self.jobs.resume(job_id, background=not wait))
+
+    def resume_plan(self, document_id: str, doc: Document | None = None) -> dict[str, Any]:
+        """Where reading stands, from the stored pages (this changes nothing). ``accepted``: done or blank, never
+        touched again. ``prepared``: host mode, the page image waits for a model. ``to_prepare``: must go through the
+        pipeline first, which needs the preserved source; ``source_missing`` names the files that are gone."""
+        doc = doc or self.get_document(document_id)
+        accepted: list[int] = []
+        prepared: list[int] = []
+        to_prepare: list[int] = []
+        for p in sorted(doc.pages, key=lambda x: x.page_number):
+            if p.status in (PageStatus.DONE, PageStatus.BLANK):
+                accepted.append(p.page_number)
+            elif self.mode == "host" and self._host_page_ready(document_id, p):
+                prepared.append(p.page_number)
+            else:
+                to_prepare.append(p.page_number)
+        manifest = self.load_manifest(document_id)
+        needed = {manifest.pages[n - 1].source_file_index for n in to_prepare}
+        missing = [s.filename for s in manifest.sources
+                   if s.index in needed and not self.store.resolve(document_id, s.stored_path).is_file()]
+        return {"accepted": accepted, "prepared": prepared, "to_prepare": to_prepare,
+                "unread": sorted(prepared + to_prepare), "source_missing": missing}
+
+    def _host_page_ready(self, document_id: str, page: Page) -> bool:
+        if page.status != PageStatus.AWAITING_TRANSCRIPTION or not page.processed_image or not page.original_image:
+            return False
+        return (host.load_task(self.store, document_id, page.page_number) is not None
+                and self.store.resolve(document_id, page.processed_image).is_file()
+                and self.store.resolve(document_id, page.original_image).is_file())
+
+    def resume_document(self, document_id: str, options: ProcessingOptions | None = None) -> dict[str, Any]:
+        """Continue a document that did not finish, without its original upload. Accepted pages are outside the
+        job's page selection, so they are never rebuilt whatever their cache key says. A job runs only for pages
+        that still need the pipeline (``job_id`` is None when every unread page is prepared already)."""
+        self.jobs.recover_stale()
+        if not self.jobs.stop_local_jobs(document_id):
+            raise JobError("The previous run of this document is still stopping; try again in a moment.")
+        doc = self.get_document(document_id)
+        plan = self.resume_plan(document_id, doc)
+        if not plan["unread"]:
+            raise InputError("every page of this document has been read")
+        if plan["source_missing"]:
+            raise InputError(f"The stored copy of {', '.join(plan['source_missing'])} is gone, so its unread pages "
+                             "cannot be prepared. Attach the file again.",
+                             details={"source_missing": plan["source_missing"]})
+        rows = self.repo.get_pages(document_id)
+        for p in doc.pages:
+            # The app may have died between storing a page and recording it: the stored page decides.
+            if p.page_number in plan["accepted"] and rows.get(p.page_number, {}).get("status") != p.status.value:
+                self.repo.set_page(document_id, p.page_number, p.status, route=p.route.value if p.route else None,
+                                   cache_key=p.cache_key)
+            elif p.page_number in plan["to_prepare"] and p.status == PageStatus.AWAITING_TRANSCRIPTION:
+                p.status = PageStatus.PENDING  # its image is gone: the pipeline must not take it as prepared
+                save_page(self.store, p)
+        job_id = None
+        if plan["to_prepare"]:
+            opts = (options or ProcessingOptions()).model_copy(
+                update={"pages": ",".join(map(str, plan["to_prepare"])), "reprocess": False})
+            job_id = self.jobs.start(document_id, opts, len(plan["to_prepare"]), background=True).job_id
+        return {"document_id": document_id, "job_id": job_id, "page_count": doc.page_count, "warnings": [], **plan}
 
     def wait_for_job(self, job_id: str, timeout: float | None = None) -> dict[str, Any]:
         return self._job_dict(self.jobs.wait(job_id, timeout))
@@ -756,7 +816,8 @@ class ScholarOCR:
 
     def layout_outdated(self, document_id: str, doc: Document | None = None) -> dict[str, Any]:
         """Whether ``refine_document`` would add anything to this document: model-estimated boxes never refined,
-        figures without a stored crop, or text without cleaned text. Cheap: reads the stored pages only."""
+        figures without a stored crop or without the stored place of their cleaned crop, or text without cleaned
+        text. Cheap: reads the stored pages only."""
         from .intelligence.clean_text import CLEANABLE_TYPES
         from .pipeline.layout_refine import needs_refinement
 
@@ -767,7 +828,9 @@ class ScholarOCR:
             for el in page.elements:
                 if page.layout_refined_at is None and needs_refinement(el):
                     reasons["boxes"] += 1
-                if el.type in VISUAL_TYPES and el.bbox is not None and not el.source.region_image:
+                if el.type in VISUAL_TYPES and el.bbox is not None and (
+                        not el.source.region_image
+                        or (el.figure is not None and el.figure.image_clean and not el.figure.image_clean_box)):
                     reasons["figures"] += 1
                 if el.type.value in CLEANABLE_TYPES and el.content and el.clean_content is None:
                     reasons["clean_text"] += 1

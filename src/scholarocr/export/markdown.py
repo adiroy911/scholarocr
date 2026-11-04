@@ -20,13 +20,15 @@ from .base import (
     is_unclear,
     iter_document,
     layout_table,
+    marks_in_text,
     marks_label,
     math_latex,
     ordered_elements,
     ordered_pages,
     plain_text,
     region_image,
-    starts_with_question_number,
+    question_label,
+    question_lead,
     unclear_text,
     with_text_variant,
     write_text,
@@ -80,11 +82,10 @@ def _question_wrap(el: Element, text: str) -> str:
     q = el.question
     if q is None:
         return text
-    prefix = f"**Q{q.number}** " if q.number else ""
-    if starts_with_question_number(q.number, text):
-        prefix = ""  # the transcription already starts with the printed number
+    lead = question_lead(q.number, text)  # empty when the transcription already starts with the printed number
+    prefix = f"**{question_label(lead)}** " if lead else ""
     suffix = f" *{marks_label(q.marks)}*" if q.marks and marks_label(q.marks) else ""
-    if q.marks and re.search(rf"[\[(]\s*{re.escape(q.marks)}\s*(marks?|M)?\s*[\])]\s*$", text, re.I):
+    if q.marks and marks_in_text(q.marks, text):
         suffix = ""  # marks already printed at the end
     return f"{prefix}{text}{suffix}"
 

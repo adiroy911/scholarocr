@@ -34,7 +34,8 @@ percentage is derived from them. The rules are in `intelligence/uncertainty.py`:
    - `unreadable` → `unresolved`
 
 Reviews are selected per page: medium/high/unresolved elements that have a box, up to 8 per page.
-With `detail="high"`, every equation and table is reviewed as well.
+With `detail="high"`, every equation and table is reviewed as well. The web app can run this pass through
+Antigravity (off by default, measured in docs/WEB_APP.md, "Second look at doubtful elements").
 
 ## Blank pages (`ingestion/loader.py`)
 
@@ -115,8 +116,47 @@ The ground-truth format is documented in the module. Metrics:
 
 These numbers only show that the deterministic path reproduces clean generated text layers
 faithfully. **They are not an accuracy claim for scanned, handwritten or real-world documents.**
-`--live` adds scanned fixtures but needs an API key, and it was **not run**. No visual-OCR accuracy
-has been measured yet (see ROADMAP.md).
+`--live` adds scanned fixtures but needs an API key, and it was **not run**.
+
+### Measurement: 8 printed exam pages through Antigravity (2026-11-04)
+
+One run of the web app's default route: `agy` 1.4.12, Gemini 3.8 Flash, effort low, 3 pages at a time. 129 s, 227,323
+tokens, one page retried once after a validator rejection. The pages are 2 each of the CBSE 2024-25 sample papers for
+class XII mathematics, physics and chemistry and class X Hindi A, from the official digital PDFs, rasterised at 200 dpi
+into an image-only PDF. Evidence and method are kept outside the repo (`accuracy-results/2026-11-04/README.md`).
+`benchmarks/rasterize_pages.py` and `benchmarks/score_against_reference.py` repeat the steps.
+
+| page | subject | `evaluate` CER | `evaluate` WER | adjusted edits / characters |
+|---|---|---|---|---|
+| 1, 2 | mathematics | 0.061, 0.008 | 0.097, 0.031 | 0 / 3,261 |
+| 3, 4 | physics | 0.043, 0.008 | 0.073, 0.011 | 0 / 3,003 |
+| 5, 6 | chemistry | 0.079, 0.074 | 0.112, 0.078 | 1 / 3,334 |
+| 7, 8 | Hindi | 0.009, 0.015 | 0.028, 0.132 | 4 / 2,527 |
+| all | | 0.038 | 0.066 | 5 / 12,125 (0.0004) |
+
+Equations: 29 of 40 reference expressions match `evaluate`'s normalised LaTeX exactly (mean similarity 0.873). The other
+11 were read by eye and differ only in spelling or grouping (`\ce{C4H9Cl}` against `C₄H₉Cl`, a unit inside the math). All
+40 are found after the adjustment below.
+
+- **The adjusted score removes differences in form.** It reduces LaTeX to its characters, merges same-symbol spellings,
+  removes all whitespace and sets aside the marks column. It cannot see spacing errors or a superscript read as a plain
+  digit, so it is a lower bound on errors. The `evaluate` figures are the upper bound; most of what they count is
+  spelling (`\dfrac`, `10¹⁸⁴`), question numbers stored in `question.number`, and marks placed elsewhere.
+- **The 5 edits are 4 real differences.** A marks-column "1" entered a sentence ("is 1 0.15 V"). Three misprints in the
+  Hindi paper were silently corrected (लगभा to लगभग, स्ववृत to स्ववृत्त, गईं to गई) despite the rule to transcribe exactly.
+  Spacing was also tidied (`4: 3` to `4:3`, `है ।` to `है।`), and in one chemical equation's LaTeX `(.aq)` became `(aq)`.
+- **Uncertainty labels gave no signal here.** All 135 elements were labelled `low`, including the four differences.
+- **The reference was checked by an AI agent, not by a human.** It was written from the page images and text layers before
+  the run; one spelling was changed afterwards and logged. Its English words agree with the PDFs' text layers. The Hindi
+  text layer is mis-encoded, so the Hindi has no independent check. Equation references are the weakest part. An AI
+  reference and an AI reader can share a blind spot.
+- **Limits.** 8 clean digital pages are a best case, not a scan or a phone photo, and the sample is too small for an error
+  rate to carry over to other papers. These pages have no figures or data tables in the reference, so those are
+  unmeasured. **Handwriting remains unmeasured**: there is no reference for it.
+
+`evaluate` as shipped in 0.4.0 reported CER 0.121 and math exact match 0.025 on this run, for two scorer faults fixed the
+same day: a table's text was counted twice (page 7 scored 0.66), and inline `$...$` math was not compared with the
+reference equations.
 
 ## Test suite
 
@@ -124,6 +164,8 @@ has been measured yet (see ROADMAP.md).
 **215 passed, 5 skipped, 1 failed**. The failure is `test_path_policy_blocks_outside_and_traversal`: creating a symlink needs a
 Windows privilege the test account lacks (WinError 1314). The skips are pandoc/XeLaTeX not installed.
 (2026-11-01, Linux, Python 3.13, before the hosted server and host mode: 129 passed, 3 skipped.)
+The pandoc tests first ran on 2026-11-04, with pandoc 3.13 on Windows, and passed. The real Windows Credential Manager was
+exercised the same day by a one-off script (docs/WEB_APP.md); the default suite still uses a fake keyring.
 
 | Group | Covers |
 |---|---|

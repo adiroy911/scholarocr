@@ -2,11 +2,70 @@
 
 ## Unreleased
 
+- **Layout PDF fixes**, from checking a real 12-page handwritten document page by page.
+  - Formulas were measured before KaTeX's fonts had loaded, in a narrower fallback, then printed wider: this caused
+    the equations cut off at the page edge (with an answer label lost past it) and formulas printed over their
+    neighbours. Every font now loads before measuring.
+  - A too-wide equation now breaks before a top-level `=`, `\Rightarrow`, `\approx` or `\quad`. Nothing passes the
+    page edge: text slides into free space, then shrinks. Equations no longer sit 2 em right of their box.
+  - One body size for all pages of a shape: larger writing no longer gives one page larger text (13 pt pages next to
+    18 pt ones), and line spacing opens to at most 1.6 instead of 2.4.
+  - Cleaned crops: drawn exactly where they were cut from, so a stroke split between two figures no longer prints
+    twice. Pen strokes along a ruled line are followed back (broken circuit wires) and rule stretches and margin
+    rules left in a drawing are dropped, on pages whose pen colour differs from the rules. Run Update layout on older
+    documents for these; the document shows it.
+  - Ink: the end of a written line that a figure's box also reaches stays with the text (the end of an equation
+    above a circuit no longer printed twice); a fraction bar or tall bracket stays with its equation.
+  - LaTeX written without `$` is typeset. `[crossed out: $x$]` is struck through instead of printed, a line is drawn
+    over struck formulas, and `[crossed out]` is a short struck gap. "Find a) ..." no longer gets a stray "a." in front.
+  - Verification now reports `clipped_by_page`, `overprinted` and `raw_latex`, measured on the finished PDF. Before,
+    these failures passed unreported.
+  - `text_variant=auto` is accepted for the layout PDF (it gave a 400).
+- First real tests of three untested paths (2026-11-04): DOCX through pandoc 3.13, the Windows Credential Manager, and
+  accuracy on 8 printed CBSE exam pages through Antigravity (results and caveats in docs/QUALITY_ASSURANCE.md). Fixes:
+  - Doubled question numbers on real pages. The check only handled plain numbers, so `Q23.(a) Q.23. (a) ...`,
+    `Q(i) (i) ...`, `Q13. 13.` and `Q17 a. a. ...` reached Word, Markdown and the layout PDF (36 lines in the 8-page Word
+    export, 0 now). It now handles compound numbers, Hindi question words and Devanagari digits, and a sub-part
+    with no question number gets no "Q".
+  - Marks: no more `[2 Marks marks]`, and Word no longer repeats marks already printed in the text.
+  - Word: inline math in table cells and captions is now native (it showed `$x^2$`); `**bold**` and `*italic*` from the
+    model become formatting instead of asterisks; `\tag{1}` is kept (pandoc dropped it silently); a formula that fails
+    to convert shows the source as read instead of the `\mathrm` rewrite; pandoc's UTF-8 warnings no longer raise a
+    decoding error in a background thread on Windows.
+  - `\ce{}` for Word and for LaTeX without mhchem: a lone `^` or `v` is a gas or precipitate arrow (`^` made pandoc fail,
+    `v` printed a letter), arrow labels sit on the arrow, `*` and a hydrate `.` are dots, `#` is a triple bond, and
+    charges before a state (`H+(aq)`) are raised. On 16 test formulas: 16 native, against 13 before.
+  - Searchable text no longer repeats a table or list whose text is already in the element's content (this doubled them
+    in the searchable PDF's text layer and in `text` output). A line break a model sent as the characters `\n` in a table
+    cell is now a space.
+  - Keychain: replacing a key on Windows left the old value in Credential Manager under `<NAME>@ScholarOCR`; it is now
+    removed first.
+  - `scholarocr evaluate`: a table's text was counted twice (one page scored CER 0.66 instead of 0.009), inline `$...$`
+    math was never compared with reference equations, and more same-symbol LaTeX spellings are treated as equal.
+- New `benchmarks/rasterize_pages.py` and `benchmarks/score_against_reference.py`.
+- Web app: **Resume reading**. A document that did not finish (stopped, failed or rejected pages, exhausted quota,
+  app closed or killed during the read) shows a "Not finished" row and continues from the page, without attaching
+  the file again and also after a restart. Only pages not yet accepted are read, with the engine, model and effort of
+  the first read, the same limit, throttling, progress and Stop, in the same message. One document has one run in the
+  whole app, so a second click cannot start a second read. If the stored source is gone and still needed, the row says
+  so and offers attaching the file, and attaching it restores the stored copy (before, the manifest was reused and the
+  page failed). A job killed with the app no longer blocks its document for two minutes through its lock. A page that
+  failed shows the reason from its last attempt, and a message names any file of it that never started.
 - Web app: the model picker shows a short name on phones ("Flash · Low") instead of a cut-off one; the sidebar's
   "Recent" heading is larger. Figure labels and text written as LaTeX without `$` (`\theta_1`, `T_A`, `x_0`)
   render as math, label chips no longer style the math inside them, and `~~crossed out~~` text is struck through
   (as in the layout PDF) instead of showing the tildes. Prose lines were re-measured at 71 characters at most; the
   "90 characters" finding was a raw LaTeX line.
+- Web app: **second look at doubtful elements** (Settings, off by default, Antigravity). After a page is accepted, the
+  elements `select_for_review` picks are checked against their crops in one more `agy -p` call with the same sandbox
+  as a page read (only the crop folder readable, no API keys, other tools refused, JSON schema). Elements show
+  "confirmed" or "changed"; a change keeps the earlier reading and can be undone from the source panel. A confirmed
+  element loses its doubt mark even when the stored label only goes from high to medium. A correction that fails the
+  schema or LaTeX checks, or a verdict on a crop the model did not open, changes nothing. A failed or rate-limited
+  review never fails the page, which is marked "Not reviewed"; it shares the page limit and throttling, and Stop
+  stops it. Off by default because of a measurement on three handwritten pages: at medium effort 35-45k tokens and
+  about 130 s more per page with doubtful elements, no corrections in 10 elements; at low effort 31-42k tokens and
+  32-55 s, 2 of 2 corrections wrong, and different verdicts on each try (docs/WEB_APP.md).
 
 ## 0.4.0 (2026-11-03)
 

@@ -43,13 +43,16 @@ from .base import (
     is_unclear,
     latex_to_readable,
     layout_table,
+    marks_in_text,
     marks_label,
     math_latex,
     ordered_elements,
     ordered_pages,
     plain_text,
+    question_label,
+    question_lead,
+    split_emphasis,
     split_inline_math,
-    starts_with_question_number,
     svg_to_png,
     unclear_text,
 )
@@ -63,9 +66,15 @@ FALLBACK_IMAGE_DPI = 150.0
 GREY = RGBColor(0x80, 0x80, 0x80)
 MONO = "Courier New"
 MATH_FONT = "Cambria Math"
+_TAG = re.compile(r"\\tag\*?\{([^{}]*)\}")
 
 
 # ------------------------------------------------------------------ equations via pandoc
+def _pandoc_math(tex: str) -> str:
+    """LaTeX as pandoc receives it: one line, and ``\\tag{1}``, which pandoc silently drops, as a printed (1)."""
+    return " ".join(_TAG.sub(r"\\qquad (\1)", tex).split())
+
+
 def latex_to_omml(latexes: list[str], warnings: list[str], inline: list[bool] | None = None
                   ) -> list[etree._Element | None]:
     """Convert LaTeX to OMML with a single pandoc run; None marks a failure. ``inline[i]`` marks inline
@@ -84,14 +93,15 @@ def latex_to_omml(latexes: list[str], warnings: list[str], inline: list[bool] | 
                         "equations)")
         return results
     usable = [i for i, tex in enumerate(latexes) if "$" not in tex]
-    parts = [f"{EQ_MARKER}{i}\n\n" + (f"${' '.join(latexes[i].split())}$" if inline[i]
-                                       else f"$${' '.join(latexes[i].split())}$$") for i in usable]
+    parts = [f"{EQ_MARKER}{i}\n\n" + (f"${_pandoc_math(latexes[i])}$" if inline[i]
+                                       else f"$${_pandoc_math(latexes[i])}$$") for i in usable]
     with tempfile.TemporaryDirectory(prefix="scholarocr-eq-") as td:
         src, dst = Path(td) / "eq.md", Path(td) / "eq.docx"
         src.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
         try:
             proc = subprocess.run([pandoc, "-f", "markdown", "-t", "docx", "-o", str(dst), str(src)],
-                                  capture_output=True, text=True, timeout=PANDOC_TIMEOUT_S, check=False)
+                                  capture_output=True, encoding="utf-8", errors="replace",
+                                  timeout=PANDOC_TIMEOUT_S, check=False)  # pandoc writes UTF-8 warnings
         except subprocess.TimeoutExpired:
             warnings.append("pandoc timed out converting equations; equations inserted as LaTeX source")
             return results
@@ -193,8 +203,9 @@ class _DocxBuilder:
     def _text_runs(self, p: Paragraph, el: Element, *, italic: bool = False, size: float | None = None) -> None:
         q = el.question
         text = plain_text(el)
-        if q and q.number and not starts_with_question_number(q.number, text):
-            p.add_run(f"Q{q.number} ").bold = True
+        lead = question_lead(q.number, text) if q else ""
+        if lead:
+            p.add_run(f"{question_label(lead)} ").bold = True
         if is_unclear(el):
             self._unclear_run(p, text or unclear_text(el))
         else:
@@ -202,26 +213,32 @@ class _DocxBuilder:
                 if i:
                     p.add_run().add_break()
                 self._rich(p, line, italic=italic, size=size)
-        if q and q.marks and marks_label(q.marks):
+        if q and q.marks and marks_label(q.marks) and not marks_in_text(q.marks, text):
             p.add_run(f"  {marks_label(q.marks)}").italic = True
 
-    def _rich(self, p: Paragraph, line: str, *, italic: bool = False, size: float | None = None) -> None:
+    def _rich(self, p: Paragraph, line: str, *, italic: bool = False, bold: bool | None = None,
+              size: float | None = None) -> None:
         """Runs for one line of text; inline $...$ math becomes a placeholder filled by insert_equations."""
         for segment, is_math in split_inline_math(line):
-            run = p.add_run(segment)
-            run.italic = italic or None
-            if size:
-                run.font.size = Pt(size)
             if is_math:
+                run = p.add_run(segment)
                 self.inline_math.append((run, segment))
+                continue
+            for piece, style in split_emphasis(segment):
+                run = p.add_run(piece)
+                run.italic = italic or style == "italic" or None
+                run.bold = bold or style == "bold" or None
+                if size:
+                    run.font.size = Pt(size)
 
     def _list(self, el: Element) -> None:
         items = [i for i in (el.items if el.items else plain_text(el).split("\n")) if i.strip()]
         q = el.question
         if q and (q.number or q.marks):
             p = self.doc.add_paragraph()
-            if q.number:
-                p.add_run(f"Q{q.number}").bold = True
+            lead = question_lead(q.number, items[0] if items else "")
+            if lead:
+                p.add_run(question_label(lead)).bold = True
             if q.marks and marks_label(q.marks):
                 p.add_run(f"  {marks_label(q.marks)}").italic = True
         for item in items:
@@ -239,7 +256,7 @@ class _DocxBuilder:
         if latex is None:
             p.add_run(" ".join(el.content.split()))
             return
-        self.equations.append((p, ce_to_math(latex) if r"\ce" in latex else latex))
+        self.equations.append((p, latex))
 
     def _table(self, el: Element) -> None:
         self._note_if_unresolved(el)
@@ -248,7 +265,7 @@ class _DocxBuilder:
             return
         head = " ".join(x for x in (el.table.label, el.table.caption) if x)
         if head:
-            self.doc.add_paragraph(head, style="Caption")
+            self._rich(self.doc.add_paragraph(style="Caption"), " ".join(head.split()))
         layout = layout_table(el.table)
         if layout.n_rows == 0 or layout.n_cols == 0:
             self._unclear_run(self.doc.add_paragraph(), "empty table")
@@ -264,14 +281,11 @@ class _DocxBuilder:
             if pc.cell.uncertain:
                 self._unclear_run(para, text or "cell")
                 continue
+            bold = pc.row < layout.header_rows or pc.cell.is_header or None
             if text:
-                run = para.add_run(text)
+                self._rich(para, text, bold=bold)
             elif pc.cell.latex:
-                run = para.add_run(pc.cell.latex)
-                run.font.name = MONO
-            else:
-                continue
-            run.bold = pc.row < layout.header_rows or pc.cell.is_header or None
+                self.inline_math.append((para.add_run(pc.cell.latex), pc.cell.latex))
         for r in range(layout.header_rows):
             tr_pr = table.rows[r]._tr.get_or_add_trPr()
             hdr = OxmlElement("w:tblHeader")
@@ -323,7 +337,8 @@ class _DocxBuilder:
     # -- finish
     def insert_equations(self) -> tuple[int, int]:
         inline_tex = [ce_to_math(tex) if r"\ce" in tex else tex for _, tex in self.inline_math]
-        omml = latex_to_omml([tex for _, tex in self.equations] + inline_tex, self.warnings,
+        omml = latex_to_omml([ce_to_math(tex) if r"\ce" in tex else tex for _, tex in self.equations] + inline_tex,
+                             self.warnings,
                              inline=[False] * len(self.equations) + [True] * len(inline_tex))
         inline_nodes = omml[len(self.equations):]
         omml = omml[:len(self.equations)]
@@ -341,7 +356,7 @@ class _DocxBuilder:
                 p._p.append(copy.deepcopy(node))
                 native += 1
             else:
-                run = p.add_run(tex)
+                run = p.add_run(tex)  # the source as read, \\ce{...} included
                 run.font.name = MONO
                 failed += 1
         if failed and shutil.which("pandoc") is not None:

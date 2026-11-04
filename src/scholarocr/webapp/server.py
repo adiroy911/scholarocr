@@ -41,6 +41,7 @@ from .agy import AgyRunner
 from .config import MAX_MESSAGE_CHARS, AppConfig, PrefsStore
 from .engines import EngineRegistry, NoEngineError, ServicePool
 from . import redraw as redraw_mod
+from . import review as review_mod
 from .keys import KeyStore
 from .runs import RunManager
 from .store import AppStore
@@ -377,6 +378,54 @@ def create_app(cfg: AppConfig | None = None, **kwargs: Any) -> Starlette:
         view = await run_in_threadpool(document_view, svc, doc_id, prefs.text_variant)
         return _json({"result": {"totals": result["totals"], "pages": len(result["pages"])}, "view": view})
 
+    async def resume_document(request: Request) -> Response:
+        """Read the pages of a document that are not accepted yet, with the engine and model of the read that left
+        them, in that read's message. A document that is being read keeps its run: answers 200 with that run."""
+        doc_id = request.path_params["did"]
+        _owned(app, doc_id)
+        data = await _body_json(request)
+        message = app.store.get_message(str(data.get("message_id") or ""))
+        stored = message["data"]
+        if message["kind"] != "read" or not any(d.get("document_id") == doc_id for d in stored.get("documents") or []):
+            raise NotFoundError(f"Document {doc_id} was not read in that message")
+
+        def answer(run, started: bool) -> Response:
+            return _json({"run_id": run.id, "message_id": run.message_id, "conversation_id": run.conversation_id,
+                          "already_running": not started}, 202 if started else 200)
+
+        current = app.runs.reading_run(doc_id)
+        if current is not None:
+            return answer(current, False)
+        prefs = app.prefs.load()
+        engine = await run_in_threadpool(app.registry.resolve, stored.get("engine"), prefs)
+        model = stored.get("model") or engine.default_model
+        if model and model not in {m["id"] for m in engine.models}:
+            raise InputError(f"model {model!r} is not offered by {engine.label} any more")
+        if stored.get("effort"):  # the same reader as the first read; the number of pages at once stays the setting
+            prefs = prefs.model_copy(update={"read_effort": stored["effort"]})
+        plan = await run_in_threadpool(lambda: app.pool.get(engine.id, prefs, model).resume_plan(doc_id))
+        if not plan["unread"]:
+            raise InputError("every page of this document has been read")
+        if plan["source_missing"]:
+            raise InputError(f"The stored copy of {', '.join(plan['source_missing'])} is gone, so its unread pages "
+                             "cannot be prepared. Attach the file again.",
+                             details={"source_missing": plan["source_missing"]})
+        run, started = await run_in_threadpool(app.runs.start_resume, message["conversation_id"], doc_id, message,
+                                               engine=engine, model=model, prefs=prefs)
+        return answer(run, started)
+
+    async def undo_review(request: Request) -> Response:
+        """Put back the reading from before the review pass changed it."""
+        doc_id, eid = request.path_params["did"], request.path_params["eid"]
+        _owned(app, doc_id)
+        if any(doc_id in app.store.documents(r.conversation_id) for r in app.runs.running()):
+            raise InputError("this document is still being read; undo the change when reading has finished")
+        prefs = app.prefs.load()
+        svc = app.pool.reader(prefs)
+        await run_in_threadpool(review_mod.undo_verdict, svc, doc_id, eid)
+        view = await run_in_threadpool(document_view, svc, doc_id, prefs.text_variant)
+        return _json({"element_id": eid, "view": view})
+
     async def element_source(request: Request) -> Response:
         doc_id, eid = request.path_params["did"], request.path_params["eid"]
         _owned(app, doc_id)
@@ -447,8 +496,10 @@ def create_app(cfg: AppConfig | None = None, **kwargs: Any) -> Starlette:
         Route("/api/documents/{did}/pages/{n}/source.png", guarded(page_source), methods=["GET"]),
         Route("/api/documents/{did}/elements/{eid}/figure/{variant}", guarded(figure_image), methods=["GET"]),
         Route("/api/documents/{did}/elements/{eid}/redraw", guarded(redraw_figure), methods=["POST"]),
+        Route("/api/documents/{did}/elements/{eid}/undo-review", guarded(undo_review), methods=["POST"]),
         Route("/api/documents/{did}/export/{fmt}", guarded(export), methods=["GET"]),
         Route("/api/documents/{did}/refine", guarded(refine_document), methods=["POST"]),
+        Route("/api/documents/{did}/resume", guarded(resume_document), methods=["POST"]),
     ]
     routes = [Route("/", index, methods=["GET"]), *api,
               Mount("/static", app=StaticFiles(directory=str(static_dir())), name="static")]

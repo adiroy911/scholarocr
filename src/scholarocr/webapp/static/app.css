@@ -385,6 +385,12 @@ button.fact:hover { color: var(--ink); background: var(--hover); }
 .el.u-unresolved { box-shadow: inset 0 0 0 1.5px var(--redpen); background: var(--redpen-soft); }
 .el.u-unresolved .u-text { color: var(--redpen); font-family: var(--ui); }
 .u-flag { display: inline-block; margin-left: 8px; font-family: var(--ui); font-size: 0.75rem; color: var(--ink-2); vertical-align: 1px; }
+/* the second look: a tick in board green when it agrees, a labelled tab when it changed the reading */
+.rv-flag { display: inline-flex; align-items: center; gap: 3px; margin-left: 8px; font-family: var(--ui); font-size: 0.75rem; font-weight: 500; line-height: 1.2; color: var(--ok); vertical-align: 1px; white-space: nowrap; font-style: normal; letter-spacing: 0; }
+.rv-flag svg { width: 12px; height: 12px; flex: none; }
+.rv-changed { padding: 1px 7px 1px 5px; border-radius: 999px; background: var(--accent-soft); color: var(--board); }
+.el.selected .rv-changed { background: var(--sheet); }
+.el > .rv-flag { display: flex; width: fit-content; margin: 2px 0 2px 0; }
 
 .page-empty, .page-error { grid-column: 2; padding: 10px 16px 6px 14px; font-family: var(--ui); color: var(--ink-2); font-size: 0.9375rem; }
 .page-error { color: var(--redpen); }
@@ -427,6 +433,9 @@ button.fact:hover { color: var(--ink); background: var(--hover); }
 .sp-label { font-size: 0.875rem; color: var(--ink-2); margin: 14px 0 4px; font-weight: 550; }
 .sp-raw { font-family: var(--mono); font-size: 0.8125rem; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--paper); border-radius: 10px; padding: 10px 12px; margin: 0; max-height: 40vh; overflow: auto; }
 .sp-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.sp-review { margin: 0 0 14px; padding-bottom: 14px; border-bottom: 1px solid var(--rule); }
+.sp-review .sp-facts { margin-top: 0; }
+.sp-note { margin: 0 0 8px; color: var(--ink-2); font-size: 0.9375rem; }
 
 /* ------------------------------------------------------------------ menus, dialogs, toast, dropzone */
 .menu { position: fixed; z-index: 60; min-width: 260px; max-width: min(360px, calc(100vw - 24px)); max-height: 70vh; overflow-y: auto;
@@ -479,6 +488,8 @@ button.fact:hover { color: var(--ink); background: var(--hover); }
 .set-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .set-grid h3, .set-grid .set-help { grid-column: 1 / -1; }
 .set-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 0.875rem; color: var(--ink-2); }
+.set-grid .set-check { grid-column: 1 / -1; flex-direction: row; align-items: center; gap: 8px; min-height: 28px; margin-top: 6px; font-size: 0.9375rem; color: var(--ink); cursor: pointer; }
+.set-check input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); flex: none; }
 .seg { display: inline-flex; flex-wrap: wrap; gap: 4px; }
 .seg label { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 999px; cursor: pointer; font-size: 0.9375rem; }
 .seg input { position: absolute; opacity: 0; width: 1px; height: 1px; }

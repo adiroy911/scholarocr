@@ -37,6 +37,7 @@ class AppConfig(BaseModel):
     page_timeout_s: float = 300.0  # one agy call for one page
     chat_timeout_s: float = 240.0
     redraw_timeout_s: float = 600.0  # one agy call copying one figure as SVG (a detailed drawing takes minutes)
+    review_timeout_s: float = 300.0  # one agy call checking a page's doubtful elements against their crops
     max_retries: int = 2  # re-prompts after a rejected page submission
     upload_ttl_s: float = 86400.0  # staged uploads not used by a message are removed after this
     rate_limit_backoff_s: float = 20.0  # first pause after agy reports throttling (doubles each time)
@@ -92,6 +93,8 @@ class Prefs(BaseModel):
     # Antigravity reasoning effort (agy --effort): page transcription, and follow-up chat + Redraw.
     read_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
     chat_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    # Antigravity: after a page is accepted, its doubtful elements get a second look against their crops.
+    review_flagged: bool = False
 
     @field_validator("saved_instructions")
     @classmethod

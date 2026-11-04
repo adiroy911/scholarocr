@@ -30,14 +30,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..exceptions import ScholarOCRError, SubmissionRejected
+from ..exceptions import InputError, ScholarOCRError, SubmissionRejected
 from ..intelligence.gemini_client import TextPart
 from ..intelligence.responses import PageExtractionResponse
 from ..intelligence.schema_utils import to_gemini_schema
 from ..logging_config import get_logger
 from ..schemas import ProcessingOptions
 from ..service import ScholarOCR
-from . import prompts
+from . import prompts, review as review_mod
 from .agy import AgyCancelled, AgyError, AgyRateLimited, AgyRunner, AgyTimeout, model_for_effort
 from .config import DEFAULT_READ_CONCURRENCY, MAX_READ_CONCURRENCY, AppConfig, Prefs
 from .engines import EngineStatus, ServicePool
@@ -123,6 +123,7 @@ class Run:
     cancel: threading.Event = field(default_factory=threading.Event)
     cond: threading.Condition = field(default_factory=threading.Condition)
     started: float = field(default_factory=time.time)
+    prior_seconds: float = 0.0  # time of the earlier runs of this message (resuming)
 
     def emit(self, type_: str, **data: Any) -> dict[str, Any]:
         with self.cond:
@@ -160,6 +161,7 @@ class RunManager:
         self._runs: dict[str, Run] = {}
         self._lock = threading.Lock()
         self.limiter = Limiter()  # every document read by this app shares it
+        self._reading: dict[str, str] = {}  # document id -> the run reading it: one run per document in the whole app
 
     def get(self, run_id: str) -> Run | None:
         with self._lock:
@@ -173,6 +175,24 @@ class RunManager:
         with self._lock:
             return next((r for r in self._runs.values() if r.conversation_id == conversation_id
                          and r.state == "running"), None)
+
+    def reading_run(self, document_id: str) -> Run | None:
+        with self._lock:
+            run = self._runs.get(self._reading.get(document_id, ""))
+            return run if run is not None and run.state == "running" else None
+
+    def _claim_document(self, document_id: str, run: Run) -> bool:
+        with self._lock:
+            holder = self._runs.get(self._reading.get(document_id, ""))
+            if holder is not None and holder.id != run.id and holder.state == "running":
+                return False
+            self._reading[document_id] = run.id
+            return True
+
+    def _release_documents(self, run: Run) -> None:
+        with self._lock:
+            for doc_id in [d for d, r in self._reading.items() if r == run.id]:
+                del self._reading[doc_id]
 
     def cancel(self, run_id: str) -> bool:
         run = self.get(run_id)
@@ -202,19 +222,49 @@ class RunManager:
         run = Run(new_id("r"), conversation_id, message_id, "read")
         return self._start(run, lambda: self._read_worker(run, groups, names, engine, model, prefs, instructions))
 
-    def _read_worker(self, run: Run, groups, names, engine: EngineStatus, model, prefs: Prefs, instructions: str):
-        data: dict[str, Any] = {"engine": engine.id, "engine_label": engine.label, "model": model,
-                                "instructions": instructions, "documents": [], "pages": {}, "usage": {}}
+    def start_resume(self, conversation_id: str, document_id: str, message: dict[str, Any], *, engine: EngineStatus,
+                     model: str | None, prefs: Prefs) -> tuple[Run, bool]:
+        """Read the pages of a document that are not accepted yet, in the message that first read it. Returns the
+        run and whether it is new: a document being read already keeps that run, so there is never a double run."""
+        with self._lock:
+            holder = self._runs.get(self._reading.get(document_id, ""))
+            if holder is not None and holder.state == "running":
+                return holder, False
+            if any(r.conversation_id == conversation_id and r.state == "running" for r in self._runs.values()):
+                raise InputError("this conversation is still working; wait for it or stop it first")
+            run = Run(new_id("r"), conversation_id, message["id"], "read")
+            run.prior_seconds = float(message["data"].get("seconds_total") or 0.0)
+            self._runs[run.id] = run  # registered and claimed under one lock: a second click sees this run
+            self._reading[document_id] = run.id
+        data = message["data"]
+        data.pop("error", None)
+        entry = next(e for e in data["documents"] if e["document_id"] == document_id)
+        self._persist(run, data, "running")
+        log.info("run %s resumes document %s in message %s", run.id, document_id, message["id"])
+        self._start(run, lambda: self._read_worker(run, [[]], [entry["files"]], engine, model, prefs,
+                                                   data.get("instructions") or "", data=data, resume=document_id))
+        return run, True
+
+    def _read_worker(self, run: Run, groups, names, engine: EngineStatus, model, prefs: Prefs, instructions: str, *,
+                     data: dict[str, Any] | None = None, resume: str | None = None):
+        fresh = data is None
+        data = data if data is not None else {
+            "engine": engine.id, "engine_label": engine.label, "model": model, "instructions": instructions,
+            "files": names, "documents": [], "pages": {}, "usage": {}}
         if engine.id == "antigravity":
-            data.update(effort=prefs.read_effort, concurrency=prefs.read_concurrency)
+            data.update(effort=prefs.read_effort, concurrency=prefs.read_concurrency, review=prefs.review_flagged)
+        if fresh:  # known from the start: a run stopped or killed before a later file can say it never started
+            self._persist(run, data, "running")
         state = "done"
         try:
             run.emit("stage", stage="starting", engine=engine.id, engine_label=engine.label, model=model)
+            if resume:
+                self._mark_unread(data, "interrupted")  # documents that a killed run left as "running"
             svc = self.pool.get(engine.id, prefs, model)
             for gi, paths in enumerate(groups):
                 run.check()
-                self._read_one(run, svc, paths, names[gi], engine, model, prefs, instructions, data)
-            if any(d.get("state") == "partial" for d in data["documents"]):
+                self._read_one(run, svc, paths, names[gi], engine, model, prefs, instructions, data, resume=resume)
+            if any(d.get("state") != "done" for d in data["documents"]):
                 state = "partial"
         except Cancelled:
             state = "cancelled"
@@ -235,23 +285,32 @@ class RunManager:
             self._finish(run, state, data)
 
     def _read_one(self, run: Run, svc: ScholarOCR, paths: list[Path], names: list[str], engine: EngineStatus,
-                  model: str | None, prefs: Prefs, instructions: str, data: dict) -> dict[str, Any]:
+                  model: str | None, prefs: Prefs, instructions: str, data: dict, *,
+                  resume: str | None = None) -> dict[str, Any]:
         label = names[0] if len(names) == 1 else f"{names[0]} and {len(names) - 1} more"
         run.emit("stage", stage="preparing", message=f"Preparing {label}", files=names)
         options = ProcessingOptions(context_hint=instructions or None)
-        result = svc.process(paths, options, wait=False)
+        result = svc.resume_document(resume, options) if resume else svc.process(paths, options, wait=False)
         doc_id, job_id = result["document_id"], result["job_id"]
+        if not self._claim_document(doc_id, run):
+            svc.cancel_job(job_id)
+            raise InputError("this document is being read in another conversation; wait for it or stop it first")
         self.store.attach_document(run.conversation_id, doc_id)
         entry: dict[str, Any] = {"document_id": doc_id, "files": names, "page_count": result["page_count"],
                                  "warnings": result.get("warnings", []), "state": "done"}
-        data["documents"].append(entry)  # recorded now, so a stopped or failed run still lists the document
+        if resume:
+            self._replace_entry(run, data, entry, result)
+        else:
+            data["documents"].append(entry)  # recorded now, so a stopped or failed run still lists the document
         entry["state"] = "running"
-        run.emit("document_started", document_id=doc_id, page_count=result["page_count"], files=names)
+        run.emit("document_started", document_id=doc_id, page_count=result["page_count"], files=names,
+                 resumed=bool(resume), already_read=len(result.get("accepted") or []))
         self._persist(run, data, "running")
         if engine.id == "antigravity":
             # pages are read while the job is still preparing the later ones
             self._transcribe_with_agy(run, svc, doc_id, job_id, engine, model, prefs, data,
-                                      page_count=result["page_count"])
+                                      page_count=result["page_count"], start_pages=result.get("prepared") or [],
+                                      already_read=len(result.get("accepted") or []))
         else:
             last = None
             while True:
@@ -274,7 +333,7 @@ class RunManager:
         view = document_view(svc, doc_id, prefs.text_variant)
         entry["title"] = view["title"]
         waiting = [p["page_number"] for p in view["pages"] if p["status"] == "awaiting_transcription"]
-        failed = [p["page_number"] for p in view["pages"] if p["status"] == "failed"]
+        failed = [p["page_number"] for p in view["pages"] if p["status"] in ("failed", "pending", "skipped")]
         if waiting or failed:
             entry["state"] = "partial"
             entry["unread_pages"] = sorted(waiting + failed)
@@ -282,6 +341,18 @@ class RunManager:
             entry["state"] = "done"
         run.emit("document", document_id=doc_id, view=view, state=entry["state"])
         return entry
+
+    @staticmethod
+    def _replace_entry(run: Run, data: dict, entry: dict[str, Any], result: dict[str, Any]) -> None:
+        """A resumed document keeps its place in the message; accepted pages and their numbers stay as they are."""
+        index = next(i for i, e in enumerate(data["documents"]) if e["document_id"] == entry["document_id"])
+        old = data["documents"][index]
+        entry["resumed"] = int(old.get("resumed") or 0) + 1
+        entry["warnings"] = old.get("warnings") or []
+        data["documents"][index] = entry
+        log.info("run %s, document %s: %d page(s) accepted and kept %s; reading %s; preparing %s", run.id,
+                 entry["document_id"], len(result["accepted"]), result["accepted"], result["prepared"],
+                 result["to_prepare"])
 
     def _mark_unread(self, data: dict, state: str) -> None:
         """Documents still in progress when a run stops: keep them, with the pages that were not read."""
@@ -306,24 +377,32 @@ class RunManager:
         return snap
 
     def _transcribe_with_agy(self, run: Run, svc: ScholarOCR, doc_id: str, job_id: str, engine: EngineStatus,
-                             model: str | None, prefs: Prefs, data: dict, *, page_count: int) -> None:
+                             model: str | None, prefs: Prefs, data: dict, *, page_count: int,
+                             start_pages: list[int] | None = None, already_read: int = 0) -> None:
         """Read every page that waits for transcription, several at once, starting while the job still prepares
-        the later pages. Returns when the job is terminal and no page is waiting or being read."""
+        the later pages. Returns when the job is terminal and no page is waiting or being read. Resuming:
+        ``start_pages`` are prepared already, ``already_read`` were accepted earlier, and ``job_id`` is None when no
+        page needs preparing."""
         model_arg, effort_arg = model_for_effort(model, prefs.read_effort, [m["id"] for m in engine.models])
         label = f"{model_arg}-{effort_arg}" if effort_arg else (model or "default")
+        review = None
+        if prefs.review_flagged:  # low effort gave a different verdict on every try (docs/WEB_APP.md): not read_effort
+            review_model, review_effort = model_for_effort(model, prefs.chat_effort, [m["id"] for m in engine.models])
+            review = review_mod.ReviewPlan(review_model, review_effort,
+                                           f"{review_model}-{review_effort}" if review_effort else (model or "default"))
         self.limiter.set_capacity(prefs.read_concurrency)
-        progress = ReadProgress(total=page_count, concurrency=prefs.read_concurrency)
+        progress = ReadProgress(total=page_count, concurrency=prefs.read_concurrency, read=already_read)
         runner: AgyRunner | None = None
-        dispatched: set[int] = set()
-        queue: list[int] = []  # pages to (re)start, in page order
+        dispatched: set[int] = set(start_pages or [])
+        queue: list[int] = list(start_pages or [])  # pages to (re)start, in page order
         requeued: dict[int, int] = {}
         futures: dict[Future, int] = {}
         pause_until = 0.0
         backoffs = 0
         failed_streak: dict[int, dict[str, Any]] = {}  # failed pages not yet recorded (see FAILURES_AS_THROTTLE)
         last_job = None
-        job_terminal = False
-        cancel_sent = False
+        job_terminal = job_id is None
+        cancel_sent = job_id is None
         pool = ThreadPoolExecutor(max_workers=MAX_READ_CONCURRENCY, thread_name_prefix=f"agy-{run.id}")
         try:
             while True:
@@ -363,7 +442,7 @@ class RunManager:
                     queue.sort()
                     n = queue.pop(0)
                     fut = pool.submit(self._agy_page, run, runner, svc, doc_id, n, model_arg, effort=effort_arg,
-                                      label=label, progress=progress)
+                                      label=label, progress=progress, review=review)
                     futures[fut] = n
                 if job_terminal and not queue and not futures:
                     break
@@ -378,6 +457,18 @@ class RunManager:
                     except Cancelled:  # agy was stopped: stop the whole run (and every other page's agy)
                         run.cancel.set()
                         continue
+                    if stats.get("review", {}).get("state") == "rate_limited":
+                        # the page stays accepted; the reader slows down as for a throttled page read
+                        delay = self.cfg.rate_limit_backoff_s * (2 ** min(backoffs, 4))
+                        backoffs += 1
+                        pause_until = max(pause_until, time.monotonic() + delay)
+                        with progress.lock:
+                            progress.concurrency = max(1, progress.concurrency // 2)
+                        run.emit("stage", stage="throttled", document_id=doc_id, concurrency=progress.concurrency,
+                                 pause_seconds=round(delay), message=(
+                                     f"Antigravity reported rate limiting or quota during a review; reviews are off "
+                                     f"for this document, waiting {round(delay)} s, then reading "
+                                     f"{progress.concurrency} page{'s' if progress.concurrency > 1 else ''} at a time"))
                     status = stats.get("status")
                     throttled = status == "rate_limited"
                     retry_pages = [n]
@@ -439,13 +530,32 @@ class RunManager:
         if results:
             self._persist(run, data, "running")
 
+    def _review_page(self, run: Run, runner: AgyRunner, svc: ScholarOCR, doc_id: str, n: int, suggested: list[dict],
+                     plan: review_mod.ReviewPlan, stats: dict[str, Any], emit: Callable[..., None]) -> None:
+        """The accepted page's second look, in its worker: it keeps the page's slot under the shared limit, so
+        there is still one agy process per slot. Whatever happens, the page stays accepted."""
+        ids = [s["element_id"] for s in suggested]
+        emit("reviewing", flagged=len(ids))
+
+        def on_usage(usage: dict[str, int], **kw: Any) -> None:
+            run.emit("usage", document_id=doc_id, page=n, usage=usage, review=True, **kw)
+
+        result = review_mod.review_page(runner, svc, doc_id, n, ids, plan, run_dir=self.cfg.runs_dir / f"{run.id}-p{n}-review",
+                                        timeout_s=self.cfg.review_timeout_s, cancel=run.cancel, on_usage=on_usage)
+        stats["review"] = result
+        for k, v in result["usage"].items():
+            stats["usage"][k] = stats["usage"].get(k, 0) + v
+        emit("reviewed", review={k: result[k] for k in ("state", "flagged", "confirmed", "corrected", "unreadable",
+                                                        "rejected", "not_reviewed", "seconds")})
+
     def _agy_page(self, run: Run, runner: AgyRunner, svc: ScholarOCR, doc_id: str, n: int, model: str | None, *,
-                  effort: str | None = None, label: str | None = None,
-                  progress: ReadProgress | None = None) -> dict[str, Any]:
+                  effort: str | None = None, label: str | None = None, progress: ReadProgress | None = None,
+                  review: review_mod.ReviewPlan | None = None) -> dict[str, Any]:
         progress = progress or ReadProgress(total=1, concurrency=1)
         stats: dict[str, Any] = {"page": n, "attempts": 0, "usage": {}, "seconds": 0.0, "status": "reading"}
         if not self.limiter.acquire(run.cancel):
             raise Cancelled()
+        log.info("run %s reads page %d of document %s", run.id, n, doc_id)
         with progress.lock:
             progress.reading.add(n)
         index = n
@@ -525,6 +635,7 @@ class RunManager:
                             errors, previous, conversation = None, None, None
                             emit("rotated", attempt=stats["attempts"] + 1, message="Page re-oriented; reading it again")
                             continue
+                        log.info("run %s: page %d of document %s accepted", run.id, n, doc_id)
                         stats.update(status="done", elements=out.get("elements"), uncertainty=out.get("uncertainty"),
                                      warnings=(out.get("warnings") or [])[:5])
                         with progress.lock:
@@ -532,6 +643,8 @@ class RunManager:
                             progress.read += 1
                         emit("done", elements=out.get("elements"), uncertainty=out.get("uncertainty"),
                              attempts=stats["attempts"])
+                        if review is not None and out.get("review_suggested"):
+                            self._review_page(run, runner, svc, doc_id, n, out["review_suggested"], review, stats, emit)
                         return stats
                 retries += 1
                 if retries > self.cfg.max_retries:
@@ -663,8 +776,9 @@ class RunManager:
 
     def _finish(self, run: Run, state: str, data: dict) -> None:
         data["state"] = state
-        data["seconds_total"] = round(time.time() - run.started, 1)
+        data["seconds_total"] = round(time.time() - run.started + run.prior_seconds, 1)
         self._persist(run, data, state)
+        self._release_documents(run)
         with run.cond:
             run.state = state
         run.emit("done", state=state, data=data)

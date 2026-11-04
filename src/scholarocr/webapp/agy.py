@@ -57,7 +57,7 @@ AGENT_REFUSED = re.compile(r"unknown agent|agent\b.{0,60}\b(not found|not availa
 # itself and surfaces the ones it cannot recover ("RESOURCE_EXHAUSTED", "individual quota reached", 503s).
 RATE_LIMIT = re.compile(r"\b429\b|\b503\b|RESOURCE_EXHAUSTED|rate[ -]?limit|quota|too many requests|capacity|"
                         r"overloaded|UNAVAILABLE|exhausted", re.I)
-READER_AGENT_BODY = """You are the vision model of the ScholarOCR desktop app. Read the one image file named in the \
+READER_AGENT_BODY = """You are the vision model of the ScholarOCR desktop app. Read the image file or files named in the \
 message with read_file (your only file tool), then answer exactly as the message asks.{finish} Never try any other \
 tool: everything else is denied in this run."""
 READER_FINISH = (" Return the JSON answer by calling the finish tool with it as the structured output; do not "
@@ -191,10 +191,10 @@ class AgyRunner:
 
     @staticmethod
     def write_reader_agent(run_dir: Path, *, schema: bool) -> str:
-        """The workspace agent for reading one image (see the module docstring). Returns its name."""
+        """The workspace agent for reading images (see the module docstring). Returns its name."""
         tools = "  - read_file\n" + ("  - finish\n" if schema else "")
         body = READER_AGENT_BODY.format(finish=READER_FINISH if schema else "")
-        doc = (f"---\nname: {READER_AGENT}\ndescription: Reads one image and answers as asked.\ntools:\n{tools}"
+        doc = (f"---\nname: {READER_AGENT}\ndescription: Reads images and answers as asked.\ntools:\n{tools}"
                f"mainAgent: true\nsubagent: false\nmodel: inherit\n---\n{body}\n")
         path = run_dir / ".agents" / "agents" / f"{READER_AGENT}.md"
         path.parent.mkdir(parents=True, exist_ok=True)

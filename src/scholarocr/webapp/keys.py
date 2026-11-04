@@ -106,6 +106,10 @@ class KeyStore:
         with self._lock:
             if self._keyring is not None:
                 try:
+                    try:  # Windows Credential Manager keeps the replaced value under "<name>@<service>" otherwise
+                        self._keyring.delete_password(SERVICE, name)
+                    except Exception:
+                        pass  # nothing stored yet
                     self._keyring.set_password(SERVICE, name, key)
                     return "keychain"
                 except Exception:

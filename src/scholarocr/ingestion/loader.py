@@ -126,7 +126,12 @@ def build_manifest(raw_paths: list[str | Path], *, policy: PathPolicy, store: Ar
     manifest_path = store.doc_dir(document_id) / "manifest.json"
     if manifest_path.exists() and not rebuild:
         log.info("document %s already ingested; reusing manifest", document_id)
-        return Manifest.model_validate(store.read_json(manifest_path))
+        manifest = Manifest.model_validate(store.read_json(manifest_path))
+        by_hash = dict(zip(hashes, inputs))
+        for src in manifest.sources:  # the stored copy may be gone: this is the same file, so put it back
+            if src.sha256 in by_hash:
+                store.restore_source(document_id, src.stored_path, by_hash[src.sha256].path)
+        return manifest
 
     sources: list[SourceFile] = []
     entries: list[ManifestEntry] = []

@@ -70,6 +70,8 @@ class PageInk:
     stats: np.ndarray  # (n, 5) x, y, w, h, area per label (row 0 = background)
     glyph_px: float  # typical glyph height
     paper_rgb: np.ndarray  # (h, w, 3) float32 background estimate, for cleaned crops
+    rule_coloured: np.ndarray | None = None  # bool, looks like a rule; None when the pen's colour is not distinct
+    pen_tinted: np.ndarray | None = None  # bool, more saturated than the rules and of the pen's hue
     results: dict[str, Refinement] = field(default_factory=dict)
 
     def components_of(self, element_id: str) -> list[int]:
@@ -281,16 +283,41 @@ def _trace(cols_t: np.ndarray, centre: np.ndarray, x: int, y: float, step: int, 
                 centre[cx] = np.nan
 
 
-def _pen_coloured(sat: np.ndarray, ink: np.ndarray, rules: np.ndarray) -> np.ndarray | None:
+def _pen_coloured(sat: np.ndarray, ink: np.ndarray, rules: np.ndarray, hue: np.ndarray | None = None,
+                  norm: np.ndarray | None = None) -> np.ndarray | None:
     """Ink clearly more saturated than the rules (a blue pen on grey ruling), or None when the pen colour is
-    not distinct from the rules' colour on this page (then colour is no evidence either way)."""
+    not distinct from the rules' colour on this page (then colour is no evidence either way). With ``hue``, also
+    of the pen's hue: a red margin rule is saturated too, and is not the pen. With ``norm`` (paper-relative grey),
+    also darker than most of the rule: a rule's slightly tinted stretch is not a stroke."""
     if rules.sum() < 200 or (ink & ~rules).sum() < 200:
         return None
     rule_sat = float(np.median(sat[rules]))
-    pen_sat = float(np.median(sat[ink & ~rules]))
+    rule_high = float(np.percentile(sat[rules], 90))
+    # the upper quartile: the median of what is left is pulled down by the rules' grey fringe
+    pen_sat = float(np.percentile(sat[ink & ~rules], 75))
     if pen_sat - rule_sat < 30:
         return None
-    return ink & (sat > (rule_sat + pen_sat) / 2 + 10)
+    seeds = ink & (sat > max(rule_high + 8, (rule_sat + pen_sat) / 2))
+    if norm is not None:
+        seeds &= norm < np.percentile(norm[rules], 25)
+    if not seeds.any():
+        return None
+    if hue is not None:
+        strong = ink & ~rules & (sat >= pen_sat)
+        if strong.any():
+            pen_hue = float(np.median(hue[strong]))
+            apart = np.abs(hue.astype(np.float32) - pen_hue)
+            seeds &= np.minimum(apart, 180 - apart) <= 25  # OpenCV hue runs 0-179 and wraps around
+            if not seeds.any():
+                return None
+    # A stroke along a rule is a run of such pixels, a coloured speck on the rule is not. Close small gaps along the
+    # run so the stroke stays one line where the pen is fainter.
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(seeds.astype(np.uint8), connectivity=8)
+    big = stats[:, cv2.CC_STAT_AREA] >= 6
+    big[0] = False
+    seeds = big[labels]
+    closed = cv2.morphologyEx(seeds.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 15), np.uint8)) > 0
+    return ink & closed
 
 
 def _dotted_rules(clean: np.ndarray) -> np.ndarray | None:
@@ -338,9 +365,12 @@ def _dotted_rules(clean: np.ndarray) -> np.ndarray | None:
     return keep[labels] if keep.any() else None
 
 
-def _drop_rule_remnants(clean: np.ndarray, rules: np.ndarray, pen: np.ndarray | None) -> np.ndarray:
+def _drop_rule_remnants(clean: np.ndarray, rules: np.ndarray, pen: np.ndarray | None,
+                        rule_coloured: np.ndarray | None = None) -> np.ndarray:
     """Remove leftovers of removed rules: components lying almost entirely in the band around a rule (its
-    anti-aliased fringe, short stretches the per-column test kept). Pen-coloured components stay."""
+    anti-aliased fringe, short stretches the per-column test kept). Pen-coloured components stay. With
+    ``rule_coloured`` (pixels no more saturated and no darker than the rules), a thin level dash of that colour goes
+    wherever it is: a stretch of a rule the tracing lost near the edge of a curled page."""
     band = cv2.dilate(rules.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
     n, labels, stats, _ = cv2.connectedComponentsWithStats(clean.astype(np.uint8), connectivity=8)
     if n <= 1:
@@ -350,10 +380,15 @@ def _drop_rule_remnants(clean: np.ndarray, rules: np.ndarray, pen: np.ndarray | 
     w, h = stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT]
     thin = np.minimum(w, h) <= 6
     elongated = np.maximum(w, h) >= 3 * np.maximum(np.minimum(w, h), 1)
-    drop = (in_band >= 0.8 * area) & thin & elongated
     if pen is not None:
+        # the pen's colour tells them apart, so a short remnant goes too; a pen dot or dash keeps its colour
         pen_px = np.bincount(labels[pen & clean], minlength=n).astype(np.float64)
-        drop &= pen_px < 0.3 * area
+        drop = (in_band >= 0.8 * area) & thin & (pen_px < 0.3 * area)
+        if rule_coloured is not None:
+            like = np.bincount(labels[rule_coloured & clean], minlength=n).astype(np.float64)
+            drop |= (like >= 0.7 * area) & (pen_px < 0.1 * area) & thin & (w >= 3 * np.maximum(h, 1))
+    else:
+        drop = (in_band >= 0.8 * area) & thin & elongated
     drop[0] = False
     return clean & ~drop[labels]
 
@@ -371,12 +406,28 @@ def analyse_page(img: Image.Image, dpi: float) -> PageInk:
     # rules are found on the raw ink: faint ruled lines are often only 1-2 px thick
     rules = _rule_mask(raw, True)
     rules |= _rule_mask(raw & ~rules, False)
-    pen = _pen_coloured(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[:, :, 1], raw, rules)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    rule_coloured = pen_tinted = None
+    if rules.sum() >= 200:
+        rule_high = np.percentile(hsv[:, :, 1][rules], 90) + 8
+        rule_coloured = (hsv[:, :, 1] <= rule_high) & (norm >= np.percentile(norm[rules], 10))
+        pen_tinted = hsv[:, :, 1] > rule_high
+    pen = _pen_coloured(hsv[:, :, 1], raw, rules, hsv[:, :, 0], norm)
     if pen is not None:  # a distinct pen colour: keep pen strokes that run along a rule
         rules &= ~pen
+        if rule_coloured is not None:  # a coloured margin rule is saturated but not of the pen's hue
+            strong = raw & ~rules & pen
+            if strong.any():
+                pen_hue = float(np.median(hsv[:, :, 0][strong]))
+                apart = np.abs(hsv[:, :, 0].astype(np.float32) - pen_hue)
+                other_hue = np.minimum(apart, 180 - apart) > 25
+                rule_coloured |= other_hue & (hsv[:, :, 1] > 20)
+                pen_tinted &= ~other_hue
+    else:
+        rule_coloured = pen_tinted = None
     clean = raw & ~rules  # speckle is removed below with the component size filter
     if rules.any():
-        clean = _drop_rule_remnants(clean, rules, pen)
+        clean = _drop_rule_remnants(clean, rules, pen, rule_coloured)
     dotted = _dotted_rules(clean)
     if dotted is not None:
         rules |= dotted
@@ -395,7 +446,8 @@ def analyse_page(img: Image.Image, dpi: float) -> PageInk:
     paper_rgb = np.dstack([_background(rgb[:, :, c]) for c in range(3)]) if not inverted else \
         np.full(rgb.shape, 255.0, np.float32)
     return PageInk(dpi=dpi, width=rgb.shape[1], height=rgb.shape[0], ink=clean, rules=rules,
-                   labels=labels.astype(np.int32), stats=stats, glyph_px=glyph, paper_rgb=paper_rgb)
+                   labels=labels.astype(np.int32), stats=stats, glyph_px=glyph, paper_rgb=paper_rgb,
+                   rule_coloured=rule_coloured, pen_tinted=pen_tinted)
 
 
 # ---------------------------------------------------------------------------------------------- assignment
@@ -564,6 +616,33 @@ def refine_elements(elements: list[Element], ink: PageInk, page_width_pt: float,
                     if gap < best_gap - 0.5:
                         best, best_gap = j, gap
             owner[c] = best
+        # The rest of a written line whose start the model boxed as text, inside that text's model box, stays with
+        # the text although a drawing's box also reaches it (an equation above a circuit).
+        joined = core.copy()
+        for _ in range(8):  # stroke by stroke along the line: each one brings the next within reach
+            changed = False
+            for c in np.flatnonzero(multiple):
+                if owner[c] < 0 or not is_fig[owner[c]]:
+                    continue
+                for j in np.flatnonzero(eligible[c]):
+                    if is_fig[j] or not _inside(comps[c], caps[j]):
+                        continue
+                    mine = np.flatnonzero(joined & (owner == j))
+                    start = np.flatnonzero(core & (owner == j))  # the line as first boxed; strokes join in any order
+                    if mine.size and start.size:
+                        line = _union(comps, [int(i) for i in start])
+                        mid = (comps[c, 1] + comps[c, 3]) / 2
+                        # it continues the line sideways (a label under a line of text is the drawing's); a subscript
+                        # hangs a little below the line
+                        beyond = comps[c, 0] >= line[2] - g or comps[c, 2] <= line[0] + g
+                        if (beyond and line[1] - 0.6 * g <= mid <= line[3] + 0.6 * g
+                                and float(_box_gap(comps[mine], comps[c]).min()) <= 6 * g):
+                            owner[c] = j
+                            joined[c] = True
+                            changed = True
+                            break
+            if not changed:
+                break
     claimed = owner >= 0
     # a drawing that touches another drawing is one component: split it, each pixel going to the figure whose
     # model box is nearest, as new components owned by those figures
@@ -635,7 +714,16 @@ def refine_elements(elements: list[Element], ink: PageInk, page_width_pt: float,
                                                     "a larger structure")
             continue
         if fig:
-            boxes = _grow_figure(boxes, comps, cap, claimed & usable & ~rule_like, g)
+            # Thin long strokes are open to the drawing (a wire the model box clipped), except one on the written
+            # line of the text that owns it: a fraction bar or a tall bracket only looks like a rule remnant.
+            taken = claimed & usable & ~rule_like
+            for c in np.flatnonzero(claimed & usable & rule_like):
+                if owner[c] >= 0 and not is_fig[owner[c]]:
+                    mine = np.flatnonzero((owner == owner[c]) & ~rule_like)
+                    if mine.size:
+                        line = _union(comps, [int(i) for i in mine])
+                        taken[c] = line[1] <= (comps[c, 1] + comps[c, 3]) / 2 <= line[3]
+            boxes = _grow_figure(boxes, comps, cap, taken, g)
             for i in boxes:
                 if i not in shared:
                     owner[i] = j
@@ -665,7 +753,7 @@ def _grow_figure(boxes: dict[int, np.ndarray], comps: np.ndarray, cap: np.ndarra
                  glyph: float) -> dict[int, np.ndarray]:
     """Add unclaimed strokes and labels near the figure's ink: strokes within ``0.8 glyph`` of a figure stroke,
     label-sized marks within ``2 glyph``; inside
-    the cap, and not part of a text line that runs out of the cap. Rule remnants are excluded by the caller."""
+    the cap, and not part of a text line that runs out of the cap. ``claimed``: strokes the figure may not take."""
     members = dict(boxes)
     free = ~claimed
     free[0] = False
